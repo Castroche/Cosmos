@@ -196,6 +196,24 @@ from .official_archive_index import (
     OfficialArchiveIndex,
     download_official_archive_index,
 )
+from .operator_workspace import (
+    AgentGoalOverview,
+    AgentLaunchPreview,
+    AgentLaunchProfile,
+    AgentLaunchRequest,
+    AgentLaunchResult,
+    AgentMarketSense,
+    AgentRuntimeOverview,
+    AgentStrategySummary,
+    AuditEventPage,
+    PersonalStrategyCreate,
+    PersonalStrategyRecord,
+    PersonalStrategyUpdate,
+    StrategyLibraryItem,
+    StrategyLibraryPage,
+    StrategyLibraryPreference,
+    stable_fingerprint,
+)
 from .order_ledger import OrderLedger
 from .plan_lifecycle import EntrySignalState, assess_entry_signal
 from .relative_value import (
@@ -3473,6 +3491,268 @@ class AgentGoalStatusUpdate(BaseModel):
     confirmation: str
 
 
+def platform_agent_mode(configuration: UserConfiguration) -> AgentAutonomyMode:
+    return {
+        TradingMode.PAPER: AgentAutonomyMode.PAPER,
+        TradingMode.SANDBOX: AgentAutonomyMode.SANDBOX,
+        TradingMode.LIVE: AgentAutonomyMode.LIVE_CAPPED,
+    }[configuration.trading_mode]
+
+
+def launch_policy(request: AgentLaunchRequest) -> AgentPolicy:
+    configuration = configuration_service.current_configuration()
+    execution_mode = platform_agent_mode(configuration)
+    can_trade = request.autonomy_mode == execution_mode
+    risk = configuration.risk
+    return AgentPolicy(
+        id=f"launch-{request.profile_id}-{request.autonomy_mode}",
+        autonomy_mode=request.autonomy_mode,
+        allowed_symbols=request.symbols,
+        allowed_timeframes=request.timeframes,
+        max_risk_per_trade=risk.risk_per_trade if can_trade else Decimal("0"),
+        max_daily_drawdown=risk.max_daily_drawdown if can_trade else Decimal("0"),
+        max_open_positions=min(risk.max_open_positions, 3) if can_trade else 0,
+        max_trades_per_day=6 if can_trade else 0,
+        max_leverage=(
+            configuration.contract_leverage
+            if can_trade and configuration.market_type == "swap"
+            else Decimal("1")
+        ),
+        require_native_protection=True,
+        allow_agent_entry=can_trade,
+        allow_agent_cancel_entry=True,
+        allow_agent_reduce=True,
+        allow_agent_exit=True,
+        allow_agent_halt=True,
+    )
+
+
+def validate_launch_scope(request: AgentLaunchRequest) -> None:
+    configuration = configuration_service.current_configuration()
+    supported_modes = {
+        AgentAutonomyMode.OBSERVE,
+        AgentAutonomyMode.RESEARCH,
+        platform_agent_mode(configuration),
+    }
+    if request.autonomy_mode not in supported_modes:
+        raise HTTPException(409, "启动模式与当前交易环境不匹配")
+    if not set(request.symbols).issubset(configuration.strategy.watchlist):
+        raise HTTPException(409, "启动品种超出系统交易白名单")
+    if not set(request.timeframes).issubset(configuration.strategy.timeframes):
+        raise HTTPException(409, "启动周期超出系统周期白名单")
+
+
+def launch_preview_payload(request: AgentLaunchRequest) -> AgentLaunchPreview:
+    validate_launch_scope(request)
+    policy = launch_policy(request)
+    grant_payload = {
+        "profile_id": request.profile_id,
+        "symbols": sorted(request.symbols),
+        "timeframes": sorted(request.timeframes),
+        "autonomy_mode": str(request.autonomy_mode),
+        "risk_template": request.risk_template,
+        "policy_fingerprint": policy.fingerprint,
+    }
+    grant_fingerprint = stable_fingerprint(grant_payload)
+    stored_payload = store.load_agent_launch_profile(request.profile_id)
+    stored = AgentLaunchProfile.model_validate(stored_payload) if stored_payload else None
+    configuration = configuration_service.current_configuration()
+    risk = configuration.risk
+    blocking: list[str] = []
+    state = risk_state_service.get()
+    if state.halted and request.autonomy_mode == platform_agent_mode(configuration):
+        blocking.append(state.reason or "全局风险闸已停止新开仓")
+    return AgentLaunchPreview(
+        profile_id=request.profile_id,
+        grant_fingerprint=grant_fingerprint,
+        confirmation_required=(
+            stored is None or stored.authorized_fingerprint != grant_fingerprint
+        ),
+        reuses_goal_id=stored.goal_id if stored else None,
+        mode=request.autonomy_mode,
+        symbols=request.symbols,
+        timeframes=request.timeframes,
+        risk_summary={
+            "交易环境": str(configuration.trading_mode),
+            "单笔风险": f"{risk.risk_per_trade * 100:f}%",
+            "日内回撤": f"{risk.max_daily_drawdown * 100:f}%",
+            "最大持仓": min(risk.max_open_positions, 3),
+            "原生保护单": True,
+        },
+        blocking_reasons=blocking,
+    )
+
+
+def strategy_overview_summary(plan: StrategyPlan) -> AgentStrategySummary:
+    return AgentStrategySummary(
+        plan_id=plan.id,
+        name=plan.name,
+        symbol=plan.symbol,
+        timeframe=plan.timeframe,
+        family=plan.algorithm,
+        status=str(plan.status),
+        source=("agent" if plan.agent_goal_id else plan.decision_origin),
+        fingerprint=plan.fingerprint,
+        updated_at=plan.data_as_of or plan.signal_candle_at or plan.created_at,
+    )
+
+
+def build_agent_runtime_overview() -> AgentRuntimeOverview:
+    goals = [
+        goal
+        for goal in agent_store.list_goals(200)
+        if goal.status != AgentGoalStatus.ARCHIVED
+    ]
+    runs = agent_store.list_runs(200)
+    episodes = agent_store.list_episodes(500)
+    coverage = agent_store.schedule_market_coverage([goal.id for goal in goals])
+    risk_state = risk_state_service.get()
+    now = datetime.now(UTC)
+    goal_views: list[AgentGoalOverview] = []
+    latest_heartbeat: datetime | None = None
+    for goal in goals:
+        goal_runs = [item for item in runs if item.goal_id == goal.id]
+        latest_run = goal_runs[0] if goal_runs else None
+        last_decision = None
+        if latest_run:
+            decisions = agent_store.decisions_for_run(latest_run.id, 50)
+            last_decision = decisions[-1] if decisions else None
+        goal_coverage = {
+            (item["symbol"], item["timeframe"]): item
+            for item in coverage
+            if item["goal_id"] == goal.id
+        }
+        senses: list[AgentMarketSense] = []
+        heartbeat_candidates: list[datetime] = []
+        next_scan_candidates: list[datetime] = []
+        for symbol in goal.symbols:
+            for timeframe in goal.timeframes:
+                item = goal_coverage.get((symbol, timeframe)) or {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                }
+                processed = item.get("event_processed_at") or item.get("event_created_at")
+                processed_at = datetime.fromisoformat(processed) if processed else None
+                if processed_at:
+                    heartbeat_candidates.append(processed_at)
+                interval = max(goal.poll_seconds, timeframe_seconds(timeframe))
+                bucket = int(now.timestamp()) // interval
+                next_scan = datetime.fromtimestamp((bucket + 1) * interval, UTC)
+                next_scan_candidates.append(next_scan)
+                event_status = item.get("event_status")
+                run_status = item.get("last_run_status")
+                sense_status = (
+                    "paused"
+                    if goal.status != AgentGoalStatus.ACTIVE
+                    else "healthy"
+                    if event_status == str(AgentEventStatus.PROCESSED)
+                    and run_status
+                    in {
+                        str(AgentRunStatus.WAITING),
+                        str(AgentRunStatus.COMPLETED),
+                        str(AgentRunStatus.HALTED),
+                    }
+                    else "running"
+                    if event_status == str(AgentEventStatus.CLAIMED)
+                    else "queued"
+                    if event_status in {None, str(AgentEventStatus.PENDING)}
+                    else "degraded"
+                )
+                senses.append(
+                    AgentMarketSense(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        status=sense_status,
+                        last_event_at=processed_at,
+                        next_scan_at=next_scan,
+                        last_run_status=run_status,
+                    )
+                )
+        if latest_run:
+            heartbeat_candidates.append(latest_run.updated_at)
+        heartbeat = max(heartbeat_candidates, default=None)
+        if heartbeat and (latest_heartbeat is None or heartbeat > latest_heartbeat):
+            latest_heartbeat = heartbeat
+        goal_plans = sorted(
+            [plan for plan in plans.values() if plan.agent_goal_id == goal.id],
+            key=lambda item: item.data_as_of or item.signal_candle_at or item.created_at,
+            reverse=True,
+        )
+        recent_strategies = [strategy_overview_summary(item) for item in goal_plans[:5]]
+        current_plan = next(
+            (item for item in goal_plans if item.status != PlanStatus.ARCHIVED),
+            None,
+        )
+        goal_episodes = [item for item in episodes if item.goal_id == goal.id]
+        active_episodes = [
+            item
+            for item in goal_episodes
+            if item.status
+            in {
+                TradeEpisodeStatus.RESERVED,
+                TradeEpisodeStatus.PENDING_ENTRY,
+                TradeEpisodeStatus.OPEN,
+                TradeEpisodeStatus.AWAITING_REVIEW,
+            }
+        ]
+        blocking: list[str] = []
+        is_execution_goal = goal.autonomy_mode in {
+            AgentAutonomyMode.PAPER,
+            AgentAutonomyMode.SANDBOX,
+            AgentAutonomyMode.LIVE_CAPPED,
+        }
+        if risk_state.halted and is_execution_goal:
+            blocking.append(risk_state.reason or "全局风险闸已停止新开仓")
+        if latest_run and latest_run.last_error:
+            blocking.append(latest_run.last_error)
+        if not goal_coverage:
+            blocking.append("尚无市场调度记录")
+        stale_after = max(goal.poll_seconds * 3, 180)
+        runtime_status: Literal["running", "waiting", "paused", "blocked", "offline"]
+        if goal.status != AgentGoalStatus.ACTIVE:
+            runtime_status = "paused"
+        elif blocking and is_execution_goal:
+            runtime_status = "blocked"
+        elif latest_run and latest_run.status == AgentRunStatus.RUNNING:
+            runtime_status = "running"
+        elif heartbeat and (now - heartbeat).total_seconds() > stale_after:
+            runtime_status = "offline"
+        else:
+            runtime_status = "waiting"
+        goal_views.append(
+            AgentGoalOverview(
+                goal_id=goal.id,
+                objective=goal.objective,
+                status=str(goal.status),
+                autonomy_mode=str(goal.autonomy_mode),
+                symbols=goal.symbols,
+                timeframes=goal.timeframes,
+                runtime_status=runtime_status,
+                last_heartbeat_at=heartbeat,
+                next_scan_at=min(next_scan_candidates, default=None),
+                last_action=str(last_decision.action) if last_decision else None,
+                last_action_summary=last_decision.reason if last_decision else None,
+                current_strategy=(
+                    strategy_overview_summary(current_plan) if current_plan else None
+                ),
+                recently_generated_strategies=recent_strategies,
+                market_sense=senses,
+                active_episode_count=len(active_episodes),
+                uncertain_episode_count=sum(
+                    item.status == TradeEpisodeStatus.UNCERTAIN for item in goal_episodes
+                ),
+                blocking_reasons=blocking,
+            )
+        )
+    return AgentRuntimeOverview(
+        active_goal_count=sum(goal.status == AgentGoalStatus.ACTIVE for goal in goals),
+        latest_heartbeat_at=latest_heartbeat,
+        risk_halted=risk_state.halted,
+        risk_reason=risk_state.reason,
+        goals=goal_views,
+    )
+
+
 def sandbox_forward_performance() -> AgentForwardPerformance:
     configuration = configuration_service.current_configuration()
     policies = agent_store.list_policies(500)
@@ -4004,6 +4284,144 @@ def build_agent_episode_runtime_views(
             )
         )
     return views
+
+
+@app.get("/api/agent/overview", response_model=AgentRuntimeOverview)
+async def agent_runtime_overview():
+    return await asyncio.to_thread(build_agent_runtime_overview)
+
+
+@app.post("/api/agent/launch/preview", response_model=AgentLaunchPreview)
+async def preview_agent_launch(request: AgentLaunchRequest):
+    return await asyncio.to_thread(launch_preview_payload, request)
+
+
+@app.post("/api/agent/launch", response_model=AgentLaunchResult)
+async def launch_agent(request: AgentLaunchRequest):
+    preview = await asyncio.to_thread(launch_preview_payload, request)
+    if preview.confirmation_required:
+        if not request.authorize:
+            raise HTTPException(409, "首次启动或权限范围变化，需要确认授权")
+        if request.preview_fingerprint != preview.grant_fingerprint:
+            raise HTTPException(409, "启动预览已变化，请重新核对授权摘要")
+    policy = launch_policy(request)
+    validate_agent_policy_against_platform(policy)
+    stored_payload = await asyncio.to_thread(
+        store.load_agent_launch_profile,
+        request.profile_id,
+    )
+    stored = AgentLaunchProfile.model_validate(stored_payload) if stored_payload else None
+    goal_id = (
+        stored.goal_id
+        if stored and stored.goal_id
+        else f"goal_launch_{stable_fingerprint({'profile_id': request.profile_id})[:16]}"
+    )
+    existing_goal = await asyncio.to_thread(agent_store.load_goal, goal_id)
+    if existing_goal:
+        goal = existing_goal.model_copy(
+            deep=True,
+            update={
+                "objective": request.objective,
+                "symbols": request.symbols,
+                "timeframes": request.timeframes,
+                "autonomy_mode": request.autonomy_mode,
+                "risk_policy_id": policy.id,
+                "poll_seconds": request.poll_seconds,
+                "status": AgentGoalStatus.ACTIVE,
+                "updated_at": datetime.now(UTC),
+            },
+        )
+    else:
+        goal = AgentGoal(
+            id=goal_id,
+            objective=request.objective,
+            symbols=request.symbols,
+            timeframes=request.timeframes,
+            autonomy_mode=request.autonomy_mode,
+            risk_policy_id=policy.id,
+            poll_seconds=request.poll_seconds,
+            status=AgentGoalStatus.ACTIVE,
+        )
+    now = datetime.now(UTC)
+    profile = AgentLaunchProfile(
+        id=request.profile_id,
+        goal_id=goal.id,
+        policy_id=policy.id,
+        symbols=request.symbols,
+        timeframes=request.timeframes,
+        autonomy_mode=request.autonomy_mode,
+        risk_template=request.risk_template,
+        objective=request.objective,
+        poll_seconds=request.poll_seconds,
+        grant_fingerprint=preview.grant_fingerprint,
+        authorized_fingerprint=preview.grant_fingerprint,
+        created_at=stored.created_at if stored else now,
+        updated_at=now,
+    )
+    await asyncio.to_thread(agent_store.save_launch_bundle, policy, goal, profile)
+    add_audit(
+        "agent",
+        "自动交易 Agent 已通过快速启动配置启用",
+        severity="warning",
+        goal_id=goal.id,
+        profile_id=profile.id,
+        symbols=",".join(goal.symbols),
+        timeframes=",".join(goal.timeframes),
+        autonomy_mode=str(goal.autonomy_mode),
+        reused=bool(existing_goal),
+    )
+    return AgentLaunchResult(
+        profile=profile,
+        goal_id=goal.id,
+        reused=bool(existing_goal),
+        status=str(goal.status),
+    )
+
+
+@app.post("/api/agent/goals/{goal_id}/archive", response_model=AgentGoal)
+async def archive_agent_goal(goal_id: str):
+    goal = await asyncio.to_thread(agent_store.load_goal, goal_id)
+    if not goal:
+        raise HTTPException(404, "Agent goal not found")
+    goal.status = AgentGoalStatus.ARCHIVED
+    await asyncio.to_thread(agent_store.save_goal, goal)
+    add_audit("agent", "Agent 目标已归档", severity="warning", goal_id=goal.id)
+    return goal
+
+
+@app.post("/api/agent/goals/{goal_id}/restore", response_model=AgentGoal)
+async def restore_agent_goal(goal_id: str):
+    goal = await asyncio.to_thread(agent_store.load_goal, goal_id)
+    if not goal:
+        raise HTTPException(404, "Agent goal not found")
+    if goal.status != AgentGoalStatus.ARCHIVED:
+        raise HTTPException(409, "only an archived Agent goal can be restored")
+    goal.status = AgentGoalStatus.PAUSED
+    await asyncio.to_thread(agent_store.save_goal, goal)
+    add_audit("agent", "Agent 目标已恢复为暂停状态", goal_id=goal.id)
+    return goal
+
+
+@app.websocket("/ws/agent")
+async def agent_runtime_stream(websocket: WebSocket):
+    await websocket.accept()
+    last_payload = ""
+    try:
+        while True:
+            overview = await asyncio.to_thread(build_agent_runtime_overview)
+            payload = overview.model_dump_json()
+            if payload != last_payload:
+                await websocket.send_json(
+                    {"type": "agent_overview", "data": overview.model_dump(mode="json")}
+                )
+                last_payload = payload
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        with suppress(Exception):
+            await websocket.send_json({"type": "error", "message": str(exc)[:180]})
+            await websocket.close(code=1011)
 
 
 @app.get("/api/agent/state")
@@ -8775,6 +9193,317 @@ async def builtin_strategy_library(family: str | None = None):
         return unified_research_strategy_library(family)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+def normalize_personal_strategy_spec(raw_spec: dict):
+    payload = dict(raw_spec)
+    payload.pop("fingerprint", None)
+    payload["source"] = "operator"
+    return validate_strategy_spec(payload)
+
+
+def personal_strategy_view(record: PersonalStrategyRecord) -> StrategyLibraryItem:
+    referenced = any(
+        plan.causal_policy_selected_library_entry_id == record.id for plan in plans.values()
+    )
+    return StrategyLibraryItem(
+        id=record.id,
+        name=record.name,
+        description=record.description,
+        origin="personal",
+        family=record.family,
+        status=record.status,
+        version=record.version,
+        strategy_spec=record.strategy_spec,
+        spec_fingerprint=record.spec_fingerprint,
+        executable=False,
+        can_edit=record.status == "draft",
+        can_archive=record.status != "archived",
+        can_restore=record.status == "archived",
+        can_delete=record.status == "draft" and not referenced,
+        evidence_summary=(
+            "已被交易计划引用，仅允许归档" if referenced else "个人草稿，执行前必须完成回测认证"
+        ),
+        updated_at=record.updated_at,
+    )
+
+
+def unified_operator_strategy_library() -> list[StrategyLibraryItem]:
+    hidden = store.hidden_strategy_library_items()
+    items: list[StrategyLibraryItem] = []
+    for entry in list_strategy_library():
+        validated = entry.validated_spec
+        items.append(
+            StrategyLibraryItem(
+                id=entry.id,
+                name=entry.name,
+                description=entry.summary,
+                origin="builtin",
+                family=str(entry.family),
+                status="available",
+                version=entry.version,
+                strategy_spec=validated.model_dump(mode="json", exclude={"fingerprint"}),
+                spec_fingerprint=validated.fingerprint,
+                executable=False,
+                hidden=entry.id in hidden,
+                can_archive=entry.id not in hidden,
+                can_restore=entry.id in hidden,
+                can_delete=False,
+                evidence_summary="公开先验；使用前必须通过不可变数据集与稳健性验证",
+            )
+        )
+    for payload in store.list_personal_strategy_library_items(1000):
+        items.append(personal_strategy_view(PersonalStrategyRecord.model_validate(payload)))
+    for payload in store.list_strategy_candidates(500):
+        try:
+            candidate = StrategyCandidate.model_validate(payload)
+        except ValidationError:
+            continue
+        if candidate.source == "system":
+            continue
+        items.append(
+            StrategyLibraryItem(
+                id=candidate.id,
+                name=f"{str(candidate.spec.get('family', 'strategy'))} · {candidate.id[-8:]}",
+                description=str(candidate.spec.get("hypothesis") or "Agent 研究候选"),
+                origin="agent",
+                family=str(candidate.spec.get("family") or "unknown"),
+                status=str(candidate.status),
+                version=1,
+                strategy_spec=candidate.spec,
+                spec_fingerprint=candidate.spec_fingerprint,
+                executable=bool(
+                    candidate.status == CandidateStatus.CHAMPION
+                    and candidate.execution_artifact is not None
+                ),
+                can_archive=candidate.status
+                not in {CandidateStatus.RETIRED, CandidateStatus.CHAMPION},
+                can_restore=candidate.status == CandidateStatus.RETIRED,
+                can_delete=False,
+                evidence_summary=(
+                    f"PF {candidate.backtest.profit_factor:f} · "
+                    f"收益 {candidate.backtest.return_percent:f}%"
+                    if candidate.backtest
+                    else "尚未绑定不可变数据集回测"
+                ),
+                updated_at=candidate.updated_at,
+            )
+        )
+    origin_order = {"personal": 0, "agent": 1, "builtin": 2}
+    return sorted(
+        items,
+        key=lambda item: (
+            origin_order[item.origin],
+            -(item.updated_at.timestamp() if item.updated_at else 0),
+            item.name,
+        ),
+    )
+
+
+@app.get("/api/strategy-library", response_model=StrategyLibraryPage)
+async def operator_strategy_library(
+    origin: Literal["builtin", "personal", "agent"] | None = None,
+    status: str | None = None,
+    family: str | None = None,
+    include_hidden: bool = False,
+    search: str | None = None,
+):
+    items = await asyncio.to_thread(unified_operator_strategy_library)
+    if origin:
+        items = [item for item in items if item.origin == origin]
+    if status:
+        items = [item for item in items if item.status == status]
+    if family:
+        items = [item for item in items if item.family == family]
+    if not include_hidden:
+        items = [item for item in items if not item.hidden]
+    if search:
+        needle = search.casefold()
+        items = [
+            item
+            for item in items
+            if needle in item.name.casefold()
+            or needle in item.description.casefold()
+            or needle in item.id.casefold()
+        ]
+    return StrategyLibraryPage(items=items, total=len(items))
+
+
+@app.post("/api/strategy-library", response_model=StrategyLibraryItem)
+async def create_personal_strategy(request: PersonalStrategyCreate):
+    try:
+        spec = normalize_personal_strategy_spec(request.strategy_spec)
+    except ValueError as exc:
+        raise HTTPException(422, f"StrategySpec 无效：{exc}") from exc
+    now = datetime.now(UTC)
+    record = PersonalStrategyRecord(
+        name=request.name.strip(),
+        description=request.description.strip(),
+        family=str(spec.family),
+        strategy_spec=spec.model_dump(mode="json", exclude={"fingerprint"}),
+        spec_fingerprint=spec.fingerprint,
+        origin_ref=request.origin_ref,
+        created_at=now,
+        updated_at=now,
+    )
+    await asyncio.to_thread(store.save_personal_strategy_library_item, record)
+    add_audit(
+        "strategy",
+        "个人策略已加入策略库",
+        item_id=record.id,
+        family=record.family,
+        origin_ref=record.origin_ref,
+    )
+    return personal_strategy_view(record)
+
+
+@app.patch("/api/strategy-library/{item_id}", response_model=StrategyLibraryItem)
+async def update_personal_strategy(item_id: str, request: PersonalStrategyUpdate):
+    payload = await asyncio.to_thread(store.load_personal_strategy_library_item, item_id)
+    if not payload:
+        raise HTTPException(404, "personal strategy not found")
+    current = PersonalStrategyRecord.model_validate(payload)
+    if current.status != "draft":
+        raise HTTPException(409, "只有个人草稿可以直接编辑")
+    spec = normalize_personal_strategy_spec(request.strategy_spec or current.strategy_spec)
+    updated = current.model_copy(
+        deep=True,
+        update={
+            "name": request.name.strip() if request.name is not None else current.name,
+            "description": (
+                request.description.strip()
+                if request.description is not None
+                else current.description
+            ),
+            "family": str(spec.family),
+            "strategy_spec": spec.model_dump(mode="json", exclude={"fingerprint"}),
+            "spec_fingerprint": spec.fingerprint,
+            "updated_at": datetime.now(UTC),
+        },
+    )
+    await asyncio.to_thread(store.save_personal_strategy_library_item, updated)
+    add_audit("strategy", "个人策略草稿已更新", item_id=updated.id)
+    return personal_strategy_view(updated)
+
+
+@app.post("/api/strategy-library/{item_id}/archive", response_model=StrategyLibraryItem)
+async def archive_strategy_library_item(item_id: str):
+    personal_payload = await asyncio.to_thread(
+        store.load_personal_strategy_library_item,
+        item_id,
+    )
+    if personal_payload:
+        record = PersonalStrategyRecord.model_validate(personal_payload)
+        record.status = "archived"
+        record.updated_at = datetime.now(UTC)
+        await asyncio.to_thread(store.save_personal_strategy_library_item, record)
+        add_audit("strategy", "个人策略已归档", severity="warning", item_id=item_id)
+        return personal_strategy_view(record)
+    candidate_payload = await asyncio.to_thread(store.load_strategy_candidate, item_id)
+    if candidate_payload:
+        candidate = StrategyCandidate.model_validate(candidate_payload)
+        if candidate.source == "system":
+            raise HTTPException(409, "内置候选不可归档，请隐藏对应公开模板")
+        if candidate.status == CandidateStatus.CHAMPION:
+            raise HTTPException(409, "当前 Champion 必须先由新的 Champion 替代")
+        candidate.status = CandidateStatus.RETIRED
+        candidate.execution_artifact = None
+        candidate.updated_at = datetime.now(UTC)
+        candidate.decision_reasons.append("操作员从策略库归档该候选")
+        await asyncio.to_thread(store.save_strategy_candidate, candidate)
+        add_audit("strategy", "Agent 策略候选已归档", severity="warning", item_id=item_id)
+        return next(
+            item
+            for item in await asyncio.to_thread(unified_operator_strategy_library)
+            if item.id == item_id
+        )
+    try:
+        library_entry(item_id)
+    except LookupError as exc:
+        raise HTTPException(404, "strategy library item not found") from exc
+    await asyncio.to_thread(store.set_strategy_library_hidden, item_id, True)
+    return next(
+        item
+        for item in await asyncio.to_thread(unified_operator_strategy_library)
+        if item.id == item_id
+    )
+
+
+@app.post("/api/strategy-library/{item_id}/restore", response_model=StrategyLibraryItem)
+async def restore_strategy_library_item(item_id: str):
+    personal_payload = await asyncio.to_thread(
+        store.load_personal_strategy_library_item,
+        item_id,
+    )
+    if personal_payload:
+        record = PersonalStrategyRecord.model_validate(personal_payload)
+        if record.status != "archived":
+            raise HTTPException(409, "strategy is not archived")
+        record.status = "draft"
+        record.updated_at = datetime.now(UTC)
+        await asyncio.to_thread(store.save_personal_strategy_library_item, record)
+        add_audit("strategy", "个人策略已恢复", item_id=item_id)
+        return personal_strategy_view(record)
+    candidate_payload = await asyncio.to_thread(store.load_strategy_candidate, item_id)
+    if candidate_payload:
+        candidate = StrategyCandidate.model_validate(candidate_payload)
+        if candidate.status != CandidateStatus.RETIRED or candidate.source == "system":
+            raise HTTPException(409, "strategy candidate cannot be restored")
+        candidate.status = CandidateStatus.PROPOSED
+        candidate.updated_at = datetime.now(UTC)
+        candidate.decision_reasons.append("操作员恢复候选；必须重新完成评估")
+        await asyncio.to_thread(store.save_strategy_candidate, candidate)
+        return next(
+            item
+            for item in await asyncio.to_thread(unified_operator_strategy_library)
+            if item.id == item_id
+        )
+    try:
+        library_entry(item_id)
+    except LookupError as exc:
+        raise HTTPException(404, "strategy library item not found") from exc
+    await asyncio.to_thread(store.set_strategy_library_hidden, item_id, False)
+    return next(
+        item
+        for item in await asyncio.to_thread(unified_operator_strategy_library)
+        if item.id == item_id
+    )
+
+
+@app.put("/api/strategy-library/{item_id}/preference", response_model=StrategyLibraryItem)
+async def set_strategy_library_preference(
+    item_id: str,
+    request: StrategyLibraryPreference,
+):
+    try:
+        library_entry(item_id)
+    except LookupError as exc:
+        raise HTTPException(404, "built-in strategy not found") from exc
+    await asyncio.to_thread(store.set_strategy_library_hidden, item_id, request.hidden)
+    return next(
+        item
+        for item in await asyncio.to_thread(unified_operator_strategy_library)
+        if item.id == item_id
+    )
+
+
+@app.delete("/api/strategy-library/{item_id}")
+async def delete_personal_strategy(item_id: str):
+    payload = await asyncio.to_thread(store.load_personal_strategy_library_item, item_id)
+    if not payload:
+        raise HTTPException(404, "personal strategy not found")
+    record = PersonalStrategyRecord.model_validate(payload)
+    view = personal_strategy_view(record)
+    if not view.can_delete:
+        raise HTTPException(409, "该策略已有证据引用，只能归档")
+    await asyncio.to_thread(store.delete_personal_strategy_library_item, item_id)
+    add_audit(
+        "strategy",
+        "未引用的个人策略草稿已永久删除",
+        severity="warning",
+        item_id=item_id,
+    )
+    return {"deleted": True, "item_id": item_id}
 
 
 ResearchDatasetBundle = tuple[
@@ -13880,6 +14609,28 @@ async def resume_trading(request: ResumeRequest):
 @app.get("/api/audit", response_model=list[AuditEvent])
 async def audit_events():
     return audit
+
+
+@app.get("/api/audit/events", response_model=AuditEventPage)
+async def paged_audit_events(
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: int | None = Query(default=None, ge=1),
+    category: str | None = None,
+    severity: str | None = None,
+    search: str | None = Query(default=None, max_length=120),
+):
+    items, next_cursor = await asyncio.to_thread(
+        store.page_audit,
+        limit=limit,
+        before_sequence=cursor,
+        category=category,
+        severity=severity,
+        search=search.strip() if search else None,
+    )
+    return AuditEventPage(
+        items=[AuditEvent.model_validate(item) for item in items],
+        next_cursor=next_cursor,
+    )
 
 
 web_distribution = Path(__file__).resolve().parent.parent.parent / "apps" / "web" / "dist"

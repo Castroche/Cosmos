@@ -107,6 +107,75 @@ class AgentStore:
             ).fetchall()
         return [AgentPolicy.model_validate_json(row["payload"]) for row in rows]
 
+    def save_launch_bundle(self, policy: AgentPolicy, goal: AgentGoal, profile) -> None:
+        """Persist a quick-launch grant, goal, and remembered profile atomically."""
+
+        now = datetime.now(UTC)
+        goal.updated_at = now
+        profile.updated_at = now
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO agent_policies
+                    (policy_id, autonomy_mode, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(policy_id) DO UPDATE SET
+                    autonomy_mode = excluded.autonomy_mode,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    policy.id,
+                    str(policy.autonomy_mode),
+                    policy.model_dump_json(),
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO agent_goals
+                    (goal_id, status, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(goal_id) DO UPDATE SET
+                    status = excluded.status,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    goal.id,
+                    str(goal.status),
+                    goal.model_dump_json(),
+                    goal.created_at.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO agent_launch_profiles
+                    (profile_id, autonomy_mode, grant_fingerprint,
+                     authorized_fingerprint, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id) DO UPDATE SET
+                    autonomy_mode = excluded.autonomy_mode,
+                    grant_fingerprint = excluded.grant_fingerprint,
+                    authorized_fingerprint = excluded.authorized_fingerprint,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    profile.id,
+                    str(profile.autonomy_mode),
+                    profile.grant_fingerprint,
+                    profile.authorized_fingerprint,
+                    profile.model_dump_json(),
+                    profile.created_at.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            connection.commit()
+
     def promote_goal_to_live(
         self,
         source_goal_id: str,

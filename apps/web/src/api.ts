@@ -33,6 +33,13 @@ import type {
   AgentRunTrace,
   AgentPolicy,
   RiskControlState,
+  AgentRuntimeOverview,
+  AgentLaunchRequest,
+  AgentLaunchPreview,
+  AgentLaunchResult,
+  StrategyLibraryPage,
+  StrategyLibraryItem,
+  AuditEventPage,
 } from './types'
 
 async function api<T>(path: string, init?: RequestInit, timeout = 15_000): Promise<T> {
@@ -207,6 +214,13 @@ export function getStrategyLibrarySummary(): Promise<{
   archetype_count: number
 }> {
   return api('/api/research/strategy-library')
+}
+
+export function getStrategySpecContract(): Promise<{
+  schema: Record<string, unknown>
+  defaults: Record<string, Record<string, unknown>>
+}> {
+  return api('/api/research/strategy-spec')
 }
 
 export function runResearchCampaign(
@@ -398,6 +412,121 @@ export async function resumeTrading(): Promise<void> {
 
 export function getAgentState(): Promise<AgentControlState> {
   return api<AgentControlState>('/api/agent/state')
+}
+
+export function getAgentOverview(): Promise<AgentRuntimeOverview> {
+  return api<AgentRuntimeOverview>('/api/agent/overview')
+}
+
+export function previewAgentLaunch(request: AgentLaunchRequest): Promise<AgentLaunchPreview> {
+  return api<AgentLaunchPreview>('/api/agent/launch/preview', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify(request),
+  })
+}
+
+export function launchAgent(request: AgentLaunchRequest): Promise<AgentLaunchResult> {
+  return api<AgentLaunchResult>('/api/agent/launch', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify(request),
+  })
+}
+
+export function archiveAgentGoal(goalId: string): Promise<AgentGoal> {
+  return api<AgentGoal>(`/api/agent/goals/${encodeURIComponent(goalId)}/archive`, {
+    method: 'POST',
+  })
+}
+
+export function restoreAgentGoal(goalId: string): Promise<AgentGoal> {
+  return api<AgentGoal>(`/api/agent/goals/${encodeURIComponent(goalId)}/restore`, {
+    method: 'POST',
+  })
+}
+
+export function openAgentStream(
+  onOverview: (overview: AgentRuntimeOverview) => void,
+  onState: (state: 'connected' | 'disconnected' | 'error') => void,
+): WebSocket {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const socket = new WebSocket(`${protocol}//${window.location.host}/ws/agent`)
+  socket.addEventListener('open', () => onState('connected'))
+  socket.addEventListener('message', message => {
+    const event = JSON.parse(String(message.data)) as {
+      type: string
+      data?: AgentRuntimeOverview
+    }
+    if (event.type === 'agent_overview' && event.data) onOverview(event.data)
+  })
+  socket.addEventListener('error', () => onState('error'))
+  socket.addEventListener('close', () => onState('disconnected'))
+  return socket
+}
+
+export function getStrategyLibrary(params: {
+  origin?: string
+  family?: string
+  status?: string
+  includeHidden?: boolean
+  search?: string
+} = {}): Promise<StrategyLibraryPage> {
+  const query = new URLSearchParams()
+  if (params.origin) query.set('origin', params.origin)
+  if (params.family) query.set('family', params.family)
+  if (params.status) query.set('status', params.status)
+  if (params.includeHidden) query.set('include_hidden', 'true')
+  if (params.search) query.set('search', params.search)
+  const suffix = query.size ? `?${query}` : ''
+  return api<StrategyLibraryPage>(`/api/strategy-library${suffix}`, undefined, 30_000)
+}
+
+export function createPersonalStrategy(request: {
+  name: string
+  description: string
+  strategy_spec: Record<string, unknown>
+  origin_ref?: string
+}): Promise<StrategyLibraryItem> {
+  return api<StrategyLibraryItem>('/api/strategy-library', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify(request),
+  })
+}
+
+export function updatePersonalStrategy(
+  itemId: string,
+  request: { name?: string; description?: string; strategy_spec?: Record<string, unknown> },
+): Promise<StrategyLibraryItem> {
+  return api<StrategyLibraryItem>(`/api/strategy-library/${encodeURIComponent(itemId)}`, {
+    method: 'PATCH', headers: jsonHeaders, body: JSON.stringify(request),
+  })
+}
+
+export function archiveStrategyLibraryItem(itemId: string): Promise<StrategyLibraryItem> {
+  return api<StrategyLibraryItem>(`/api/strategy-library/${encodeURIComponent(itemId)}/archive`, {
+    method: 'POST',
+  })
+}
+
+export function restoreStrategyLibraryItem(itemId: string): Promise<StrategyLibraryItem> {
+  return api<StrategyLibraryItem>(`/api/strategy-library/${encodeURIComponent(itemId)}/restore`, {
+    method: 'POST',
+  })
+}
+
+export async function deletePersonalStrategy(itemId: string): Promise<void> {
+  await api(`/api/strategy-library/${encodeURIComponent(itemId)}`, { method: 'DELETE' })
+}
+
+export function getAuditEvents(params: {
+  limit?: number
+  cursor?: number
+  category?: string
+  severity?: string
+  search?: string
+} = {}): Promise<AuditEventPage> {
+  const query = new URLSearchParams({ limit: String(params.limit ?? 50) })
+  if (params.cursor) query.set('cursor', String(params.cursor))
+  if (params.category) query.set('category', params.category)
+  if (params.severity) query.set('severity', params.severity)
+  if (params.search) query.set('search', params.search)
+  return api<AuditEventPage>(`/api/audit/events?${query}`)
 }
 
 export function getAgentReadiness(): Promise<AgentReadiness> {

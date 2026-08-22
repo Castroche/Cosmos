@@ -235,6 +235,136 @@ export type AgentMarketCoverage = {
   coverage_status: 'healthy' | 'running' | 'queued' | 'degraded' | 'paused'
 }
 
+export type AgentStrategySummary = {
+  plan_id: string
+  name: string
+  symbol: string
+  timeframe: string
+  family: string
+  status: string
+  source: string
+  fingerprint: string
+  updated_at: string
+}
+
+export type AgentMarketSense = {
+  symbol: string
+  timeframe: string
+  status: string
+  last_event_at?: string | null
+  next_scan_at?: string | null
+  last_run_status?: string | null
+}
+
+export type AgentGoalOverview = {
+  goal_id: string
+  objective: string
+  status: string
+  autonomy_mode: string
+  symbols: string[]
+  timeframes: string[]
+  runtime_status: 'running' | 'waiting' | 'paused' | 'blocked' | 'offline'
+  last_heartbeat_at?: string | null
+  next_scan_at?: string | null
+  last_action?: string | null
+  last_action_summary?: string | null
+  current_strategy?: AgentStrategySummary | null
+  recently_generated_strategies: AgentStrategySummary[]
+  market_sense: AgentMarketSense[]
+  active_episode_count: number
+  uncertain_episode_count: number
+  blocking_reasons: string[]
+}
+
+export type AgentRuntimeOverview = {
+  generated_at: string
+  active_goal_count: number
+  latest_heartbeat_at?: string | null
+  risk_halted: boolean
+  risk_reason: string
+  goals: AgentGoalOverview[]
+}
+
+export type AgentLaunchRequest = {
+  profile_id: string
+  symbols: string[]
+  timeframes: string[]
+  autonomy_mode: AgentAutonomyMode
+  risk_template: string
+  objective: string
+  poll_seconds: number
+  authorize?: boolean
+  preview_fingerprint?: string
+}
+
+export type AgentLaunchPreview = {
+  profile_id: string
+  grant_fingerprint: string
+  confirmation_required: boolean
+  reuses_goal_id?: string | null
+  mode: AgentAutonomyMode
+  symbols: string[]
+  timeframes: string[]
+  risk_summary: Record<string, string | number | boolean>
+  blocking_reasons: string[]
+}
+
+export type AgentLaunchResult = {
+  profile: {
+    id: string
+    goal_id?: string | null
+    policy_id: string
+    symbols: string[]
+    timeframes: string[]
+    autonomy_mode: AgentAutonomyMode
+    risk_template: string
+    grant_fingerprint: string
+  }
+  goal_id: string
+  reused: boolean
+  status: string
+}
+
+export type StrategyLibraryItem = {
+  id: string
+  name: string
+  description: string
+  origin: 'builtin' | 'personal' | 'agent'
+  family: string
+  status: string
+  version: number | string
+  strategy_spec: Record<string, unknown>
+  spec_fingerprint: string
+  executable: boolean
+  hidden: boolean
+  can_edit: boolean
+  can_archive: boolean
+  can_restore: boolean
+  can_delete: boolean
+  can_clone: boolean
+  evidence_summary: string
+  updated_at?: string | null
+}
+
+export type StrategyLibraryPage = {
+  items: StrategyLibraryItem[]
+  total: number
+}
+
+export type AuditEvent = {
+  id: string
+  timestamp: string
+  category: string
+  severity: string
+  message: string
+  data: Record<string, string | number | boolean | null>
+}
+
+export type AuditEventPage = {
+  items: AuditEvent[]
+  next_cursor?: number | null
+}
+
 export type ShadowValidationTrial = {
   id: string
   goal_id: string

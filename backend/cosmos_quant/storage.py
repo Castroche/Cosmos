@@ -19,7 +19,7 @@ class SqliteStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
-        self._backup_before_schema_upgrade(6)
+        self._backup_before_schema_upgrade(7)
         self._initialize()
 
     def _backup_before_schema_upgrade(self, target_version: int) -> Path | None:
@@ -748,6 +748,23 @@ class SqliteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_strategy_candidates_status
                     ON strategy_candidates(status, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS personal_strategy_library (
+                    item_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    family TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    spec_fingerprint TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_personal_strategy_library_status
+                    ON personal_strategy_library(status, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS strategy_library_preferences (
+                    item_id TEXT PRIMARY KEY,
+                    hidden INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS risk_control_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     payload TEXT NOT NULL,
@@ -813,6 +830,17 @@ class SqliteStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS agent_launch_profiles (
+                    profile_id TEXT PRIMARY KEY,
+                    autonomy_mode TEXT NOT NULL,
+                    grant_fingerprint TEXT NOT NULL,
+                    authorized_fingerprint TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_launch_profiles_updated
+                    ON agent_launch_profiles(updated_at DESC);
                 CREATE TABLE IF NOT EXISTS agent_events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id TEXT NOT NULL UNIQUE,
@@ -989,6 +1017,7 @@ class SqliteStore:
                     (4, "autonomous_research_v2_artifacts", now),
                     (5, "autonomous_research_persistent_budgets", now),
                     (6, "autonomous_research_novelty_index", now),
+                    (7, "operator_workspace_and_personal_strategy_library", now),
                 ],
             )
 
@@ -3009,6 +3038,135 @@ class SqliteStore:
             ).fetchall()
         return [repair_text_tree(json.loads(row["payload"])) for row in rows]
 
+    def save_personal_strategy_library_item(self, item) -> None:
+        payload = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+        now = str(payload["updated_at"])
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO personal_strategy_library
+                    (item_id, name, family, status, spec_fingerprint, payload,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(item_id) DO UPDATE SET
+                    name = excluded.name,
+                    family = excluded.family,
+                    status = excluded.status,
+                    spec_fingerprint = excluded.spec_fingerprint,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    payload["id"],
+                    payload["name"],
+                    payload["family"],
+                    payload["status"],
+                    payload["spec_fingerprint"],
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    str(payload["created_at"]),
+                    now,
+                ),
+            )
+
+    def load_personal_strategy_library_item(self, item_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM personal_strategy_library WHERE item_id = ?",
+                (item_id,),
+            ).fetchone()
+        return repair_text_tree(json.loads(row["payload"])) if row else None
+
+    def list_personal_strategy_library_items(self, limit: int = 500) -> list[dict]:
+        bounded = min(max(limit, 1), 1000)
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM personal_strategy_library
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (bounded,),
+            ).fetchall()
+        return [repair_text_tree(json.loads(row["payload"])) for row in rows]
+
+    def delete_personal_strategy_library_item(self, item_id: str) -> bool:
+        with self._lock, self.connect() as connection:
+            deleted = connection.execute(
+                "DELETE FROM personal_strategy_library WHERE item_id = ?",
+                (item_id,),
+            ).rowcount
+        return bool(deleted)
+
+    def set_strategy_library_hidden(self, item_id: str, hidden: bool) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO strategy_library_preferences (item_id, hidden, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(item_id) DO UPDATE SET
+                    hidden = excluded.hidden,
+                    updated_at = excluded.updated_at
+                """,
+                (item_id, int(hidden), datetime.now(UTC).isoformat()),
+            )
+
+    def hidden_strategy_library_items(self) -> set[str]:
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                "SELECT item_id FROM strategy_library_preferences WHERE hidden = 1"
+            ).fetchall()
+        return {str(row["item_id"]) for row in rows}
+
+    def save_agent_launch_profile(self, profile) -> None:
+        payload = (
+            profile.model_dump(mode="json")
+            if hasattr(profile, "model_dump")
+            else dict(profile)
+        )
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_launch_profiles
+                    (profile_id, autonomy_mode, grant_fingerprint,
+                     authorized_fingerprint, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id) DO UPDATE SET
+                    autonomy_mode = excluded.autonomy_mode,
+                    grant_fingerprint = excluded.grant_fingerprint,
+                    authorized_fingerprint = excluded.authorized_fingerprint,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    payload["id"],
+                    payload["autonomy_mode"],
+                    payload["grant_fingerprint"],
+                    payload.get("authorized_fingerprint"),
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    str(payload["created_at"]),
+                    str(payload["updated_at"]),
+                ),
+            )
+
+    def load_agent_launch_profile(self, profile_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM agent_launch_profiles WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+        return repair_text_tree(json.loads(row["payload"])) if row else None
+
+    def list_agent_launch_profiles(self, limit: int = 100) -> list[dict]:
+        bounded = min(max(limit, 1), 200)
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM agent_launch_profiles
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (bounded,),
+            ).fetchall()
+        return [repair_text_tree(json.loads(row["payload"])) for row in rows]
+
     def retire_superseded_system_candidate(self, candidate_id: str) -> bool:
         """Archive an obsolete built-in even when its legacy spec no longer validates."""
 
@@ -3278,6 +3436,45 @@ class SqliteStore:
                 "SELECT payload FROM audit_events ORDER BY sequence DESC LIMIT ?", (limit,)
             ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
+
+    def page_audit(
+        self,
+        *,
+        limit: int = 50,
+        before_sequence: int | None = None,
+        category: str | None = None,
+        severity: str | None = None,
+        search: str | None = None,
+    ) -> tuple[list[dict], int | None]:
+        bounded = min(max(limit, 1), 200)
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if before_sequence is not None:
+            clauses.append("sequence < ?")
+            parameters.append(before_sequence)
+        if category:
+            clauses.append("category = ?")
+            parameters.append(category)
+        if severity:
+            clauses.append("severity = ?")
+            parameters.append(severity)
+        if search:
+            clauses.append("(message LIKE ? OR payload LIKE ?)")
+            needle = f"%{search}%"
+            parameters.extend([needle, needle])
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(bounded + 1)
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                "SELECT sequence, payload FROM audit_events"
+                + where
+                + " ORDER BY sequence DESC LIMIT ?",
+                parameters,
+            ).fetchall()
+        has_more = len(rows) > bounded
+        selected = rows[:bounded]
+        next_cursor = int(selected[-1]["sequence"]) if has_more and selected else None
+        return [json.loads(row["payload"]) for row in selected], next_cursor
 
     def save_candles(
         self,
