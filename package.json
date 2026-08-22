@@ -1,0 +1,22 @@
+{
+  "name": "cosmos-quant",
+  "private": true,
+  "workspaces": ["apps/web"],
+  "scripts": {
+    "dev": "concurrently -n API,WEB -c yellow,cyan \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": ".venv\\Scripts\\python.exe -m uvicorn cosmos_quant.api:app --app-dir backend --reload --host 127.0.0.1 --port 8000",
+    "dev:web": "npm --workspace @cosmos/web run dev",
+    "start": "npm run build && .venv\\Scripts\\python.exe -m uvicorn cosmos_quant.api:app --app-dir backend --host 127.0.0.1 --port 8000",
+    "start:api": ".venv\\Scripts\\python.exe -m uvicorn cosmos_quant.api:app --app-dir backend --host 127.0.0.1 --port 8000",
+    "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\cosmos-service.ps1 start",
+    "service:start:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\cosmos-service.ps1 start -Build",
+    "service:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\cosmos-service.ps1 status",
+    "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\cosmos-service.ps1 stop",
+    "build": "npm --workspace @cosmos/web run build",
+    "test": ".venv\\Scripts\\python.exe -m pytest backend/tests && npm --workspace @cosmos/web run typecheck",
+    "lint": ".venv\\Scripts\\python.exe -m ruff check backend && npm --workspace @cosmos/web run lint"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

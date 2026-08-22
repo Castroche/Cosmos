@@ -1,0 +1,79 @@
+{
+  "version": 2,
+  "symbols": [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT"
+  ],
+  "timeframes": [
+    "1h",
+    "4h"
+  ],
+  "requirements": [
+    {
+      "feature": "candles",
+      "minimum_history_days": "1095",
+      "minimum_venues": 2,
+      "minimum_points": 6570,
+      "maximum_gap_hours": "8",
+      "weight": 30,
+      "historical_source_policy": "Exchange-native OHLCV from two independent venues; closed bars only."
+    },
+    {
+      "feature": "funding",
+      "minimum_history_days": "730",
+      "minimum_venues": 1,
+      "minimum_points": 1500,
+      "maximum_gap_hours": "48",
+      "weight": 15,
+      "historical_source_policy": "Exchange-published perpetual funding history; never backfill from current funding."
+    },
+    {
+      "feature": "open_interest",
+      "minimum_history_days": "365",
+      "minimum_venues": 1,
+      "minimum_points": 365,
+      "maximum_gap_hours": "48",
+      "weight": 15,
+      "historical_source_policy": "Native or licensed point-in-time OI history with timestamped provenance."
+    },
+    {
+      "feature": "positioning",
+      "minimum_history_days": "365",
+      "minimum_venues": 1,
+      "minimum_points": 365,
+      "maximum_gap_hours": "48",
+      "weight": 10,
+      "historical_source_policy": "Exchange-published long/short positioning series; absent history disables the factor."
+    },
+    {
+      "feature": "basis",
+      "minimum_history_days": "365",
+      "minimum_venues": 1,
+      "minimum_points": 365,
+      "maximum_gap_hours": "48",
+      "weight": 10,
+      "historical_source_policy": "Point-in-time mark/index basis derived only from contemporaneous exchange records."
+    },
+    {
+      "feature": "order_flow",
+      "minimum_history_days": "180",
+      "minimum_venues": 1,
+      "minimum_points": 1080,
+      "maximum_gap_hours": "8",
+      "weight": 15,
+      "historical_source_policy": "Checksum-verified exchange futures klines with published taker-buy volume, or aggregate trades converted to closed-bar taker flow."
+    },
+    {
+      "feature": "liquidations",
+      "minimum_history_days": "90",
+      "minimum_venues": 1,
+      "minimum_points": 100,
+      "maximum_gap_hours": "0.034",
+      "weight": 5,
+      "historical_source_policy": "Truthful live collection or licensed history; no fabricated historical liquidation events. Live evidence must bind durable connection sessions with at least 99.9% coverage and no gap over 120 seconds."
+    }
+  ],
+  "no_synthetic_backfill": true,
+  "missing_feature_policy": "A strategy that requires a missing historical feature is ineligible for that dataset; current values may never be copied backward."
+}

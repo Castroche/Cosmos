@@ -1,0 +1,12 @@
+{
+  "job_id": "rcj_6bebe031fe2e45f9",
+  "report_id": "campaign_16a2ccf7a3804c25",
+  "dataset_id": "ds_b37b1cb8c74e65542fb9b601",
+  "cache_hits": 0,
+  "computed_cells": 1,
+  "health_samples": 16,
+  "health_failures": 0,
+  "health_latency_median_ms": 19.07,
+  "health_latency_p95_ms": 40.6,
+  "acceptance_http_status": 200
+}
