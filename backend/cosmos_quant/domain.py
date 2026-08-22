@@ -75,8 +75,35 @@ class OrderStatus(StrEnum):
     REJECTED = "rejected"
 
 
-class Candle(BaseModel):
+class PointInTimeRecord(BaseModel):
+    """Optional publication metadata retained across immutable research datasets."""
+
     model_config = ConfigDict(frozen=True)
+
+    event_time: datetime | None = None
+    available_time: datetime | None = None
+    source_time: datetime | None = None
+    ingestion_time: datetime | None = None
+    revision_policy: str | None = None
+
+    @model_validator(mode="after")
+    def validate_temporal_order(self):
+        if (
+            self.event_time is not None
+            and self.available_time is not None
+            and self.available_time < self.event_time
+        ):
+            raise ValueError("available_time cannot precede event_time")
+        if (
+            self.available_time is not None
+            and self.ingestion_time is not None
+            and self.ingestion_time < self.available_time
+        ):
+            raise ValueError("ingestion_time cannot precede available_time")
+        return self
+
+
+class Candle(PointInTimeRecord):
 
     timestamp: datetime
     open: Money
@@ -86,7 +113,7 @@ class Candle(BaseModel):
     volume: Money
 
 
-class FundingRatePoint(BaseModel):
+class FundingRatePoint(PointInTimeRecord):
     model_config = ConfigDict(frozen=True)
 
     timestamp: datetime
@@ -94,7 +121,7 @@ class FundingRatePoint(BaseModel):
     mark_price: Money | None = None
 
 
-class OpenInterestPoint(BaseModel):
+class OpenInterestPoint(PointInTimeRecord):
     model_config = ConfigDict(frozen=True)
 
     timestamp: datetime
@@ -108,7 +135,7 @@ class OpenInterestPoint(BaseModel):
         return self
 
 
-class PositioningPoint(BaseModel):
+class PositioningPoint(PointInTimeRecord):
     """Causal derivatives positioning observation published by an exchange."""
 
     model_config = ConfigDict(frozen=True)
@@ -133,7 +160,7 @@ class PositioningPoint(BaseModel):
         return self
 
 
-class BasisPoint(BaseModel):
+class BasisPoint(PointInTimeRecord):
     """Mark/index dislocation observed at one closed derivatives bar."""
 
     model_config = ConfigDict(frozen=True)
@@ -151,7 +178,7 @@ class BasisPoint(BaseModel):
         return self
 
 
-class OrderFlowBar(BaseModel):
+class OrderFlowBar(PointInTimeRecord):
     """Causal closed-bar taker flow from exchange-published trades or kline totals."""
 
     model_config = ConfigDict(frozen=True)
@@ -201,7 +228,7 @@ class LiquidationEvent(BaseModel):
     source_variant: str = "all_market_1000ms_snapshot"
 
 
-class LiquidationFlowPoint(BaseModel):
+class LiquidationFlowPoint(PointInTimeRecord):
     """Closed-hour forced-flow context with explicit cross-contract provenance."""
 
     model_config = ConfigDict(frozen=True)

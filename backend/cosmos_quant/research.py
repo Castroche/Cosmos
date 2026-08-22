@@ -21,6 +21,23 @@ from .domain import (
 )
 from .timeframes import TIMEFRAME_SECONDS
 
+POINT_IN_TIME_FINGERPRINT_EXCLUDES = {
+    "event_time",
+    "available_time",
+    "source_time",
+    "ingestion_time",
+    "revision_policy",
+}
+
+
+def _market_fact_fingerprint_json(point) -> str:
+    """Keep legacy fact hashes stable; policies are bound by dataset/artifact schema."""
+
+    return point.model_dump_json(
+        exclude_none=True,
+        exclude=POINT_IN_TIME_FINGERPRINT_EXCLUDES,
+    )
+
 
 class ResearchJobStatus(StrEnum):
     QUEUED = "queued"
@@ -41,7 +58,7 @@ class BacktestJob(BaseModel):
 
 
 class ResearchDataset(BaseModel):
-    schema_version: int = 8
+    schema_version: int = 9
     id: str
     exchange: str
     market_type: str
@@ -77,6 +94,8 @@ class ResearchDataset(BaseModel):
     expected_candle_count: int = 0
     coverage_ratio: Decimal = Decimal("0")
     closed_bars_only: bool = True
+    point_in_time_status: Literal["legacy", "verified", "unverified"] = "legacy"
+    availability_policy_version: int = Field(default=1, ge=1)
     research_role: Literal["general", "development", "blind"] = "general"
     source_dataset_id: str | None = None
     blind_set_id: str | None = None
@@ -139,25 +158,25 @@ def candle_data_fingerprint(
     )
     for candle in candles:
         digest.update(b"\n")
-        digest.update(candle.model_dump_json(exclude_none=True).encode("utf-8"))
+        digest.update(_market_fact_fingerprint_json(candle).encode("utf-8"))
     for point in funding_rates or []:
         digest.update(b"\nfunding:")
-        digest.update(point.model_dump_json(exclude_none=True).encode("utf-8"))
+        digest.update(_market_fact_fingerprint_json(point).encode("utf-8"))
     for point in open_interest or []:
         digest.update(b"\nopen-interest:")
-        digest.update(point.model_dump_json(exclude_none=True).encode("utf-8"))
+        digest.update(_market_fact_fingerprint_json(point).encode("utf-8"))
     for point in positioning or []:
         digest.update(b"\npositioning:")
-        digest.update(point.model_dump_json(exclude_none=True).encode("utf-8"))
+        digest.update(_market_fact_fingerprint_json(point).encode("utf-8"))
     for point in basis or []:
         digest.update(b"\nbasis:")
-        digest.update(point.model_dump_json(exclude_none=True).encode("utf-8"))
+        digest.update(_market_fact_fingerprint_json(point).encode("utf-8"))
     for point in order_flow or []:
         digest.update(b"\norder-flow:")
-        digest.update(point.model_dump_json(exclude_none=True).encode("utf-8"))
+        digest.update(_market_fact_fingerprint_json(point).encode("utf-8"))
     for point in liquidation_flow or []:
         digest.update(b"\nliquidation-flow:")
-        digest.update(point.model_dump_json(exclude_none=True).encode("utf-8"))
+        digest.update(_market_fact_fingerprint_json(point).encode("utf-8"))
     return digest.hexdigest()[:24]
 
 
@@ -349,6 +368,7 @@ def build_research_dataset(
         timeframe_seconds=interval_seconds,
         expected_candle_count=expected_count,
         coverage_ratio=coverage_ratio.quantize(Decimal("0.0001")),
+        point_in_time_status="verified",
         research_role=research_role,
         source_dataset_id=source_dataset_id,
         blind_set_id=blind_set_id,
@@ -360,6 +380,11 @@ def build_research_dataset(
             "deduplicated": True,
             "sorted_ascending": True,
             "closed_bars_only": True,
+            "event_time_policy": "exchange_event_or_bar_open",
+            "available_time_policy": "closed_bar_or_exchange_publication",
+            "source_time_policy": "exchange_published_timestamp",
+            "ingestion_time_policy": "cosmos_persistence_time",
+            "revision_policy": "append_only_or_explicitly_versioned",
             "funding_bound_to_fingerprint": bool(funding_rates),
             "open_interest_bound_to_fingerprint": bool(open_interest_points),
             "positioning_bound_to_fingerprint": bool(positioning_points),

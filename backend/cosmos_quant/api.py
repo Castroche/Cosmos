@@ -85,6 +85,11 @@ from .ai_gateway import (
     AIUsage,
 )
 from .ai_usage import AIUsageReport
+from .autonomous_research import (
+    AutonomousResearchRunRequest,
+    FastGateEngine,
+    ResearchRunResult,
+)
 from .backtest import (
     CAUSAL_LIBRARY_POLICY_VERSION,
     BacktestResult,
@@ -94,6 +99,7 @@ from .backtest import (
     run_walk_forward_backtest,
 )
 from .backup import BackupResult, BackupService
+from .build_identity import capture_runtime_build_identity
 from .carry import (
     CARRY_BACKTEST_ENGINE_VERSION,
     CARRY_STRATEGY_LIBRARY,
@@ -232,12 +238,15 @@ from .research_campaign import (
     finalize_campaign,
     historical_feature_eligibility,
     ineligible_campaign_cell,
+    redact_campaign_for_research_agent,
     research_experiment_fingerprint,
     research_lineage_id,
     research_trial_family_id,
     validate_campaign_execution_certificate,
     validate_causal_policy_definition,
 )
+from .research_certificates import GeneratorEnvelopeCertificate
+from .research_evolution import EvolutionOperation
 from .research_holdout import (
     SealedHoldoutReport,
     SealedHoldoutRequest,
@@ -248,6 +257,12 @@ from .research_hypothesis import (
     HypothesisRevision,
     generate_campaign_failure_revisions,
     generate_failure_driven_revisions,
+)
+from .research_integrity import (
+    OnlineFDRController,
+    PermanentTrialRecord,
+    TrialResult,
+    TrialType,
 )
 from .research_lifecycle import (
     CandidateStatus,
@@ -285,6 +300,7 @@ from .strategy_adaptation import (
     AdaptiveStrategyCandidate,
     build_adaptive_strategy_candidates,
 )
+from .strategy_dsl import ResearchHypothesisV2, StrategyDSLV2, compile_strategy_dsl
 from .strategy_factory import StrategyFactory
 from .strategy_library import (
     StrategyLibraryEntry,
@@ -315,6 +331,7 @@ from .timeframes import (
 
 env_settings = Settings()
 store = SqliteStore(env_settings.cosmos_data_dir / "cosmos.db")
+runtime_build_identity = capture_runtime_build_identity()
 secret_store = SecretStore(env_settings.cosmos_data_dir / "cosmos.db")
 configuration_service = ConfigurationService(store, secret_store)
 ai_configuration_service = AIConfigurationService(store, secret_store)
@@ -399,8 +416,7 @@ def agent_trailing_state(
 
     state = {
         "configured": bool(
-            plan.exit.trailing_stop_atr is not None
-            or plan.exit.break_even_after_first_target
+            plan.exit.trailing_stop_atr is not None or plan.exit.break_even_after_first_target
         ),
         "activation": str(plan.exit.trailing_activation),
         "active": False,
@@ -447,9 +463,7 @@ def agent_trailing_state(
             initial_risk=initial_risk,
         )
     )
-    break_even_active = bool(
-        plan.exit.break_even_after_first_target and targets_reached >= 1
-    )
+    break_even_active = bool(plan.exit.break_even_after_first_target and targets_reached >= 1)
     active = trailing_active or break_even_active
     state.update(
         {
@@ -464,9 +478,7 @@ def agent_trailing_state(
     stop_price = plan.exit.stop_loss
     if break_even_active:
         stop_price = (
-            max(stop_price, entry_price)
-            if plan.side == Side.LONG
-            else min(stop_price, entry_price)
+            max(stop_price, entry_price) if plan.side == Side.LONG else min(stop_price, entry_price)
         )
     if trailing_active:
         assert plan.exit.trailing_stop_atr is not None
@@ -3011,9 +3023,7 @@ class CausalPolicyCampaignSpec(BaseModel):
         if len(self.library_entry_ids) != len(set(self.library_entry_ids)):
             raise ValueError("causal policy library entry identifiers must be unique")
         if self.minimum_directional_consensus > self.maximum_candidates_per_bar:
-            raise ValueError(
-                "causal policy directional consensus cannot exceed max candidates"
-            )
+            raise ValueError("causal policy directional consensus cannot exceed max candidates")
         return self
 
 
@@ -3063,21 +3073,17 @@ class ResearchCampaignRequest(BaseModel):
             for item in self.causal_policy_specs
         }
         if len(policy_shapes) != len(self.causal_policy_specs):
-            raise ValueError(
-                "causal policy Campaign hypotheses must be structurally unique"
-            )
+            raise ValueError("causal policy Campaign hypotheses must be structurally unique")
         return self
+
+
 class CausalPolicyBacktestRequest(BaseModel):
     dataset_id: str
     library_entry_ids: list[str] = Field(min_length=2, max_length=200)
     maximum_candidates_per_bar: int = Field(default=3, ge=1, le=20)
     abstain_on_ambiguous_regime: bool = True
-    minimum_regime_confidence: Decimal = Field(
-        default=Decimal("0"), ge=0, le=1
-    )
-    minimum_signal_confidence: Decimal = Field(
-        default=Decimal("0"), ge=0, le=1
-    )
+    minimum_regime_confidence: Decimal = Field(default=Decimal("0"), ge=0, le=1)
+    minimum_signal_confidence: Decimal = Field(default=Decimal("0"), ge=0, le=1)
     minimum_directional_consensus: int = Field(default=1, ge=1, le=20)
     research_trial_count: int = Field(default=1, ge=1, le=100000)
 
@@ -3086,9 +3092,7 @@ class CausalPolicyBacktestRequest(BaseModel):
         if len(self.library_entry_ids) != len(set(self.library_entry_ids)):
             raise ValueError("causal policy library entry identifiers must be unique")
         if self.minimum_directional_consensus > self.maximum_candidates_per_bar:
-            raise ValueError(
-                "causal policy directional consensus cannot exceed max candidates"
-            )
+            raise ValueError("causal policy directional consensus cannot exceed max candidates")
         return self
 
 
@@ -3609,26 +3613,17 @@ def build_plan_causal_policy_selection_evidence(
     if definition is None or certificate is None:
         raise ValueError("Campaign does not contain a certified causal policy")
     policy_fingerprint = validate_causal_policy_definition(definition)
-    if (
-        policy_fingerprint != certificate.strategy_fingerprint
-        or policy_fingerprint
-        != next(
-            item.strategy_fingerprint
-            for item in report.candidates
-            if item.library_entry_id == report.selected_library_entry_id
-        )
+    if policy_fingerprint != certificate.strategy_fingerprint or policy_fingerprint != next(
+        item.strategy_fingerprint
+        for item in report.candidates
+        if item.library_entry_id == report.selected_library_entry_id
     ):
         raise ValueError("causal policy certificate and Campaign evidence differ")
     if bool(definition["abstain_on_ambiguous_regime"]) and assessment.ambiguous:
         raise ValueError("certified causal policy requires abstention in an ambiguous regime")
-    if assessment.confidence < Decimal(
-        str(definition.get("minimum_regime_confidence", "0"))
-    ):
+    if assessment.confidence < Decimal(str(definition.get("minimum_regime_confidence", "0"))):
         raise ValueError("current regime confidence is below the certified policy threshold")
-    priors = [
-        CausalStrategyPrior.model_validate(item)
-        for item in definition["priors"]
-    ]
+    priors = [CausalStrategyPrior.model_validate(item) for item in definition["priors"]]
     ranked = rank_causal_strategy_priors(priors, assessment, set(available_data))
     admitted = ranked[: int(definition["maximum_candidates_per_bar"])]
     selected_prior = next(
@@ -3641,9 +3636,7 @@ def build_plan_causal_policy_selection_evidence(
         raise ValueError("selected public strategy fingerprint differs from the trade plan")
     if plan.signal_candle_at is None or plan.data_as_of is None:
         raise ValueError("causal policy plan must bind signal and market evidence times")
-    minimum_signal_confidence = Decimal(
-        str(definition.get("minimum_signal_confidence", "0"))
-    )
+    minimum_signal_confidence = Decimal(str(definition.get("minimum_signal_confidence", "0")))
     raw_consensus_evidence = actionable_library_evidence or [
         {
             "library_entry_id": selected_library_entry_id,
@@ -3686,8 +3679,7 @@ def build_plan_causal_policy_selection_evidence(
     )
     required_consensus = int(definition.get("minimum_directional_consensus", 1))
     if (
-        selected_library_entry_id
-        not in {item["library_entry_id"] for item in consensus_evidence}
+        selected_library_entry_id not in {item["library_entry_id"] for item in consensus_evidence}
         or len(consensus_evidence) < required_consensus
     ):
         raise ValueError("current signals do not satisfy certified directional consensus")
@@ -3745,8 +3737,7 @@ def validate_plan_causal_policy_selection(
         return False
     return bool(
         expected == evidence
-        and getattr(plan, "causal_policy_fingerprint", None)
-        == evidence["policy_fingerprint"]
+        and getattr(plan, "causal_policy_fingerprint", None) == evidence["policy_fingerprint"]
     )
 
 
@@ -3809,12 +3800,8 @@ def matching_execution_campaign(
                         report,
                         assessment=causal_policy_assessment,
                         available_data=causal_policy_available_data,
-                        selected_library_entry_id=(
-                            causal_policy_selected_library_entry_id
-                        ),
-                        actionable_library_evidence=(
-                            causal_policy_actionable_evidence
-                        ),
+                        selected_library_entry_id=(causal_policy_selected_library_entry_id),
+                        actionable_library_evidence=(causal_policy_actionable_evidence),
                     )
                 except (StopIteration, ValueError):
                     strategy_binding_valid = False
@@ -3840,8 +3827,7 @@ def matching_execution_campaign(
             )
         plan_binding_valid = (
             getattr(plan, "research_campaign_id", None) == report.id
-            and getattr(plan, "campaign_certificate_fingerprint", None)
-            == certificate.fingerprint
+            and getattr(plan, "campaign_certificate_fingerprint", None) == certificate.fingerprint
         )
         if (
             report.autonomous_execution_eligible
@@ -5567,21 +5553,15 @@ def build_agent_coordinator(goal: AgentGoal, policy: AgentPolicy) -> AgentCoordi
                     plan,
                     campaign_payloads,
                     require_plan_binding=False,
-                    causal_policy_assessment=(
-                        assessment if selected_library_entry_id else None
-                    ),
+                    causal_policy_assessment=(assessment if selected_library_entry_id else None),
                     causal_policy_available_data=(
                         current_available_data if selected_library_entry_id else None
                     ),
                     causal_policy_selected_library_entry_id=(
-                        str(selected_library_entry_id)
-                        if selected_library_entry_id
-                        else None
+                        str(selected_library_entry_id) if selected_library_entry_id else None
                     ),
                     causal_policy_actionable_evidence=(
-                        current_policy_actionable_evidence
-                        if selected_library_entry_id
-                        else None
+                        current_policy_actionable_evidence if selected_library_entry_id else None
                     ),
                 )
                 if policy.autonomy_mode
@@ -5599,14 +5579,10 @@ def build_agent_coordinator(goal: AgentGoal, policy: AgentPolicy) -> AgentCoordi
                         assessment=assessment,
                         available_data=current_available_data,
                         selected_library_entry_id=str(selected_library_entry_id),
-                        actionable_library_evidence=(
-                            current_policy_actionable_evidence
-                        ),
+                        actionable_library_evidence=(current_policy_actionable_evidence),
                     )
                     plan.causal_policy_fingerprint = certificate.strategy_fingerprint
-                    plan.causal_policy_selected_library_entry_id = str(
-                        selected_library_entry_id
-                    )
+                    plan.causal_policy_selected_library_entry_id = str(selected_library_entry_id)
                     plan.causal_policy_selection_evidence = selection_evidence
                 plan.research_campaign_id = matching_campaign.id
                 plan.campaign_certificate_fingerprint = certificate.fingerprint
@@ -6581,8 +6557,7 @@ def build_agent_coordinator(goal: AgentGoal, policy: AgentPolicy) -> AgentCoordi
                 development_metadata[dataset_id] = dataset
         selected_library_entry_ids = list(library_entry_ids or [])
         selected_causal_policy_specs = [
-            CausalPolicyCampaignSpec.model_validate(item)
-            for item in (causal_policy_specs or [])
+            CausalPolicyCampaignSpec.model_validate(item) for item in (causal_policy_specs or [])
         ]
         data_preflight: dict = {
             "applied": False,
@@ -6658,17 +6633,12 @@ def build_agent_coordinator(goal: AgentGoal, policy: AgentPolicy) -> AgentCoordi
                 parent_campaign_id=parent_campaign_id,
             )
         )
-        result = report.model_dump(mode="json")
+        result = redact_campaign_for_research_agent(report)
         result["causal_data_preflight"] = data_preflight
-        if report.blind_consumption_id:
-            result["cells"] = [
-                cell for cell in result["cells"] if cell["dataset_role"] == "research"
-            ]
-            result["blind_candidate"] = None
-            result["blind_disclosure_policy"] = (
-                "The one-time blind result is disclosed to the Agent only as PASS/HOLD; "
-                "blind metrics cannot be used for revision."
-            )
+        result["blind_disclosure_policy"] = (
+            "Research Agents receive only PASS, FAIL or SHADOW_REQUIRED with coarse codes; "
+            "blind scope and metrics are sealed."
+        )
         return result
 
     async def run_relative_value_research(
@@ -6831,6 +6801,73 @@ def build_agent_coordinator(goal: AgentGoal, policy: AgentPolicy) -> AgentCoordi
         )
         return response.model_dump(mode="json")
 
+    async def detect_research_opportunity(symbol: str, timeframe: str) -> dict:
+        market, history = await runtime.market_context(
+            limit=300, symbol=symbol, timeframe=timeframe
+        )
+        candles = closed_candles(history, timeframe, market.timestamp)
+        assessment = score_market_state(candles)
+        return {
+            "snapshot_time": market.timestamp.isoformat(),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "closed_bar_count": len(candles),
+            "market_state": assessment.model_dump(mode="json"),
+            "permitted_next_tools": ["propose_hypothesis"],
+        }
+
+    def propose_hypothesis(hypothesis: dict) -> dict:
+        validated = ResearchHypothesisV2.model_validate(hypothesis)
+        return {
+            "hypothesis": validated.model_dump(mode="json"),
+            "status": "SEMANTIC_PROPOSAL_ONLY",
+            "notice": "Certification Service must persist this before empirical evaluation",
+        }
+
+    def propose_strategy_dsl(dsl: dict) -> dict:
+        validated = StrategyDSLV2.model_validate(dsl)
+        ir = compile_strategy_dsl(validated)
+        return {
+            "dsl": validated.model_dump(mode="json"),
+            "canonical_ir_hash": ir.fingerprint,
+            "required_features": list(ir.required_features),
+            "status": "SHADOW_REQUIRED_UNLESS_CERTIFIED_GENERATOR_PROVENANCE_EXISTS",
+        }
+
+    def propose_mutation(
+        operation: EvolutionOperation,
+        parent_ir_hash: str,
+        changed_nodes: list[str],
+        reason: str,
+    ) -> dict:
+        if not changed_nodes or len(changed_nodes) > 8:
+            raise ValueError("mutation must name between one and eight changed nodes")
+        return {
+            "operation": str(operation),
+            "parent_ir_hash": parent_ir_hash,
+            "changed_nodes": changed_nodes,
+            "reason": reason[:500],
+            "status": "STRUCTURAL_PROPOSAL_ONLY",
+        }
+
+    def review_candidate(dsl: dict) -> dict:
+        ir = compile_strategy_dsl(StrategyDSLV2.model_validate(dsl))
+        return {
+            "canonical_ir_hash": ir.fingerprint,
+            "node_count": len(ir.nodes),
+            "maximum_warmup": max(node.warmup for node in ir.nodes),
+            "required_features": list(ir.required_features),
+            "review": "SEMANTICALLY_VALID",
+        }
+
+    def summarize_failure(reason_codes: list[str]) -> dict:
+        bounded = sorted(set(reason_codes))[:32]
+        return {
+            "reason_codes": bounded,
+            "summary": "Candidate did not advance through one or more coarse research gates.",
+            "blind_metrics_disclosed": False,
+        }
+
     async def review_strategy_health() -> dict:
         report = await review_strategy_governance()
         return report.model_dump(mode="json")
@@ -6898,6 +6935,58 @@ def build_agent_coordinator(goal: AgentGoal, policy: AgentPolicy) -> AgentCoordi
         }
 
     for tool in (
+        AgentTool(
+            name="detect_research_opportunity",
+            description=(
+                "Read a bounded point-in-time market snapshot and identify whether a "
+                "research hypothesis is warranted. Returns no database or execution handle"
+            ),
+            risk_class=ToolRiskClass.READ_ONLY,
+            handler=detect_research_opportunity,
+        ),
+        AgentTool(
+            name="propose_hypothesis",
+            description=(
+                "Validate one ResearchHypothesisV2 semantic proposal. This tool does not "
+                "persist, backtest, certify, adjust risk, or place orders"
+            ),
+            risk_class=ToolRiskClass.RESEARCH,
+            handler=propose_hypothesis,
+        ),
+        AgentTool(
+            name="propose_strategy_dsl",
+            description=(
+                "Parse and semantically compile versioned JSON Strategy DSL v2. Free DSL "
+                "remains Shadow-only and this tool cannot issue provenance or certificates"
+            ),
+            risk_class=ToolRiskClass.RESEARCH,
+            handler=propose_strategy_dsl,
+        ),
+        AgentTool(
+            name="propose_mutation",
+            description=(
+                "Propose exactly one bounded structural evolution operation and changed "
+                "node set; budget enforcement remains outside the LLM capability"
+            ),
+            risk_class=ToolRiskClass.RESEARCH,
+            handler=propose_mutation,
+        ),
+        AgentTool(
+            name="review_candidate",
+            description=(
+                "Review DSL semantic validity and complexity without return or blind metrics"
+            ),
+            risk_class=ToolRiskClass.RESEARCH,
+            handler=review_candidate,
+        ),
+        AgentTool(
+            name="summarize_failure",
+            description=(
+                "Summarize fixed coarse failure reason codes without sealed blind attribution"
+            ),
+            risk_class=ToolRiskClass.READ_ONLY,
+            handler=summarize_failure,
+        ),
         AgentTool(
             name="inspect_strategy_library",
             description=(
@@ -8566,6 +8655,72 @@ async def strategy_spec_contract():
     }
 
 
+@app.post("/api/research/autonomous-runs", response_model=ResearchRunResult)
+async def create_autonomous_research_run(request: AutonomousResearchRunRequest):
+    envelope = None
+    if request.generator_envelope_id:
+        envelope_payload = await asyncio.to_thread(
+            store.load_generator_envelope, request.generator_envelope_id
+        )
+        if envelope_payload is None:
+            raise HTTPException(404, "generator envelope not found")
+        envelope = GeneratorEnvelopeCertificate.model_validate(envelope_payload)
+    engine = FastGateEngine(
+        store,
+        runtime_build_identity,
+        envelope=envelope,
+    )
+    return await asyncio.to_thread(engine.run, request)
+
+
+@app.get(
+    "/api/research/autonomous-runs/{run_id}",
+    response_model=ResearchRunResult,
+)
+async def autonomous_research_run_result(run_id: str):
+    payload = await asyncio.to_thread(store.load_autonomous_research_event, run_id)
+    if payload is None:
+        raise HTTPException(404, "autonomous research run not found")
+    if "disposition" not in payload:
+        raise HTTPException(409, "autonomous research decision is not committed")
+    return ResearchRunResult.model_validate(payload)
+
+
+@app.get("/api/research/trials")
+async def permanent_trial_ledger(family_id: str | None = None, limit: int = 100):
+    trials = await asyncio.to_thread(
+        partial(
+            store.list_research_trials,
+            family_id=family_id,
+            limit=min(max(limit, 1), 1_000),
+        )
+    )
+    # Never expose return statistics or sealed blind attribution through the
+    # public/Agent-facing ledger DTO.
+    return [
+        {
+            "id": trial["id"],
+            "research_event_id": trial["research_event_id"],
+            "hypothesis_id": trial["hypothesis_id"],
+            "family_id": trial["family_id"],
+            "candidate_id": trial["candidate_id"],
+            "trial_type": trial["trial_type"],
+            "result": trial.get("result", "pending"),
+            "reason_codes": trial.get("reason_codes", []),
+            "created_at": trial["created_at"],
+        }
+        for trial in trials
+    ]
+
+
+@app.get("/api/research/certificates/{certificate_id}")
+async def research_certificate_status(certificate_id: str):
+    payload = await asyncio.to_thread(store.load_research_certificate_status, certificate_id)
+    if payload is None:
+        raise HTTPException(404, "research certificate not found")
+    return payload
+
+
 @app.get("/api/research/datasets", response_model=list[ResearchDataset])
 async def research_datasets(limit: int = 50):
     bounded_limit = min(max(limit, 1), 200)
@@ -8742,13 +8897,7 @@ class CausalPolicyCampaignEntry:
         # policy-wide historical coverage requirement. The single-dataset
         # development screen may still explore partial availability, but a
         # formal Campaign cell becomes ineligible when this union is missing.
-        return sorted(
-            {
-                feature
-                for prior in self.priors
-                for feature in prior.required_data
-            }
-        )
+        return sorted({feature for prior in self.priors for feature in prior.required_data})
 
     @property
     def validated_spec(self) -> _CampaignPolicyFingerprint:
@@ -8765,9 +8914,7 @@ class CausalPolicyCampaignEntry:
             "minimum_regime_confidence": str(self.minimum_regime_confidence),
             "minimum_signal_confidence": str(self.minimum_signal_confidence),
             "minimum_directional_consensus": self.minimum_directional_consensus,
-            "selection_inputs": (
-                "closed_bar_regime_and_latest_known_causal_features_only"
-            ),
+            "selection_inputs": ("closed_bar_regime_and_latest_known_causal_features_only"),
             "realized_return_inputs_forbidden": True,
             "priors": [
                 prior.model_dump(mode="json")
@@ -8838,21 +8985,11 @@ async def backtest_causal_policy_entry_on_dataset(
         order_flow=order_flow,
         liquidation_flow=liquidation_flow,
         causal_strategy_priors=list(entry.priors),
-        causal_policy_max_candidates_per_bar=(
-            entry.maximum_candidates_per_bar
-        ),
-        causal_policy_abstain_on_ambiguous_regime=(
-            entry.abstain_on_ambiguous_regime
-        ),
-        causal_policy_minimum_regime_confidence=(
-            entry.minimum_regime_confidence
-        ),
-        causal_policy_minimum_signal_confidence=(
-            entry.minimum_signal_confidence
-        ),
-        causal_policy_minimum_directional_consensus=(
-            entry.minimum_directional_consensus
-        ),
+        causal_policy_max_candidates_per_bar=(entry.maximum_candidates_per_bar),
+        causal_policy_abstain_on_ambiguous_regime=(entry.abstain_on_ambiguous_regime),
+        causal_policy_minimum_regime_confidence=(entry.minimum_regime_confidence),
+        causal_policy_minimum_signal_confidence=(entry.minimum_signal_confidence),
+        causal_policy_minimum_directional_consensus=(entry.minimum_directional_consensus),
         research_trial_count=research_trial_count,
         require_regime_family_fit=True,
     )
@@ -8892,14 +9029,10 @@ async def backtest_causal_strategy_policy(
                 id="single_dataset_development_screen",
                 library_entry_ids=request.library_entry_ids,
                 maximum_candidates_per_bar=request.maximum_candidates_per_bar,
-                abstain_on_ambiguous_regime=(
-                    request.abstain_on_ambiguous_regime
-                ),
+                abstain_on_ambiguous_regime=(request.abstain_on_ambiguous_regime),
                 minimum_regime_confidence=request.minimum_regime_confidence,
                 minimum_signal_confidence=request.minimum_signal_confidence,
-                minimum_directional_consensus=(
-                    request.minimum_directional_consensus
-                ),
+                minimum_directional_consensus=(request.minimum_directional_consensus),
             )
         )
     except LookupError as exc:
@@ -9174,8 +9307,7 @@ async def execute_research_campaign(
     if causal_policy_mode:
         try:
             entries = [
-                build_causal_policy_campaign_entry(policy)
-                for policy in request.causal_policy_specs
+                build_causal_policy_campaign_entry(policy) for policy in request.causal_policy_specs
             ]
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
@@ -9556,9 +9688,7 @@ async def execute_research_campaign(
             replayed_report = ResearchCampaignReport.model_validate(replayed_payload)
     effective_trial_count = int(ledger_summary["effective_trial_count"])
     if parent_report is not None:
-        experiment_kind = (
-            "bounded_policy_revision" if causal_policy_mode else "bounded_revision"
-        )
+        experiment_kind = "bounded_policy_revision" if causal_policy_mode else "bounded_revision"
         predecessor_campaign_id = parent_report.id
     elif lineage_history:
         experiment_kind = "structural_extension"
@@ -9566,6 +9696,95 @@ async def execute_research_campaign(
     else:
         experiment_kind = "initial"
         predecessor_campaign_id = None
+
+    # Complete all non-return data gates before reserving empirical trials.
+    # Every eligible hypothesis is then charged exactly once before a cache or
+    # backtest result can expose return-bearing evidence.
+    feature_eligibility: dict[tuple[str, str], list[str]] = {}
+    research_dataset_id_set = set(research_dataset_ids)
+    for entry in entries:
+        for (
+            dataset,
+            _candles,
+            funding,
+            open_interest,
+            positioning,
+            basis,
+            order_flow,
+            liquidation_flow,
+        ) in datasets:
+            if dataset.id not in research_dataset_id_set:
+                continue
+            feature_eligibility[(entry.id, dataset.id)] = historical_feature_eligibility(
+                dataset=dataset,
+                required_data=entry.required_data,
+                funding=funding,
+                open_interest=open_interest,
+                positioning=positioning,
+                basis=basis,
+                order_flow=order_flow,
+                liquidation_flow=liquidation_flow,
+            )
+
+    fdr_controller = OnlineFDRController(store)
+    permanent_trials: dict[str, PermanentTrialRecord] = {}
+    fdr_allocations: dict[str, tuple[object, object]] = {}
+    for entry in entries:
+        eligible_dataset_fingerprints = sorted(
+            dataset.data_fingerprint
+            for dataset, *_rest in datasets
+            if dataset.id in research_dataset_id_set
+            and not feature_eligibility[(entry.id, dataset.id)]
+        )
+        if not eligible_dataset_fingerprints:
+            continue
+        dataset_scope_fingerprint = sha256(
+            json.dumps(
+                eligible_dataset_fingerprints,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        artifact_fingerprint = sha256(
+            json.dumps(
+                {
+                    "engine_version": CAMPAIGN_ENGINE_VERSION,
+                    "strategy_fingerprint": entry.validated_spec.fingerprint,
+                    "dataset_scope_fingerprint": dataset_scope_fingerprint,
+                    "validation_fingerprint": research_configuration_fingerprint,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        trial = PermanentTrialRecord.empirical(
+            research_event_id=experiment_id,
+            campaign_id=campaign_id,
+            hypothesis_id=f"legacy_hypothesis:{entry.validated_spec.fingerprint}",
+            family_id=f"{trial_family_id}:{entry.family.value}",
+            candidate_id=entry.id,
+            dataset_fingerprint=dataset_scope_fingerprint,
+            validation_fingerprint=research_configuration_fingerprint,
+            artifact_fingerprint=artifact_fingerprint,
+        )
+        persisted_trial = PermanentTrialRecord.model_validate(
+            await asyncio.to_thread(store.reserve_research_trial, trial)
+        )
+        global_allocation = await asyncio.to_thread(
+            fdr_controller.allocate_alpha,
+            "research:global",
+            scope="global",
+            idempotency_key=f"{persisted_trial.idempotency_key}:global",
+        )
+        family_allocation = await asyncio.to_thread(
+            fdr_controller.allocate_alpha,
+            f"research:family:{persisted_trial.family_id}",
+            scope=persisted_trial.family_id,
+            idempotency_key=f"{persisted_trial.idempotency_key}:family",
+        )
+        permanent_trials[entry.id] = persisted_trial
+        fdr_allocations[entry.id] = (global_allocation, family_allocation)
+
     semaphore = asyncio.Semaphore(CAMPAIGN_CELL_CONCURRENCY)
     completed_cells = 0
     cache_hits = 0
@@ -9604,28 +9823,7 @@ async def execute_research_campaign(
                 trial_count=statistical_trial_count,
                 research_configuration_fingerprint=(research_configuration_fingerprint),
             )
-            cached_payload = await asyncio.to_thread(
-                store.load_research_campaign_cell,
-                cache_key,
-            )
-            if cached_payload is not None:
-                cell = ResearchCampaignCell.model_validate(cached_payload).model_copy(
-                    update={"dataset_role": dataset_role}
-                )
-                cache_hits += 1
-                completed_cells += 1
-                await report_progress()
-                return cell
-            data_ineligibility_reasons = historical_feature_eligibility(
-                dataset=dataset,
-                required_data=entry.required_data,
-                funding=funding,
-                open_interest=open_interest,
-                positioning=positioning,
-                basis=basis,
-                order_flow=order_flow,
-                liquidation_flow=liquidation_flow,
-            )
+            data_ineligibility_reasons = feature_eligibility.get((entry.id, dataset.id), [])
             if data_ineligibility_reasons:
                 cell = ineligible_campaign_cell(
                     library_entry=entry,
@@ -9642,6 +9840,18 @@ async def execute_research_campaign(
                     cell=cell,
                 )
                 computed_cells += 1
+                completed_cells += 1
+                await report_progress()
+                return cell
+            cached_payload = await asyncio.to_thread(
+                store.load_research_campaign_cell,
+                cache_key,
+            )
+            if cached_payload is not None:
+                cell = ResearchCampaignCell.model_validate(cached_payload).model_copy(
+                    update={"dataset_role": dataset_role}
+                )
+                cache_hits += 1
                 completed_cells += 1
                 await report_progress()
                 return cell
@@ -9732,12 +9942,71 @@ async def execute_research_campaign(
         research_cells,
         cumulative_hypothesis_count=effective_trial_count,
     )
+    online_fdr_results: dict[str, dict] = {}
+    for candidate in research_candidates:
+        allocations = fdr_allocations.get(candidate.library_entry_id)
+        trial = permanent_trials.get(candidate.library_entry_id)
+        if allocations is None or trial is None:
+            continue
+        global_allocation, family_allocation = allocations
+        await asyncio.to_thread(
+            fdr_controller.record_result,
+            global_allocation,
+            p_value=candidate.strategy_p_value,
+        )
+        await asyncio.to_thread(
+            fdr_controller.record_result,
+            family_allocation,
+            p_value=candidate.strategy_p_value,
+        )
+        online_alpha = min(global_allocation.alpha, family_allocation.alpha)
+        online_passed = candidate.strategy_p_value <= online_alpha
+        online_fdr_results[candidate.library_entry_id] = {
+            "alpha": str(online_alpha),
+            "passed": online_passed,
+        }
+        if candidate.expected_r_testable_market_count == 0:
+            trial_result = TrialResult.UNTESTABLE
+        elif candidate.cross_market_passed and online_passed and research_pbo.passed:
+            trial_result = TrialResult.PASS
+        else:
+            trial_result = TrialResult.FAIL
+        await asyncio.to_thread(
+            store.append_research_trial_result,
+            trial.id,
+            result=str(trial_result),
+            p_value=candidate.strategy_p_value,
+            adjusted_p_value=candidate.multiple_testing_adjusted_p_value,
+            dsr=candidate.median_deflated_sharpe_probability,
+            pbo=research_pbo.upper_confidence_bound,
+            global_alpha=global_allocation.alpha,
+            family_alpha=family_allocation.alpha,
+            reason_codes=([] if online_passed else ["online_fdr_budget_not_met"]),
+        )
+    research_candidates = [
+        candidate.model_copy(
+            update={
+                "online_fdr_alpha": Decimal(
+                    str(online_fdr_results.get(candidate.library_entry_id, {}).get("alpha", "0"))
+                ),
+                "online_fdr_passed": bool(
+                    online_fdr_results.get(candidate.library_entry_id, {}).get("passed", False)
+                ),
+                "cross_market_passed": candidate.cross_market_passed
+                and bool(
+                    online_fdr_results.get(candidate.library_entry_id, {}).get("passed", False)
+                ),
+            }
+        )
+        for candidate in research_candidates
+    ]
     provisional_selected = next(
         (candidate for candidate in research_candidates if candidate.cross_market_passed),
         None,
     )
     blind_cells: list[ResearchCampaignCell] = []
     blind_consumption_id: str | None = None
+    blind_trial: PermanentTrialRecord | None = None
     if campaign_blind_opening_allowed(
         provisional_selected=provisional_selected,
         research_pbo=research_pbo,
@@ -9767,6 +10036,33 @@ async def execute_research_campaign(
             store.mark_research_lineage_blind_opened,
             lineage_id=lineage_id,
             blind_consumption_id=blind_consumption_id,
+        )
+        blind_scope_fingerprint = sha256(
+            json.dumps(
+                sorted(dataset_metadata[item].data_fingerprint for item in blind_dataset_ids),
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        blind_trial_candidate = PermanentTrialRecord.empirical(
+            research_event_id=experiment_id,
+            campaign_id=campaign_id,
+            hypothesis_id=(f"legacy_hypothesis:{selected_entry.validated_spec.fingerprint}"),
+            family_id=f"{trial_family_id}:{selected_entry.family.value}",
+            candidate_id=selected_entry.id,
+            dataset_fingerprint=blind_scope_fingerprint,
+            validation_fingerprint=research_configuration_fingerprint,
+            artifact_fingerprint=sha256(
+                f"blind:{experiment_id}:{selected_entry.validated_spec.fingerprint}:"
+                f"{blind_scope_fingerprint}".encode()
+            ).hexdigest(),
+        ).model_copy(
+            update={
+                "trial_type": TrialType.BLIND,
+                "touched_blind": True,
+            }
+        )
+        blind_trial = PermanentTrialRecord.model_validate(
+            await asyncio.to_thread(store.reserve_research_trial, blind_trial_candidate)
         )
         blind_datasets = await asyncio.gather(
             *(load_verified_research_dataset(dataset_id) for dataset_id in blind_dataset_ids)
@@ -9822,6 +10118,8 @@ async def execute_research_campaign(
         cumulative_hypothesis_count=int(ledger_summary["cumulative_hypothesis_count"]),
         sequential_experiment_count=int(ledger_summary["sequential_experiment_count"]),
         effective_trial_count=effective_trial_count,
+        permanent_trial_ids=[trial.id for trial in permanent_trials.values()],
+        online_fdr_results=online_fdr_results,
         parent_campaign_id=(parent_report.id if parent_report is not None else None),
         predecessor_campaign_id=predecessor_campaign_id,
         experiment_kind=experiment_kind,
@@ -9872,6 +10170,17 @@ async def execute_research_campaign(
             evaluation_id=blind_consumption_id,
             campaign_id=report.id,
             passed=report.blind_selected_candidate_passed,
+        )
+    if blind_trial is not None:
+        await asyncio.to_thread(
+            store.append_research_trial_result,
+            blind_trial.id,
+            result=str(
+                TrialResult.PASS if report.blind_selected_candidate_passed else TrialResult.FAIL
+            ),
+            reason_codes=[
+                "blind_passed" if report.blind_selected_candidate_passed else "blind_not_admitted"
+            ],
         )
     add_audit(
         "research",
@@ -11397,18 +11706,10 @@ async def revise_campaign_causal_policy(
         id=str(definition["policy_id"]),
         library_entry_ids=[str(item["id"]) for item in definition["priors"]],
         maximum_candidates_per_bar=int(definition["maximum_candidates_per_bar"]),
-        abstain_on_ambiguous_regime=bool(
-            definition["abstain_on_ambiguous_regime"]
-        ),
-        minimum_regime_confidence=Decimal(
-            str(definition.get("minimum_regime_confidence", "0"))
-        ),
-        minimum_signal_confidence=Decimal(
-            str(definition.get("minimum_signal_confidence", "0"))
-        ),
-        minimum_directional_consensus=int(
-            definition.get("minimum_directional_consensus", 1)
-        ),
+        abstain_on_ambiguous_regime=bool(definition["abstain_on_ambiguous_regime"]),
+        minimum_regime_confidence=Decimal(str(definition.get("minimum_regime_confidence", "0"))),
+        minimum_signal_confidence=Decimal(str(definition.get("minimum_signal_confidence", "0"))),
+        minimum_directional_consensus=int(definition.get("minimum_directional_consensus", 1)),
     )
     proposed_changes: list[tuple[str, object, str]] = []
     next_signal_confidence = min(

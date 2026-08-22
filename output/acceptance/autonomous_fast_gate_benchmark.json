@@ -1,0 +1,146 @@
+{
+  "benchmark_version": "autonomous-fast-gate-v1",
+  "measured_at": "2026-08-22T10:03:43.203117+00:00",
+  "scenario": "local snapshot ready, warm Python/NumPy process, cold per-market feature load",
+  "case_count": 12,
+  "warm_snapshot_ready_latency": {
+    "p50_seconds": 0.137286,
+    "p90_seconds": 0.141734,
+    "p95_seconds": 0.142028,
+    "p99_seconds": 0.142292,
+    "maximum_seconds": 0.142358
+  },
+  "cold_feature_plus_gate_diagnostic": {
+    "p50_seconds": 0.183748,
+    "p90_seconds": 0.210883,
+    "p95_seconds": 0.214396,
+    "p99_seconds": 0.217501,
+    "maximum_seconds": 0.218277
+  },
+  "p95_slo_seconds": 240,
+  "hard_deadline_seconds": 300,
+  "p95_passed": true,
+  "hard_deadline_passed": true,
+  "cases": [
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "1h",
+      "variant": 1,
+      "bars": 2000,
+      "cold_feature_seconds": 0.075919,
+      "snapshot_ready_to_commit_seconds": 0.142358,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "1h",
+      "variant": 2,
+      "bars": 2000,
+      "cold_feature_seconds": 0.075919,
+      "snapshot_ready_to_commit_seconds": 0.131921,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "variant": 1,
+      "bars": 2000,
+      "cold_feature_seconds": 0.022673,
+      "snapshot_ready_to_commit_seconds": 0.139779,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "variant": 2,
+      "bars": 2000,
+      "cold_feature_seconds": 0.022673,
+      "snapshot_ready_to_commit_seconds": 0.133946,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "1h",
+      "variant": 1,
+      "bars": 2000,
+      "cold_feature_seconds": 0.069707,
+      "snapshot_ready_to_commit_seconds": 0.141514,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "1h",
+      "variant": 2,
+      "bars": 2000,
+      "cold_feature_seconds": 0.069707,
+      "snapshot_ready_to_commit_seconds": 0.132792,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "variant": 1,
+      "bars": 2000,
+      "cold_feature_seconds": 0.029617,
+      "snapshot_ready_to_commit_seconds": 0.141758,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "variant": 2,
+      "bars": 2000,
+      "cold_feature_seconds": 0.029617,
+      "snapshot_ready_to_commit_seconds": 0.129245,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "1h",
+      "variant": 1,
+      "bars": 2000,
+      "cold_feature_seconds": 0.067109,
+      "snapshot_ready_to_commit_seconds": 0.138594,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "1h",
+      "variant": 2,
+      "bars": 2000,
+      "cold_feature_seconds": 0.067109,
+      "snapshot_ready_to_commit_seconds": 0.129013,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "variant": 1,
+      "bars": 2000,
+      "cold_feature_seconds": 0.022826,
+      "snapshot_ready_to_commit_seconds": 0.138113,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "variant": 2,
+      "bars": 2000,
+      "cold_feature_seconds": 0.022826,
+      "snapshot_ready_to_commit_seconds": 0.136459,
+      "disposition": "rejected",
+      "deadline_exceeded": false
+    }
+  ]
+}

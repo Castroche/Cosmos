@@ -1155,6 +1155,7 @@ class AgentCoordinator:
             AgentAction.ANALYZE: {
                 "analyze_market_regime",
                 "assess_owned_position",
+                "detect_research_opportunity",
             },
             AgentAction.RESEARCH: {
                 "build_trade_plan",
@@ -1167,6 +1168,11 @@ class AgentCoordinator:
                 "run_relative_value_campaign",
                 "revise_failed_strategy",
                 "review_strategy_health",
+                "propose_hypothesis",
+                "propose_strategy_dsl",
+                "propose_mutation",
+                "review_candidate",
+                "summarize_failure",
             },
             AgentAction.BACKTEST: {
                 "run_plan_backtest",

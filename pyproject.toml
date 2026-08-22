@@ -13,6 +13,7 @@ dependencies = [
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
   "keyring>=25.6,<26",
+  "numpy>=2,<3",
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",
   "uvicorn[standard]>=0.34,<1",

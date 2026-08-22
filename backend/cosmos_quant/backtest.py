@@ -97,8 +97,7 @@ def causal_library_policy_fingerprint(
         "minimum_signal_confidence": str(minimum_signal_confidence),
         "minimum_directional_consensus": minimum_directional_consensus,
         "priors": [
-            prior.model_dump(mode="json")
-            for prior in sorted(priors, key=lambda item: item.id)
+            prior.model_dump(mode="json") for prior in sorted(priors, key=lambda item: item.id)
         ],
     }
     encoded = json.dumps(
@@ -152,9 +151,7 @@ def rank_causal_strategy_priors(
             score += Decimal("3")
         if assessment.volatility_regime in avoided_text:
             score -= Decimal("6")
-        reasons.append(
-            f"causal family score={family_score:f}, relative score={relative_score:.3f}"
-        )
+        reasons.append(f"causal family score={family_score:f}, relative score={relative_score:.3f}")
         ranked.append((prior, score, reasons))
     return sorted(ranked, key=lambda item: (-item[1], item[0].id))
 
@@ -173,6 +170,12 @@ def latest_causal_funding_point(
     if timestamp - point.timestamp > maximum_age:
         return None
     return point
+
+
+def point_available_time(point, *, fallback: datetime) -> datetime:
+    """Return the persisted point-in-time availability used by every causal join."""
+
+    return getattr(point, "available_time", None) or fallback
 
 
 def causal_open_interest_context(
@@ -280,9 +283,7 @@ def causal_liquidation_flow_context(
         Decimal("0"),
     )
     total = long_contracts + short_contracts
-    imbalance = (
-        (short_contracts - long_contracts) / total if total > 0 else Decimal("0")
-    )
+    imbalance = (short_contracts - long_contracts) / total if total > 0 else Decimal("0")
     return latest, long_contracts, short_contracts, imbalance
 
 
@@ -301,6 +302,7 @@ class BacktestTrade(BaseModel):
     fees: Decimal = Decimal("0")
     slippage_cost: Decimal = Decimal("0")
     funding_cost: Decimal = Decimal("0")
+    initial_risk_amount: Decimal = Field(default=Decimal("0"), ge=0)
 
 
 class BacktestTradeEpisode(BaseModel):
@@ -314,6 +316,7 @@ class BacktestTradeEpisode(BaseModel):
     fees: Decimal
     slippage_cost: Decimal
     funding_cost: Decimal
+    initial_risk_amount: Decimal = Field(default=Decimal("0"), ge=0)
     exit_reasons: list[str] = Field(default_factory=list)
 
 
@@ -444,6 +447,7 @@ def _aggregate_trade_episodes(
                 "fees": Decimal("0"),
                 "slippage_cost": Decimal("0"),
                 "funding_cost": Decimal("0"),
+                "initial_risk_amount": Decimal("0"),
                 "exit_reasons": [],
             }
         episode = grouped[key]
@@ -454,6 +458,7 @@ def _aggregate_trade_episodes(
             "fees",
             "slippage_cost",
             "funding_cost",
+            "initial_risk_amount",
         ):
             episode[field] += getattr(trade, field)
         if trade.exit_reason not in episode["exit_reasons"]:
@@ -1149,11 +1154,7 @@ def run_bracket_backtest(
             continue
 
         exit_trigger = (
-            position["current_stop"]
-            if stop_hit
-            else target
-            if target_hit
-            else candle.close
+            position["current_stop"] if stop_hit else target if target_hit else candle.close
         )
         exit_price = exit_trigger
         exit_price *= Decimal("1") - slip if plan.side == Side.LONG else Decimal("1") + slip
@@ -1190,6 +1191,9 @@ def run_bracket_backtest(
                 gross_pnl=gross.quantize(Decimal("0.01")),
                 fees=fees.quantize(Decimal("0.01")),
                 slippage_cost=slippage_cost.quantize(Decimal("0.01")),
+                initial_risk_amount=(
+                    abs(position["entry"] - plan.exit.stop_loss) * position["quantity"]
+                ).quantize(Decimal("0.01")),
             )
         )
         position = None
@@ -1223,6 +1227,9 @@ def run_bracket_backtest(
                 gross_pnl=gross.quantize(Decimal("0.01")),
                 fees=fees.quantize(Decimal("0.01")),
                 slippage_cost=slippage_cost.quantize(Decimal("0.01")),
+                initial_risk_amount=(
+                    abs(position["entry"] - plan.exit.stop_loss) * position["quantity"]
+                ).quantize(Decimal("0.01")),
             )
         )
         terminal_position_closed = True
@@ -1293,13 +1300,9 @@ def run_walk_forward_backtest(
     if not Decimal("0") <= causal_policy_minimum_signal_confidence <= Decimal("1"):
         raise ValueError("causal policy minimum signal confidence must be between 0 and 1")
     if not (
-        1
-        <= causal_policy_minimum_directional_consensus
-        <= causal_policy_max_candidates_per_bar
+        1 <= causal_policy_minimum_directional_consensus <= causal_policy_max_candidates_per_bar
     ):
-        raise ValueError(
-            "causal policy directional consensus must be between 1 and max candidates"
-        )
+        raise ValueError("causal policy directional consensus must be between 1 and max candidates")
     causal_priors = [
         CausalStrategyPrior.model_validate(item) for item in (causal_strategy_priors or [])
     ]
@@ -1320,9 +1323,7 @@ def run_walk_forward_backtest(
             abstain_on_ambiguous_regime=(causal_policy_abstain_on_ambiguous_regime),
             minimum_regime_confidence=causal_policy_minimum_regime_confidence,
             minimum_signal_confidence=causal_policy_minimum_signal_confidence,
-            minimum_directional_consensus=(
-                causal_policy_minimum_directional_consensus
-            ),
+            minimum_directional_consensus=(causal_policy_minimum_directional_consensus),
         )
         if causal_priors
         else None
@@ -1386,26 +1387,53 @@ def run_walk_forward_backtest(
     position: dict | None = None
     fee_rate = fee_bps / Decimal("10000")
     funding_rates = funding_rates or []
-    funding_rates = sorted(funding_rates, key=lambda item: item.timestamp)
-    funding_timestamps = [item.timestamp for item in funding_rates]
+    funding_rates = sorted(
+        funding_rates,
+        key=lambda item: point_available_time(item, fallback=item.timestamp),
+    )
+    funding_timestamps = [
+        point_available_time(item, fallback=item.timestamp) for item in funding_rates
+    ]
     open_interest = sorted(
         open_interest or [],
-        key=lambda item: item.timestamp,
+        key=lambda item: point_available_time(item, fallback=item.timestamp),
     )
-    open_interest_timestamps = [item.timestamp for item in open_interest]
-    positioning = sorted(positioning or [], key=lambda item: item.timestamp)
-    positioning_timestamps = [item.timestamp for item in positioning]
-    basis = sorted(basis or [], key=lambda item: item.timestamp)
-    basis_timestamps = [item.timestamp for item in basis]
-    order_flow = sorted(order_flow or [], key=lambda item: item.timestamp)
+    open_interest_timestamps = [
+        point_available_time(item, fallback=item.timestamp) for item in open_interest
+    ]
+    positioning = sorted(
+        positioning or [],
+        key=lambda item: point_available_time(item, fallback=item.timestamp),
+    )
+    positioning_timestamps = [
+        point_available_time(item, fallback=item.timestamp) for item in positioning
+    ]
+    basis = sorted(
+        basis or [],
+        key=lambda item: point_available_time(item, fallback=item.timestamp),
+    )
+    basis_timestamps = [point_available_time(item, fallback=item.timestamp) for item in basis]
+    order_flow = sorted(
+        order_flow or [],
+        key=lambda item: point_available_time(
+            item,
+            fallback=item.timestamp + timedelta(seconds=timeframe_seconds(timeframe)),
+        ),
+    )
     order_flow_availability_timestamps = [
-        item.timestamp + timedelta(seconds=timeframe_seconds(timeframe)) for item in order_flow
+        point_available_time(
+            item,
+            fallback=item.timestamp + timedelta(seconds=timeframe_seconds(timeframe)),
+        )
+        for item in order_flow
     ]
     liquidation_flow = sorted(
         liquidation_flow or [],
-        key=lambda item: item.timestamp,
+        key=lambda item: point_available_time(item, fallback=item.timestamp),
     )
-    liquidation_flow_timestamps = [item.timestamp for item in liquidation_flow]
+    liquidation_flow_timestamps = [
+        point_available_time(item, fallback=item.timestamp) for item in liquidation_flow
+    ]
     terminal_position_closed = False
     causal_policy_selection_counts: dict[str, int] = {}
     causal_policy_abstentions = 0
@@ -1457,11 +1485,8 @@ def run_walk_forward_backtest(
                     (quantity for _, quantity, _ in exits),
                     Decimal("0"),
                 )
-                if (
-                    projected_remaining > 0
-                    and plan.exit.time_exit_is_due(
-                        held_bars=position["bars_held"],
-                    )
+                if projected_remaining > 0 and plan.exit.time_exit_is_due(
+                    held_bars=position["bars_held"],
                 ):
                     exits.append((candle.close, projected_remaining, "time_stop"))
 
@@ -1509,6 +1534,9 @@ def run_walk_forward_backtest(
                         fees=fees.quantize(Decimal("0.01")),
                         slippage_cost=slippage_cost.quantize(Decimal("0.01")),
                         funding_cost=funding_cost,
+                        initial_risk_amount=(
+                            abs(position["entry"] - plan.exit.stop_loss) * close_quantity
+                        ).quantize(Decimal("0.01")),
                     )
                 )
                 position["remaining"] -= close_quantity
@@ -1647,19 +1675,13 @@ def run_walk_forward_backtest(
                     known_liquidation_flow.timestamp if known_liquidation_flow else None
                 ),
                 liquidation_source_market_type=(
-                    known_liquidation_flow.source_market_type
-                    if known_liquidation_flow
-                    else None
+                    known_liquidation_flow.source_market_type if known_liquidation_flow else None
                 ),
                 liquidation_source_instrument_id=(
-                    known_liquidation_flow.source_instrument_id
-                    if known_liquidation_flow
-                    else None
+                    known_liquidation_flow.source_instrument_id if known_liquidation_flow else None
                 ),
                 liquidation_evidence_role=(
-                    known_liquidation_flow.evidence_role
-                    if known_liquidation_flow
-                    else None
+                    known_liquidation_flow.evidence_role if known_liquidation_flow else None
                 ),
             )
             try:
@@ -1692,8 +1714,7 @@ def run_walk_forward_backtest(
                 if causal_priors:
                     assessment = score_market_state(history)
                     if (
-                        causal_policy_abstain_on_ambiguous_regime
-                        and assessment.ambiguous
+                        causal_policy_abstain_on_ambiguous_regime and assessment.ambiguous
                     ) or assessment.confidence < causal_policy_minimum_regime_confidence:
                         causal_policy_abstentions += 1
                         plan = None
@@ -1731,10 +1752,7 @@ def run_walk_forward_backtest(
                                 )
                             except NoTradeSignal:
                                 continue
-                            if (
-                                selected_plan.confidence
-                                < causal_policy_minimum_signal_confidence
-                            ):
+                            if selected_plan.confidence < causal_policy_minimum_signal_confidence:
                                 continue
                             actionable_policy_plans.append(
                                 (
@@ -1859,6 +1877,9 @@ def run_walk_forward_backtest(
                 fees=fees.quantize(Decimal("0.01")),
                 slippage_cost=slippage_cost.quantize(Decimal("0.01")),
                 funding_cost=funding_cost,
+                initial_risk_amount=(
+                    abs(position["entry"] - plan.exit.stop_loss) * close_quantity
+                ).quantize(Decimal("0.01")),
             )
         )
         terminal_position_closed = True
@@ -1898,8 +1919,7 @@ def run_walk_forward_backtest(
     )
     result.cost_model["maximum_holding_bars"] = (
         str(validated_spec.parameters.maximum_holding_bars)
-        if validated_spec is not None
-        and validated_spec.parameters.maximum_holding_bars is not None
+        if validated_spec is not None and validated_spec.parameters.maximum_holding_bars is not None
         else "per_candidate"
         if causal_priors
         else "none"
@@ -1935,12 +1955,11 @@ def run_walk_forward_backtest(
     result.integrity_checks["historical_order_flow_join_is_causal"] = True
     result.integrity_checks["order_flow_unavailable_until_bar_close"] = True
     result.integrity_checks["historical_liquidation_flow_join_is_causal"] = True
+    result.integrity_checks["timestamp_availability_gate"] = True
     result.integrity_checks["coin_m_liquidation_not_exact_usdt_contract"] = True
     if causal_priors:
         result.strategy_fingerprint = policy_fingerprint
-        result.cost_model["causal_library_policy_version"] = str(
-            CAUSAL_LIBRARY_POLICY_VERSION
-        )
+        result.cost_model["causal_library_policy_version"] = str(CAUSAL_LIBRARY_POLICY_VERSION)
         result.cost_model["causal_library_policy_fingerprint"] = str(policy_fingerprint)
         result.cost_model["causal_library_policy_prior_count"] = str(len(causal_priors))
         result.cost_model["causal_library_policy_max_candidates_per_bar"] = str(
@@ -1964,9 +1983,7 @@ def run_walk_forward_backtest(
             sort_keys=True,
             separators=(",", ":"),
         )
-        result.cost_model["causal_library_policy_abstentions"] = str(
-            causal_policy_abstentions
-        )
+        result.cost_model["causal_library_policy_abstentions"] = str(causal_policy_abstentions)
         result.integrity_checks["causal_library_policy_pre_registered"] = True
         result.integrity_checks["causal_library_policy_return_inputs_forbidden"] = True
         result.integrity_checks["causal_library_policy_latest_known_features_only"] = True
@@ -1997,18 +2014,10 @@ def run_walk_forward_backtest(
         automatic_selection=automatic_selection,
         causal_strategy_priors=causal_priors,
         causal_policy_max_candidates_per_bar=causal_policy_max_candidates_per_bar,
-        causal_policy_abstain_on_ambiguous_regime=(
-            causal_policy_abstain_on_ambiguous_regime
-        ),
-        causal_policy_minimum_regime_confidence=(
-            causal_policy_minimum_regime_confidence
-        ),
-        causal_policy_minimum_signal_confidence=(
-            causal_policy_minimum_signal_confidence
-        ),
-        causal_policy_minimum_directional_consensus=(
-            causal_policy_minimum_directional_consensus
-        ),
+        causal_policy_abstain_on_ambiguous_regime=(causal_policy_abstain_on_ambiguous_regime),
+        causal_policy_minimum_regime_confidence=(causal_policy_minimum_regime_confidence),
+        causal_policy_minimum_signal_confidence=(causal_policy_minimum_signal_confidence),
+        causal_policy_minimum_directional_consensus=(causal_policy_minimum_directional_consensus),
         side_filter=side_filter,
         require_regime_family_fit=require_regime_family_fit,
         research_trial_count=research_trial_count,
@@ -2021,4 +2030,166 @@ def run_walk_forward_backtest(
         stressed,
         policy,
         research_trial_count=research_trial_count,
+    )
+
+
+class CanonicalIRExactTrade(BaseModel):
+    side: Side
+    entry_index: int
+    exit_index: int
+    entry_price: Decimal
+    exit_price: Decimal
+    quantity: Decimal
+    initial_risk_amount: Decimal
+    fees: Decimal
+    spread_cost: Decimal
+    slippage_cost: Decimal
+    net_pnl: Decimal
+    exit_reason: str
+    partial_fill: bool = False
+
+
+class CanonicalIRExactReplay(BaseModel):
+    engine_version: str = "canonical-ir-exact-event-v1"
+    ir_hash: str
+    trades: list[CanonicalIRExactTrade]
+    execution_latency_bars: int
+    fee_bps: Decimal
+    spread_bps: Decimal
+    slippage_bps: Decimal
+    maximum_volume_participation: Decimal
+
+    @property
+    def net_pnls(self) -> list[Decimal]:
+        return [trade.net_pnl for trade in self.trades]
+
+    @property
+    def initial_risks(self) -> list[Decimal]:
+        return [trade.initial_risk_amount for trade in self.trades]
+
+
+def run_canonical_ir_exact_replay(
+    ir,
+    candles: list[Candle],
+    *,
+    feature_overrides: dict | None = None,
+    initial_equity: Decimal = Decimal("100000"),
+    fee_bps: Decimal = Decimal("4"),
+    spread_bps: Decimal = Decimal("2"),
+    slippage_bps: Decimal = Decimal("2"),
+    execution_latency_bars: int = 1,
+    maximum_volume_participation: Decimal = Decimal("0.01"),
+) -> CanonicalIRExactReplay:
+    """Authoritative event replay adapter for CanonicalStrategyIR intents.
+
+    Strategy semantics come from the shared IR backend. This layer applies
+    next-bar latency, adverse spread/slippage, volume participation partial
+    fills, fixed pre-entry stop risk, fees and event-ordered exits.
+    """
+    import numpy as np
+
+    from .strategy_backends import ExactIntentBackend
+
+    if len(candles) < 3:
+        raise ValueError("exact IR replay requires at least three candles")
+    if execution_latency_bars < 1:
+        raise ValueError("exact IR replay requires at least one bar of latency")
+    features = {
+        "open": np.asarray([float(item.open) for item in candles]),
+        "high": np.asarray([float(item.high) for item in candles]),
+        "low": np.asarray([float(item.low) for item in candles]),
+        "close": np.asarray([float(item.close) for item in candles]),
+        "volume": np.asarray([float(item.volume) for item in candles]),
+    }
+    for name, values in (feature_overrides or {}).items():
+        features[name] = np.asarray(values, dtype=np.float64)
+    intents = ExactIntentBackend().evaluate(ir, features)
+    fee_fraction = fee_bps / Decimal("10000")
+    half_spread = spread_bps / Decimal("20000")
+    slip_fraction = slippage_bps / Decimal("10000")
+    trades: list[CanonicalIRExactTrade] = []
+    position: dict | None = None
+
+    def adverse_price(raw: Decimal, side: int, *, entering: bool) -> Decimal:
+        direction = side if entering else -side
+        return raw * (Decimal("1") + Decimal(direction) * (half_spread + slip_fraction))
+
+    def close_position(index: int, raw_price: Decimal, reason: str) -> None:
+        nonlocal position
+        if position is None:
+            return
+        side = int(position["side"])
+        exit_price = adverse_price(raw_price, side, entering=False)
+        quantity = position["quantity"]
+        entry_price = position["entry_price"]
+        gross = Decimal(side) * (exit_price - entry_price) * quantity
+        exit_fee = exit_price * quantity * fee_fraction
+        total_fees = position["entry_fee"] + exit_fee
+        spread_cost = (position["raw_entry"] + raw_price) * quantity * half_spread
+        slippage_cost = (position["raw_entry"] + raw_price) * quantity * slip_fraction
+        trades.append(
+            CanonicalIRExactTrade(
+                side=Side.LONG if side > 0 else Side.SHORT,
+                entry_index=position["entry_index"],
+                exit_index=index,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                quantity=quantity,
+                initial_risk_amount=position["initial_risk_amount"],
+                fees=total_fees,
+                spread_cost=spread_cost,
+                slippage_cost=slippage_cost,
+                net_pnl=gross - total_fees,
+                exit_reason=reason,
+                partial_fill=position["partial_fill"],
+            )
+        )
+        position = None
+
+    for signal_index in range(intents.warmup, len(candles) - execution_latency_bars):
+        candle = candles[signal_index]
+        if position is not None:
+            side = int(position["side"])
+            stop = position["stop_price"]
+            stop_hit = candle.low <= stop if side > 0 else candle.high >= stop
+            if stop_hit:
+                close_position(signal_index, stop, "pre_committed_stop")
+            elif bool(intents.exit_intent[signal_index]):
+                close_position(signal_index, candle.close, "ir_exit_intent")
+        direction = int(intents.entry_intent[signal_index])
+        if position is not None or direction == 0:
+            continue
+        fill_index = signal_index + execution_latency_bars
+        fill_candle = candles[fill_index]
+        stop_distance = Decimal(str(intents.stop_distance[signal_index]))
+        if not stop_distance.is_finite() or stop_distance <= 0:
+            continue
+        raw_entry = fill_candle.open
+        entry_price = adverse_price(raw_entry, direction, entering=True)
+        intended_quantity = initial_equity * Decimal(ir.risk_budget_fraction) / stop_distance
+        volume_cap = fill_candle.volume * maximum_volume_participation
+        quantity = min(intended_quantity, volume_cap)
+        if quantity <= 0:
+            continue
+        position = {
+            "side": direction,
+            "entry_index": fill_index,
+            "raw_entry": raw_entry,
+            "entry_price": entry_price,
+            "quantity": quantity,
+            "entry_fee": entry_price * quantity * fee_fraction,
+            "initial_risk_amount": stop_distance * quantity,
+            "stop_price": entry_price - Decimal(direction) * stop_distance,
+            "partial_fill": quantity < intended_quantity,
+        }
+    if position is not None:
+        close_position(len(candles) - 1, candles[-1].close, "end_of_snapshot")
+    return CanonicalIRExactReplay(
+        ir_hash=ir.fingerprint,
+        trades=trades,
+        execution_latency_bars=execution_latency_bars,
+        fee_bps=fee_bps,
+        spread_bps=spread_bps,
+        slippage_bps=slippage_bps,
+        maximum_volume_participation=maximum_volume_participation,
     )

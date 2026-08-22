@@ -17,6 +17,12 @@ from .backtest import (
     CausalStrategyPrior,
     causal_library_policy_fingerprint,
 )
+from .research_integrity import (
+    CertificationOutcome,
+    RedactedCertificationResult,
+    ResearchDisposition,
+    moving_block_expected_r,
+)
 from .statistical_validation import (
     BacktestOverfittingReport,
     benjamini_hochberg_adjusted_p_values,
@@ -26,7 +32,7 @@ from .statistical_validation import (
     wilson_lower_bound,
 )
 
-CAMPAIGN_ENGINE_VERSION = 17
+CAMPAIGN_ENGINE_VERSION = 18
 CAMPAIGN_CELL_CONCURRENCY = min(8, max(2, (os.cpu_count() or 4) // 2))
 
 
@@ -211,6 +217,13 @@ class ResearchCampaignCell(BaseModel):
     one_sided_sharpe_p_value: Decimal = Field(default=Decimal("1"), ge=0, le=1)
     one_sided_win_rate_p_value: Decimal = Field(default=Decimal("1"), ge=0, le=1)
     deflated_sharpe_probability: Decimal = Field(default=Decimal("0"), ge=0, le=1)
+    expected_r: Decimal = Decimal("0")
+    cost_adjusted_expectancy: Decimal = Decimal("0")
+    expected_r_confidence_lower_bound: Decimal = Decimal("0")
+    expected_r_p_value: Decimal = Field(default=Decimal("1"), ge=0, le=1)
+    expected_r_testable: bool = False
+    expected_r_passed: bool = False
+    expected_r_observation_count: int = Field(default=0, ge=0)
 
 
 class CampaignCandidateAggregate(BaseModel):
@@ -243,6 +256,14 @@ class CampaignCandidateAggregate(BaseModel):
     strategy_p_value: Decimal = Decimal("1")
     multiple_testing_adjusted_p_value: Decimal = Decimal("1")
     strategy_statistical_passed: bool = False
+    expected_r_testable_market_count: int = 0
+    expected_r_testable_market_ratio: Decimal = Decimal("0")
+    median_expected_r: Decimal = Decimal("0")
+    median_expected_r_confidence_lower_bound: Decimal = Decimal("0")
+    median_cost_adjusted_expectancy: Decimal = Decimal("0")
+    median_deflated_sharpe_probability: Decimal = Decimal("0")
+    online_fdr_alpha: Decimal = Decimal("0")
+    online_fdr_passed: bool = False
 
 
 def campaign_candidate_fingerprint(candidate: CampaignCandidateAggregate) -> str:
@@ -327,7 +348,7 @@ def causal_policy_definitions_fingerprint(definitions: list[dict]) -> str:
 class CampaignExecutionCertificate(BaseModel):
     """Immutable binding between one admitted strategy and all sealed evidence."""
 
-    certificate_version: int = 8
+    certificate_version: int = 9
     campaign_id: str
     engine_version: int
     selected_library_entry_id: str
@@ -343,6 +364,10 @@ class CampaignExecutionCertificate(BaseModel):
     high_quality_market_ratio: Decimal
     pooled_win_rate_lower_bound_percent: Decimal = Decimal("0")
     multiple_testing_adjusted_p_value: Decimal = Decimal("1")
+    median_expected_r: Decimal = Decimal("0")
+    median_expected_r_confidence_lower_bound: Decimal = Decimal("0")
+    median_cost_adjusted_expectancy: Decimal = Decimal("0")
+    median_deflated_sharpe_probability: Decimal = Decimal("0")
     research_lineage_id: str = ""
     research_trial_family_id: str = ""
     research_experiment_id: str = ""
@@ -396,6 +421,7 @@ class ResearchCampaignReport(BaseModel):
     cumulative_hypothesis_count: int = 1
     sequential_experiment_count: int = 1
     effective_trial_count: int = 1
+    permanent_trial_ids: list[str] = Field(default_factory=list)
     parent_campaign_id: str | None = None
     predecessor_campaign_id: str | None = None
     experiment_kind: str = "initial"
@@ -415,11 +441,49 @@ class ResearchCampaignReport(BaseModel):
     portfolio_allocations: list[dict] = Field(default_factory=list)
     selected_library_entry_id: str | None = None
     autonomous_execution_eligible: bool = False
+    research_disposition: ResearchDisposition = ResearchDisposition.UNTESTABLE
     blind_selected_candidate_passed: bool = False
     blind_candidate: CampaignCandidateAggregate | None = None
     execution_certificate: CampaignExecutionCertificate | None = None
     selection_reasons: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+def redact_campaign_for_research_agent(report: ResearchCampaignReport) -> dict:
+    """Return development evidence plus one coarse blind outcome, never blind metrics."""
+
+    if report.blind_consumption_id:
+        outcome = (
+            CertificationOutcome.PASS
+            if report.blind_selected_candidate_passed
+            else CertificationOutcome.FAIL
+        )
+        reason_codes = [
+            "blind_passed" if report.blind_selected_candidate_passed else "blind_not_admitted"
+        ]
+    else:
+        outcome = CertificationOutcome.SHADOW_REQUIRED
+        reason_codes = ["independent_blind_evidence_required"]
+    result = report.model_dump(
+        mode="json",
+        exclude={
+            "dataset_ids",
+            "blind_dataset_ids",
+            "blind_set_id",
+            "blind_consumption_id",
+            "blind_candidate",
+            "execution_certificate",
+        },
+    )
+    result["cells"] = [
+        cell for cell in result["cells"] if cell.get("dataset_role") == "research"
+    ]
+    result["blind_certification"] = RedactedCertificationResult(
+        outcome=outcome,
+        reason_codes=reason_codes,
+        evidence_reference=f"sealed:{report.id}",
+    ).model_dump(mode="json")
+    return result
 
 
 def campaign_cell(
@@ -442,7 +506,18 @@ def campaign_cell(
         if result.trade_episodes
         else [trade.pnl for trade in result.trades]
     )
+    episode_risks = (
+        [episode.initial_risk_amount for episode in result.trade_episodes]
+        if result.trade_episodes
+        else [trade.initial_risk_amount for trade in result.trades]
+    )
     statistical = result.statistical_validation
+    expected_r = moving_block_expected_r(
+        episode_pnls,
+        episode_risks,
+        samples=500,
+        seed_material=backtest_fingerprint,
+    )
     return ResearchCampaignCell(
         library_entry_id=library_entry.id,
         strategy_fingerprint=expected_strategy_fingerprint,
@@ -480,6 +555,17 @@ def campaign_cell(
         deflated_sharpe_probability=(
             statistical.deflated_sharpe_probability if statistical else Decimal("0")
         ),
+        expected_r=expected_r.expected_r,
+        cost_adjusted_expectancy=expected_r.cost_adjusted_expectancy,
+        expected_r_confidence_lower_bound=expected_r.confidence_lower_bound,
+        expected_r_p_value=(
+            min(expected_r.p_value, statistical.one_sided_sharpe_p_value)
+            if expected_r.testable and statistical
+            else expected_r.p_value
+        ),
+        expected_r_testable=expected_r.testable,
+        expected_r_passed=expected_r.passed,
+        expected_r_observation_count=expected_r.observation_count,
     )
 
 
@@ -772,7 +858,17 @@ def aggregate_campaign(
     maximum_pbo: Decimal = Decimal("0.20"),
     cumulative_hypothesis_count: int | None = None,
 ) -> tuple[list[CampaignCandidateAggregate], BacktestOverfittingReport]:
-    """Apply one strategy-level multiple-testing correction across markets."""
+    """Apply v18 expectancy-first cross-market and multiple-testing gates.
+
+    The legacy win-rate, payoff and profit-factor arguments remain accepted so
+    existing API clients do not break. They are descriptive only and are not
+    universal admission thresholds in Campaign v18.
+    """
+
+    del minimum_median_win_rate_percent
+    del minimum_median_payoff_ratio
+    del minimum_median_profit_factor
+    del minimum_pooled_win_rate_lower_bound_percent
 
     grouped: dict[str, list[ResearchCampaignCell]] = {}
     for cell in cells:
@@ -792,9 +888,10 @@ def aggregate_campaign(
         unique_exchange_count = len({item.exchange for item in items})
         unique_timeframe_count = len({item.timeframe for item in items})
         high_quality_count = sum(
-            item.win_rate_percent >= minimum_median_win_rate_percent
-            and item.payoff_ratio >= minimum_median_payoff_ratio
-            and item.profit_factor >= minimum_median_profit_factor
+            item.expected_r_testable
+            and item.expected_r_passed
+            and item.expected_r_confidence_lower_bound > 0
+            and item.deflated_sharpe_probability >= Decimal("0.90")
             and item.stress_return_percent is not None
             and item.stress_return_percent > 0
             and item.temporal_stability_passed
@@ -802,6 +899,7 @@ def aggregate_campaign(
             for item in items
         )
         total_trades = sum(item.total_trades for item in items)
+        expected_r_testable_count = sum(item.expected_r_testable for item in items)
         total_wins = 0
         total_resolved_trades = 0
         for item in items:
@@ -818,15 +916,14 @@ def aggregate_campaign(
             else Decimal("0")
         )
         # Timeframes of the same symbol overlap heavily. Collapse them first
-        # with a within-symbol Bonferroni correction. Crypto symbols also move
-        # together, so combine the symbol p-values with the dependence-robust
-        # Cauchy test instead of assuming they are independent observations.
+        # with a within-symbol Bonferroni correction. Expected-R/Sharpe evidence
+        # replaces the former 50% win-rate null; win rate remains descriptive.
         per_symbol_p_values: list[Decimal] = []
         for symbol in sorted({item.symbol for item in items}):
             symbol_items = [item for item in items if item.symbol == symbol]
             per_symbol_p_values.append(
                 min(
-                    min(item.one_sided_win_rate_p_value for item in symbol_items)
+                    min(item.expected_r_p_value for item in symbol_items)
                     * Decimal(len(symbol_items)),
                     Decimal("1"),
                 )
@@ -836,6 +933,7 @@ def aggregate_campaign(
         stress_ratio = Decimal(positive_stress_count) / Decimal(market_count)
         high_quality_ratio = Decimal(high_quality_count) / Decimal(market_count)
         temporal_stable_ratio = Decimal(temporal_stable_count) / Decimal(market_count)
+        expected_r_testable_ratio = Decimal(expected_r_testable_count) / Decimal(market_count)
         inputs.append(
             {
                 "library_entry_id": entry_id,
@@ -869,6 +967,29 @@ def aggregate_campaign(
                 "temporal_stable_market_count": temporal_stable_count,
                 "temporal_stable_market_ratio": temporal_stable_ratio.quantize(Decimal("0.001")),
                 "pooled_win_rate_lower_bound_percent": pooled_win_lower.quantize(Decimal("0.01")),
+                "expected_r_testable_market_count": expected_r_testable_count,
+                "expected_r_testable_market_ratio": expected_r_testable_ratio.quantize(
+                    Decimal("0.001")
+                ),
+                "median_expected_r": Decimal(
+                    str(median([float(item.expected_r) for item in items]))
+                ).quantize(Decimal("0.0001")),
+                "median_expected_r_confidence_lower_bound": Decimal(
+                    str(
+                        median(
+                            [
+                                float(item.expected_r_confidence_lower_bound)
+                                for item in items
+                            ]
+                        )
+                    )
+                ).quantize(Decimal("0.0001")),
+                "median_cost_adjusted_expectancy": Decimal(
+                    str(median([float(item.cost_adjusted_expectancy) for item in items]))
+                ).quantize(Decimal("0.01")),
+                "median_deflated_sharpe_probability": Decimal(
+                    str(median([float(item.deflated_sharpe_probability) for item in items]))
+                ).quantize(Decimal("0.0001")),
                 "strategy_p_value": strategy_p_value,
             }
         )
@@ -893,8 +1014,8 @@ def aggregate_campaign(
         adjusted_p = adjusted[item["library_entry_id"]]
         statistical_passed = bool(
             adjusted_p <= maximum_false_discovery_rate
-            and item["pooled_win_rate_lower_bound_percent"]
-            >= minimum_pooled_win_rate_lower_bound_percent
+            and item["median_deflated_sharpe_probability"] >= Decimal("0.90")
+            and item["expected_r_testable_market_ratio"] >= minimum_high_quality_market_ratio
         )
         cross_market_passed = bool(
             item["market_count"] >= minimum_markets
@@ -904,9 +1025,9 @@ def aggregate_campaign(
             and item["positive_stress_ratio"] >= minimum_positive_stress_ratio
             and item["high_quality_market_ratio"] >= minimum_high_quality_market_ratio
             and item["temporal_stable_market_ratio"] >= minimum_temporal_stable_market_ratio
-            and item["median_win_rate_percent"] >= minimum_median_win_rate_percent
-            and item["median_payoff_ratio"] >= minimum_median_payoff_ratio
-            and item["median_profit_factor"] >= minimum_median_profit_factor
+            and item["median_expected_r"] > 0
+            and item["median_expected_r_confidence_lower_bound"] > 0
+            and item["median_cost_adjusted_expectancy"] > 0
             and item["worst_drawdown_percent"] <= maximum_worst_drawdown_percent
             and statistical_passed
         )
@@ -939,20 +1060,16 @@ def aggregate_campaign(
                 "temporal stability ratio",
                 minimum_temporal_stable_market_ratio,
             ),
+            (item["median_expected_r"] > 0, "median Expected R", Decimal("0")),
             (
-                item["median_win_rate_percent"] >= minimum_median_win_rate_percent,
-                "胜率中位数",
-                minimum_median_win_rate_percent,
+                item["median_expected_r_confidence_lower_bound"] > 0,
+                "Expected R 95% lower bound",
+                Decimal("0"),
             ),
             (
-                item["median_payoff_ratio"] >= minimum_median_payoff_ratio,
-                "盈亏比中位数",
-                minimum_median_payoff_ratio,
-            ),
-            (
-                item["median_profit_factor"] >= minimum_median_profit_factor,
-                "median profit factor",
-                minimum_median_profit_factor,
+                item["median_cost_adjusted_expectancy"] > 0,
+                "cost-adjusted expectancy",
+                Decimal("0"),
             ),
             (
                 item["worst_drawdown_percent"] <= maximum_worst_drawdown_percent,
@@ -968,9 +1085,11 @@ def aggregate_campaign(
             "positive stress ratio": item["positive_stress_ratio"],
             "joint quality ratio": item["high_quality_market_ratio"],
             "temporal stability ratio": item["temporal_stable_market_ratio"],
-            "胜率中位数": item["median_win_rate_percent"],
-            "盈亏比中位数": item["median_payoff_ratio"],
-            "median profit factor": item["median_profit_factor"],
+            "median Expected R": item["median_expected_r"],
+            "Expected R 95% lower bound": item[
+                "median_expected_r_confidence_lower_bound"
+            ],
+            "cost-adjusted expectancy": item["median_cost_adjusted_expectancy"],
             "worst drawdown percent": item["worst_drawdown_percent"],
         }
         for passed, label, threshold in checks:
@@ -981,14 +1100,10 @@ def aggregate_campaign(
                 f"strategy BH adjusted p-value {adjusted_p:.4f} above "
                 f"{maximum_false_discovery_rate}"
             )
-        if (
-            item["pooled_win_rate_lower_bound_percent"]
-            < minimum_pooled_win_rate_lower_bound_percent
-        ):
+        if item["median_deflated_sharpe_probability"] < Decimal("0.90"):
             reasons.append(
-                "pooled win-rate Wilson lower bound "
-                f"{item['pooled_win_rate_lower_bound_percent']:.2f}% below "
-                f"{minimum_pooled_win_rate_lower_bound_percent}%"
+                "median Deflated Sharpe probability "
+                f"{item['median_deflated_sharpe_probability']:.4f} below 0.90"
             )
         significance_score = Decimal(
             str(min(max(-math.log10(max(float(adjusted_p), 1e-12)), 0), 5))
@@ -997,9 +1112,12 @@ def aggregate_campaign(
             item["positive_stress_ratio"] * Decimal("15")
             + item["high_quality_market_ratio"] * Decimal("25")
             + item["temporal_stable_market_ratio"] * Decimal("10")
-            + item["median_profit_factor"] * Decimal("10")
-            + item["median_payoff_ratio"] * Decimal("5")
-            + (item["median_win_rate_percent"] / Decimal("100")) * Decimal("15")
+            + max(item["median_expected_r"], Decimal("-1")) * Decimal("20")
+            + max(
+                item["median_expected_r_confidence_lower_bound"], Decimal("-1")
+            )
+            * Decimal("20")
+            + item["median_deflated_sharpe_probability"] * Decimal("10")
             + significance_score * Decimal("4")
             - item["worst_drawdown_percent"] * Decimal("0.5")
         )
@@ -1059,6 +1177,8 @@ def finalize_campaign(
     cumulative_hypothesis_count: int | None = None,
     sequential_experiment_count: int = 1,
     effective_trial_count: int | None = None,
+    permanent_trial_ids: list[str] | None = None,
+    online_fdr_results: dict[str, dict] | None = None,
     parent_campaign_id: str | None = None,
     predecessor_campaign_id: str | None = None,
     experiment_kind: str = "initial",
@@ -1082,6 +1202,35 @@ def finalize_campaign(
         research_cells,
         cumulative_hypothesis_count=effective_count,
     )
+    if online_fdr_results:
+        gated_candidates: list[CampaignCandidateAggregate] = []
+        for candidate in candidates:
+            online = online_fdr_results.get(candidate.library_entry_id)
+            if online is None:
+                gated_candidates.append(candidate)
+                continue
+            passed = bool(online.get("passed"))
+            reasons = list(candidate.reasons)
+            if not passed:
+                reasons.append(
+                    "online FDR p-value "
+                    f"{candidate.strategy_p_value:.4f} exceeded allocated alpha "
+                    f"{Decimal(str(online['alpha'])):.8f}"
+                )
+            gated_candidates.append(
+                candidate.model_copy(
+                    update={
+                        "online_fdr_alpha": Decimal(str(online["alpha"])),
+                        "online_fdr_passed": passed,
+                        "strategy_statistical_passed": (
+                            candidate.strategy_statistical_passed and passed
+                        ),
+                        "cross_market_passed": candidate.cross_market_passed and passed,
+                        "reasons": reasons,
+                    }
+                )
+            )
+        candidates = gated_candidates
     selected = next(
         (candidate for candidate in candidates if candidate.cross_market_passed),
         None,
@@ -1095,6 +1244,16 @@ def finalize_campaign(
         blind_candidate = blind_candidates[0] if blind_candidates else None
     blind_passed = bool(blind_candidate and blind_candidate.cross_market_passed)
     eligible = bool(selected and pbo.passed and blind_passed and survivorship_bias_control_passed)
+    if eligible:
+        disposition = ResearchDisposition.EXECUTION_ELIGIBLE
+    elif selected is not None and pbo.passed:
+        disposition = ResearchDisposition.SHADOW_ONLY
+    elif candidates and all(
+        candidate.expected_r_testable_market_count == 0 for candidate in candidates
+    ):
+        disposition = ResearchDisposition.UNTESTABLE
+    else:
+        disposition = ResearchDisposition.REJECTED
     from .strategy_portfolio import allocate_campaign_strategies
 
     # Only the selected strategy is evaluated on the sealed blind set. Never
@@ -1158,6 +1317,7 @@ def finalize_campaign(
         cumulative_hypothesis_count=cumulative_count,
         sequential_experiment_count=max(sequential_experiment_count, 1),
         effective_trial_count=effective_count,
+        permanent_trial_ids=list(permanent_trial_ids or []),
         parent_campaign_id=parent_campaign_id,
         predecessor_campaign_id=predecessor_campaign_id,
         experiment_kind=experiment_kind,
@@ -1172,6 +1332,7 @@ def finalize_campaign(
         portfolio_allocations=[allocation.model_dump(mode="json") for allocation in allocations],
         selected_library_entry_id=(selected.library_entry_id if eligible and selected else None),
         autonomous_execution_eligible=eligible,
+        research_disposition=disposition,
         blind_selected_candidate_passed=blind_passed,
         blind_candidate=blind_candidate,
         engine_version=CAMPAIGN_ENGINE_VERSION,
@@ -1283,6 +1444,14 @@ def build_campaign_execution_certificate(
         high_quality_market_ratio=selected.high_quality_market_ratio,
         pooled_win_rate_lower_bound_percent=(selected.pooled_win_rate_lower_bound_percent),
         multiple_testing_adjusted_p_value=selected.multiple_testing_adjusted_p_value,
+        median_expected_r=selected.median_expected_r,
+        median_expected_r_confidence_lower_bound=(
+            selected.median_expected_r_confidence_lower_bound
+        ),
+        median_cost_adjusted_expectancy=selected.median_cost_adjusted_expectancy,
+        median_deflated_sharpe_probability=(
+            selected.median_deflated_sharpe_probability
+        ),
         research_lineage_id=report.research_lineage_id,
         research_trial_family_id=report.research_trial_family_id,
         research_experiment_id=report.research_experiment_id,

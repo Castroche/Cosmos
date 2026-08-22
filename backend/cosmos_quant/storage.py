@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from threading import RLock
 
@@ -18,7 +19,50 @@ class SqliteStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
+        self._backup_before_schema_upgrade(6)
         self._initialize()
+
+    def _backup_before_schema_upgrade(self, target_version: int) -> Path | None:
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return None
+        source = sqlite3.connect(self.path, timeout=30)
+        try:
+            has_migrations = source.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'schema_migrations'
+                """
+            ).fetchone()
+            current_version = (
+                int(
+                    source.execute(
+                        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+                    ).fetchone()[0]
+                )
+                if has_migrations
+                else 0
+            )
+            if current_version >= target_version:
+                return None
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+            destination = (
+                self.path.parent
+                / "backups"
+                / (f"{self.path.stem}-pre-schema-v{target_version}-{stamp}.db")
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            target = sqlite3.connect(destination)
+            try:
+                source.backup(target)
+                target.commit()
+                check = target.execute("PRAGMA quick_check").fetchone()
+                if not check or check[0] != "ok":
+                    raise RuntimeError("pre-migration database backup failed quick_check")
+            finally:
+                target.close()
+            return destination
+        finally:
+            source.close()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
@@ -52,6 +96,11 @@ class SqliteStore:
         with self._lock, self.connect() as connection:
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    applied_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS app_configuration (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     payload TEXT NOT NULL,
@@ -142,6 +191,11 @@ class SqliteStore:
                     dataset_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     timestamp TEXT NOT NULL,
+                    event_time TEXT,
+                    available_time TEXT,
+                    source_time TEXT,
+                    ingestion_time TEXT,
+                    revision_policy TEXT,
                     open TEXT NOT NULL,
                     high TEXT NOT NULL,
                     low TEXT NOT NULL,
@@ -155,6 +209,11 @@ class SqliteStore:
                     dataset_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     timestamp TEXT NOT NULL,
+                    event_time TEXT,
+                    available_time TEXT,
+                    source_time TEXT,
+                    ingestion_time TEXT,
+                    revision_policy TEXT,
                     rate TEXT NOT NULL,
                     mark_price TEXT,
                     PRIMARY KEY (dataset_id, sequence),
@@ -165,6 +224,11 @@ class SqliteStore:
                     dataset_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     timestamp TEXT NOT NULL,
+                    event_time TEXT,
+                    available_time TEXT,
+                    source_time TEXT,
+                    ingestion_time TEXT,
+                    revision_policy TEXT,
                     open_interest_amount TEXT,
                     open_interest_value TEXT,
                     PRIMARY KEY (dataset_id, sequence),
@@ -175,6 +239,11 @@ class SqliteStore:
                     dataset_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     timestamp TEXT NOT NULL,
+                    event_time TEXT,
+                    available_time TEXT,
+                    source_time TEXT,
+                    ingestion_time TEXT,
+                    revision_policy TEXT,
                     long_short_ratio TEXT NOT NULL,
                     long_account_fraction TEXT,
                     short_account_fraction TEXT,
@@ -187,6 +256,11 @@ class SqliteStore:
                     dataset_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     timestamp TEXT NOT NULL,
+                    event_time TEXT,
+                    available_time TEXT,
+                    source_time TEXT,
+                    ingestion_time TEXT,
+                    revision_policy TEXT,
                     mark_price TEXT NOT NULL,
                     index_price TEXT NOT NULL,
                     basis_rate TEXT NOT NULL,
@@ -198,6 +272,11 @@ class SqliteStore:
                     dataset_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     timestamp TEXT NOT NULL,
+                    event_time TEXT,
+                    available_time TEXT,
+                    source_time TEXT,
+                    ingestion_time TEXT,
+                    revision_policy TEXT,
                     aggregate_count INTEGER NOT NULL,
                     underlying_trade_count INTEGER NOT NULL,
                     base_volume TEXT NOT NULL,
@@ -214,6 +293,11 @@ class SqliteStore:
                     dataset_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     timestamp TEXT NOT NULL,
+                    event_time TEXT,
+                    available_time TEXT,
+                    source_time TEXT,
+                    ingestion_time TEXT,
+                    revision_policy TEXT,
                     payload TEXT NOT NULL,
                     PRIMARY KEY (dataset_id, sequence),
                     FOREIGN KEY (dataset_id) REFERENCES research_datasets(dataset_id)
@@ -402,6 +486,168 @@ class SqliteStore:
                     ON research_trial_family_experiments(
                         family_id, sequential_experiment_count
                     );
+                CREATE TABLE IF NOT EXISTS research_hypotheses_v2 (
+                    hypothesis_id TEXT PRIMARY KEY,
+                    family_id TEXT NOT NULL,
+                    parent_hypothesis_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_research_hypotheses_family
+                    ON research_hypotheses_v2(family_id, created_at);
+                CREATE TABLE IF NOT EXISTS research_trials (
+                    trial_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    research_event_id TEXT NOT NULL,
+                    campaign_id TEXT,
+                    hypothesis_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    parent_trial_id TEXT,
+                    trial_type TEXT NOT NULL,
+                    touched_returns INTEGER NOT NULL,
+                    touched_blind INTEGER NOT NULL,
+                    touched_shadow INTEGER NOT NULL,
+                    dataset_fingerprint TEXT NOT NULL,
+                    validation_fingerprint TEXT NOT NULL,
+                    artifact_fingerprint TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_research_trials_family_created
+                    ON research_trials(family_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_research_trials_event
+                    ON research_trials(research_event_id, created_at);
+                CREATE TABLE IF NOT EXISTS research_trial_events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (trial_id) REFERENCES research_trials(trial_id)
+                        ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS idx_research_trial_events_trial
+                    ON research_trial_events(trial_id, sequence);
+                CREATE TABLE IF NOT EXISTS online_fdr_streams (
+                    stream_id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS online_fdr_events (
+                    stream_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    alpha TEXT NOT NULL,
+                    p_value TEXT,
+                    rejected INTEGER,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    PRIMARY KEY (stream_id, sequence),
+                    FOREIGN KEY (stream_id) REFERENCES online_fdr_streams(stream_id)
+                        ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS autonomous_research_events (
+                    run_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    snapshot_ready_at TEXT NOT NULL,
+                    decision_committed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_autonomous_research_events_updated
+                    ON autonomous_research_events(updated_at DESC);
+                CREATE TABLE IF NOT EXISTS autonomous_validation_runs (
+                    validation_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    artifact_fingerprint TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id) REFERENCES autonomous_research_events(run_id)
+                        ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS autonomous_research_budgets (
+                    research_event_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    semantic_proposals INTEGER NOT NULL DEFAULT 0,
+                    empirical_trials INTEGER NOT NULL DEFAULT 0,
+                    exact_finalists INTEGER NOT NULL DEFAULT 0,
+                    evolution_rounds INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (research_event_id, family_id)
+                );
+                CREATE TABLE IF NOT EXISTS autonomous_research_budget_events (
+                    idempotency_key TEXT PRIMARY KEY,
+                    research_event_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    budget_kind TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS research_artifact_index (
+                    artifact_fingerprint TEXT PRIMARY KEY,
+                    artifact_kind TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS research_behavior_fingerprints (
+                    behavior_fingerprint TEXT PRIMARY KEY,
+                    ir_hash TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS research_novelty_index (
+                    novelty_kind TEXT NOT NULL,
+                    novelty_fingerprint TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (novelty_kind, novelty_fingerprint, family_id)
+                );
+                CREATE TABLE IF NOT EXISTS research_candidate_lineage_v2 (
+                    lineage_id TEXT PRIMARY KEY,
+                    research_event_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    parent_ids TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS generator_envelopes (
+                    envelope_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS research_certificates_v2 (
+                    certificate_id TEXT PRIMARY KEY,
+                    certificate_type TEXT NOT NULL,
+                    strategy_ir_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS certificate_revocations (
+                    revocation_id TEXT PRIMARY KEY,
+                    certificate_id TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_certificate_revocations_certificate
+                    ON certificate_revocations(certificate_id, created_at);
+                CREATE TABLE IF NOT EXISTS shadow_evidence_v2 (
+                    evidence_id TEXT PRIMARY KEY,
+                    strategy_ir_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS research_campaign_jobs (
                     job_id TEXT PRIMARY KEY,
                     request_fingerprint TEXT NOT NULL,
@@ -701,11 +947,49 @@ class SqliteStore:
             }
             if "goal_id" not in agent_event_columns:
                 connection.execute("ALTER TABLE agent_events ADD COLUMN goal_id TEXT")
+            temporal_tables = (
+                "research_dataset_candles",
+                "research_dataset_funding",
+                "research_dataset_open_interest",
+                "research_dataset_positioning",
+                "research_dataset_basis",
+                "research_dataset_order_flow",
+                "research_dataset_liquidation_flow",
+            )
+            for table in temporal_tables:
+                temporal_columns = {
+                    row["name"]
+                    for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for column in (
+                    "event_time",
+                    "available_time",
+                    "source_time",
+                    "ingestion_time",
+                    "revision_policy",
+                ):
+                    if column not in temporal_columns:
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_candidates_champion
                 ON strategy_candidates(family) WHERE status = 'champion'
                 """
+            )
+            now = datetime.now(UTC).isoformat()
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO schema_migrations (version, name, applied_at)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (1, "legacy_schema_baseline", now),
+                    (2, "autonomous_research_integrity", now),
+                    (3, "point_in_time_fact_metadata", now),
+                    (4, "autonomous_research_v2_artifacts", now),
+                    (5, "autonomous_research_persistent_budgets", now),
+                    (6, "autonomous_research_novelty_index", now),
+                ],
             )
 
     def load_configuration(self) -> tuple[UserConfiguration, datetime | None]:
@@ -956,6 +1240,32 @@ class SqliteStore:
             raise ValueError("dataset order-flow count does not match payload")
         if len(liquidation_flow or []) != dataset.liquidation_flow_count:
             raise ValueError("dataset liquidation-flow count does not match payload")
+
+        def temporal_values(point, *, closed_bar: bool = False) -> tuple[str, str, str, str, str]:
+            timestamp = point.timestamp
+            derived_available = timestamp
+            if closed_bar and getattr(dataset, "timeframe_seconds", 0) > 0:
+                from datetime import timedelta
+
+                derived_available = timestamp + timedelta(seconds=dataset.timeframe_seconds)
+            event_time = getattr(point, "event_time", None) or timestamp
+            available_time = getattr(point, "available_time", None) or derived_available
+            source_time = getattr(point, "source_time", None) or available_time
+            ingestion_time = getattr(point, "ingestion_time", None) or max(
+                dataset.created_at,
+                available_time,
+            )
+            revision_policy = getattr(point, "revision_policy", None) or (
+                "append_only_closed_bar" if closed_bar else "exchange_published_append_only"
+            )
+            return (
+                event_time.isoformat(),
+                available_time.isoformat(),
+                source_time.isoformat(),
+                ingestion_time.isoformat(),
+                str(revision_policy),
+            )
+
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -988,14 +1298,17 @@ class SqliteStore:
             connection.executemany(
                 """
                 INSERT INTO research_dataset_candles
-                    (dataset_id, sequence, timestamp, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (dataset_id, sequence, timestamp, event_time, available_time,
+                     source_time, ingestion_time, revision_policy,
+                     open, high, low, close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         dataset.id,
                         index,
                         candle.timestamp.isoformat(),
+                        *temporal_values(candle, closed_bar=True),
                         str(candle.open),
                         str(candle.high),
                         str(candle.low),
@@ -1008,14 +1321,16 @@ class SqliteStore:
             connection.executemany(
                 """
                 INSERT INTO research_dataset_funding
-                    (dataset_id, sequence, timestamp, rate, mark_price)
-                VALUES (?, ?, ?, ?, ?)
+                    (dataset_id, sequence, timestamp, event_time, available_time,
+                     source_time, ingestion_time, revision_policy, rate, mark_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         dataset.id,
                         index,
                         point.timestamp.isoformat(),
+                        *temporal_values(point),
                         str(point.rate),
                         str(point.mark_price) if point.mark_price is not None else None,
                     )
@@ -1025,15 +1340,17 @@ class SqliteStore:
             connection.executemany(
                 """
                 INSERT INTO research_dataset_open_interest
-                    (dataset_id, sequence, timestamp,
+                    (dataset_id, sequence, timestamp, event_time, available_time,
+                     source_time, ingestion_time, revision_policy,
                      open_interest_amount, open_interest_value)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         dataset.id,
                         index,
                         point.timestamp.isoformat(),
+                        *temporal_values(point),
                         (
                             str(point.open_interest_amount)
                             if point.open_interest_amount is not None
@@ -1051,15 +1368,17 @@ class SqliteStore:
             connection.executemany(
                 """
                 INSERT INTO research_dataset_positioning
-                    (dataset_id, sequence, timestamp, long_short_ratio,
+                    (dataset_id, sequence, timestamp, event_time, available_time,
+                     source_time, ingestion_time, revision_policy, long_short_ratio,
                      long_account_fraction, short_account_fraction, source_variant)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         dataset.id,
                         index,
                         point.timestamp.isoformat(),
+                        *temporal_values(point),
                         str(point.long_short_ratio),
                         (
                             str(point.long_account_fraction)
@@ -1079,14 +1398,17 @@ class SqliteStore:
             connection.executemany(
                 """
                 INSERT INTO research_dataset_basis
-                    (dataset_id, sequence, timestamp, mark_price, index_price, basis_rate)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (dataset_id, sequence, timestamp, event_time, available_time,
+                     source_time, ingestion_time, revision_policy,
+                     mark_price, index_price, basis_rate)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         dataset.id,
                         index,
                         point.timestamp.isoformat(),
+                        *temporal_values(point),
                         str(point.mark_price),
                         str(point.index_price),
                         str(point.basis_rate),
@@ -1097,17 +1419,19 @@ class SqliteStore:
             connection.executemany(
                 """
                 INSERT INTO research_dataset_order_flow
-                    (dataset_id, sequence, timestamp, aggregate_count,
+                    (dataset_id, sequence, timestamp, event_time, available_time,
+                     source_time, ingestion_time, revision_policy, aggregate_count,
                      underlying_trade_count, base_volume, quote_volume,
                      taker_buy_base_volume, taker_sell_base_volume,
                      delta_base_volume, maximum_trade_quote)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         dataset.id,
                         index,
                         point.timestamp.isoformat(),
+                        *temporal_values(point, closed_bar=True),
                         point.aggregate_count,
                         point.underlying_trade_count,
                         str(point.base_volume),
@@ -1123,14 +1447,16 @@ class SqliteStore:
             connection.executemany(
                 """
                 INSERT INTO research_dataset_liquidation_flow
-                    (dataset_id, sequence, timestamp, payload)
-                VALUES (?, ?, ?, ?)
+                    (dataset_id, sequence, timestamp, event_time, available_time,
+                     source_time, ingestion_time, revision_policy, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         dataset.id,
                         index,
                         point.timestamp.isoformat(),
+                        *temporal_values(point),
                         point.model_dump_json(),
                     )
                     for index, point in enumerate(liquidation_flow or [])
@@ -1150,7 +1476,8 @@ class SqliteStore:
         with self._lock, self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT timestamp, open, high, low, close, volume
+                SELECT timestamp, event_time, available_time, source_time,
+                       ingestion_time, revision_policy, open, high, low, close, volume
                 FROM research_dataset_candles
                 WHERE dataset_id = ? ORDER BY sequence
                 """,
@@ -1162,7 +1489,8 @@ class SqliteStore:
         with self._lock, self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT timestamp, rate, mark_price
+                SELECT timestamp, event_time, available_time, source_time,
+                       ingestion_time, revision_policy, rate, mark_price
                 FROM research_dataset_funding
                 WHERE dataset_id = ? ORDER BY sequence
                 """,
@@ -1177,7 +1505,9 @@ class SqliteStore:
         with self._lock, self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT timestamp, open_interest_amount, open_interest_value
+                SELECT timestamp, event_time, available_time, source_time,
+                       ingestion_time, revision_policy,
+                       open_interest_amount, open_interest_value
                 FROM research_dataset_open_interest
                 WHERE dataset_id = ? ORDER BY sequence
                 """,
@@ -1192,7 +1522,9 @@ class SqliteStore:
         with self._lock, self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT timestamp, long_short_ratio, long_account_fraction,
+                SELECT timestamp, event_time, available_time, source_time,
+                       ingestion_time, revision_policy,
+                       long_short_ratio, long_account_fraction,
                        short_account_fraction, source_variant
                 FROM research_dataset_positioning
                 WHERE dataset_id = ? ORDER BY sequence
@@ -1208,7 +1540,8 @@ class SqliteStore:
         with self._lock, self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT timestamp, mark_price, index_price, basis_rate
+                SELECT timestamp, event_time, available_time, source_time,
+                       ingestion_time, revision_policy, mark_price, index_price, basis_rate
                 FROM research_dataset_basis
                 WHERE dataset_id = ? ORDER BY sequence
                 """,
@@ -1223,7 +1556,9 @@ class SqliteStore:
         with self._lock, self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT timestamp, aggregate_count, underlying_trade_count,
+                SELECT timestamp, event_time, available_time, source_time,
+                       ingestion_time, revision_policy,
+                       aggregate_count, underlying_trade_count,
                        base_volume, quote_volume, taker_buy_base_volume,
                        taker_sell_base_volume, delta_base_volume,
                        maximum_trade_quote
@@ -1241,12 +1576,27 @@ class SqliteStore:
         with self._lock, self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT payload FROM research_dataset_liquidation_flow
+                SELECT payload, event_time, available_time, source_time,
+                       ingestion_time, revision_policy
+                FROM research_dataset_liquidation_flow
                 WHERE dataset_id = ? ORDER BY sequence
                 """,
                 (dataset_id,),
             ).fetchall()
-        return [json.loads(row["payload"]) for row in rows]
+        result: list[dict] = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            for field in (
+                "event_time",
+                "available_time",
+                "source_time",
+                "ingestion_time",
+                "revision_policy",
+            ):
+                if row[field] is not None:
+                    payload[field] = row[field]
+            result.append(payload)
+        return result
 
     def save_liquidation_event(self, event) -> None:
         with self._lock, self.connect() as connection:
@@ -1448,9 +1798,7 @@ class SqliteStore:
             ).fetchone()
             latest_id = latest["snapshot_id"] if latest else None
             if latest_id != snapshot.previous_snapshot_id:
-                raise RuntimeError(
-                    "catalog journal append would fork or skip the durable chain"
-                )
+                raise RuntimeError("catalog journal append would fork or skip the durable chain")
             connection.execute(
                 """
                 INSERT INTO market_catalog_journal_snapshots
@@ -1847,9 +2195,7 @@ class SqliteStore:
                     (family_id,),
                 ).fetchone()[0]
             )
-            effective_trial_count = (
-                cumulative_hypothesis_count + sequential_experiment_count - 1
-            )
+            effective_trial_count = cumulative_hypothesis_count + sequential_experiment_count - 1
             connection.execute(
                 """
                 INSERT INTO research_trial_family_experiments
@@ -3018,3 +3364,827 @@ class SqliteStore:
                 (account_id,),
             ).fetchone()
         return row["payload"] if row else None
+
+    def reserve_research_trial(self, trial) -> dict:
+        """Persist an immutable trial before any return-bearing evidence is read."""
+
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT trial_id FROM research_trials WHERE idempotency_key = ?",
+                (trial.idempotency_key,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO research_trials
+                        (trial_id, idempotency_key, research_event_id, campaign_id,
+                         hypothesis_id, family_id, candidate_id, parent_trial_id,
+                         trial_type, touched_returns, touched_blind, touched_shadow,
+                         dataset_fingerprint, validation_fingerprint,
+                         artifact_fingerprint, payload, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trial.id,
+                        trial.idempotency_key,
+                        trial.research_event_id,
+                        trial.campaign_id,
+                        trial.hypothesis_id,
+                        trial.family_id,
+                        trial.candidate_id,
+                        trial.parent_trial_id,
+                        str(trial.trial_type),
+                        int(trial.touched_returns),
+                        int(trial.touched_blind),
+                        int(trial.touched_shadow),
+                        trial.dataset_fingerprint,
+                        trial.validation_fingerprint,
+                        trial.artifact_fingerprint,
+                        trial.model_dump_json(),
+                        trial.created_at.isoformat(),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO research_trial_events
+                        (trial_id, event_type, payload, created_at)
+                    VALUES (?, 'reserved', ?, ?)
+                    """,
+                    (trial.id, trial.model_dump_json(), now),
+                )
+                trial_id = trial.id
+            else:
+                trial_id = existing["trial_id"]
+            connection.commit()
+        loaded = self.load_research_trial(trial_id)
+        if loaded is None:
+            raise RuntimeError("reserved research trial could not be reloaded")
+        return loaded
+
+    def append_research_trial_result(
+        self,
+        trial_id: str,
+        *,
+        result: str,
+        p_value: Decimal | None = None,
+        adjusted_p_value: Decimal | None = None,
+        dsr: Decimal | None = None,
+        pbo: Decimal | None = None,
+        global_alpha: Decimal | None = None,
+        family_alpha: Decimal | None = None,
+        reason_codes: list[str] | None = None,
+    ) -> dict:
+        payload = {
+            "result": result,
+            "p_value": str(p_value) if p_value is not None else None,
+            "adjusted_p_value": (str(adjusted_p_value) if adjusted_p_value is not None else None),
+            "dsr": str(dsr) if dsr is not None else None,
+            "pbo": str(pbo) if pbo is not None else None,
+            "global_alpha": str(global_alpha) if global_alpha is not None else None,
+            "family_alpha": str(family_alpha) if family_alpha is not None else None,
+            "reason_codes": list(reason_codes or []),
+        }
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM research_trials WHERE trial_id = ?", (trial_id,)
+                ).fetchone()
+                is None
+            ):
+                raise LookupError(f"research trial not found: {trial_id}")
+            connection.execute(
+                """
+                INSERT INTO research_trial_events
+                    (trial_id, event_type, payload, created_at)
+                VALUES (?, 'result', ?, ?)
+                """,
+                (trial_id, json.dumps(payload, sort_keys=True), now),
+            )
+            connection.commit()
+        loaded = self.load_research_trial(trial_id)
+        if loaded is None:
+            raise RuntimeError("completed research trial could not be reloaded")
+        return loaded
+
+    def load_research_trial(self, trial_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM research_trials WHERE trial_id = ?", (trial_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            events = connection.execute(
+                """
+                SELECT event_type, payload FROM research_trial_events
+                WHERE trial_id = ? ORDER BY sequence
+                """,
+                (trial_id,),
+            ).fetchall()
+        payload = json.loads(row["payload"])
+        for event in events:
+            if event["event_type"] == "result":
+                update = json.loads(event["payload"])
+                payload.update({key: value for key, value in update.items() if value is not None})
+        return payload
+
+    def list_research_trials(
+        self,
+        *,
+        family_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        bounded = min(max(limit, 1), 10000)
+        with self._lock, self.connect() as connection:
+            if family_id:
+                rows = connection.execute(
+                    """
+                    SELECT trial_id FROM research_trials WHERE family_id = ?
+                    ORDER BY created_at DESC LIMIT ?
+                    """,
+                    (family_id, bounded),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT trial_id FROM research_trials
+                    ORDER BY created_at DESC LIMIT ?
+                    """,
+                    (bounded,),
+                ).fetchall()
+        return [
+            loaded
+            for row in rows
+            if (loaded := self.load_research_trial(row["trial_id"])) is not None
+        ]
+
+    def allocate_online_fdr(
+        self,
+        *,
+        stream_id: str,
+        scope: str,
+        target_fdr: Decimal,
+        idempotency_key: str,
+    ) -> dict:
+        from .research_integrity import OnlineFDRSnapshot, lord_plus_plus_alpha
+
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_event = connection.execute(
+                "SELECT payload FROM online_fdr_events WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing_event is not None:
+                connection.commit()
+                return json.loads(existing_event["payload"])["allocation"]
+            row = connection.execute(
+                "SELECT scope, payload FROM online_fdr_streams WHERE stream_id = ?",
+                (stream_id,),
+            ).fetchone()
+            if row is None:
+                snapshot = OnlineFDRSnapshot(
+                    stream_id=stream_id,
+                    scope=scope,
+                    target_fdr=target_fdr,
+                    initial_wealth=target_fdr / Decimal("2"),
+                    next_sequence=1,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO online_fdr_streams (stream_id, scope, payload, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (stream_id, scope, snapshot.model_dump_json(), now),
+                )
+            else:
+                if row["scope"] != scope:
+                    raise RuntimeError("online FDR stream scope cannot change")
+                try:
+                    snapshot = OnlineFDRSnapshot.model_validate_json(row["payload"])
+                except Exception:
+                    snapshot = OnlineFDRSnapshot(
+                        stream_id=stream_id,
+                        scope=scope,
+                        target_fdr=target_fdr,
+                        initial_wealth=target_fdr / Decimal("2"),
+                        next_sequence=1,
+                        method="non_replenishing_alpha_spending_v1",
+                        degraded=True,
+                    )
+            sequence = snapshot.next_sequence
+            alpha = lord_plus_plus_alpha(snapshot, sequence)
+            allocation = {
+                "stream_id": stream_id,
+                "sequence": sequence,
+                "alpha": str(alpha),
+                "method": snapshot.method,
+                "idempotency_key": idempotency_key,
+            }
+            snapshot = snapshot.model_copy(
+                update={
+                    "next_sequence": sequence + 1,
+                    "pending_sequences": [*snapshot.pending_sequences, sequence],
+                }
+            )
+            event_payload = {"allocation": allocation, "status": "pending"}
+            connection.execute(
+                """
+                INSERT INTO online_fdr_events
+                    (stream_id, sequence, idempotency_key, alpha, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    stream_id,
+                    sequence,
+                    idempotency_key,
+                    str(alpha),
+                    json.dumps(event_payload, sort_keys=True),
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE online_fdr_streams SET payload = ?, updated_at = ? WHERE stream_id = ?",
+                (snapshot.model_dump_json(), now, stream_id),
+            )
+            connection.commit()
+        return allocation
+
+    def record_online_fdr_result(
+        self,
+        *,
+        stream_id: str,
+        sequence: int,
+        idempotency_key: str,
+        p_value: Decimal,
+    ) -> dict:
+        from .research_integrity import OnlineFDRSnapshot
+
+        if not Decimal("0") <= p_value <= Decimal("1"):
+            raise ValueError("online FDR p-value must be between zero and one")
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            stream = connection.execute(
+                "SELECT payload FROM online_fdr_streams WHERE stream_id = ?", (stream_id,)
+            ).fetchone()
+            event = connection.execute(
+                """
+                SELECT alpha, p_value, payload FROM online_fdr_events
+                WHERE stream_id = ? AND sequence = ? AND idempotency_key = ?
+                """,
+                (stream_id, sequence, idempotency_key),
+            ).fetchone()
+            if stream is None or event is None:
+                raise LookupError("online FDR allocation not found")
+            snapshot = OnlineFDRSnapshot.model_validate_json(stream["payload"])
+            if event["p_value"] is not None:
+                if Decimal(event["p_value"]) != p_value:
+                    raise RuntimeError("online FDR result is immutable")
+                connection.commit()
+                return snapshot.model_dump(mode="json")
+            alpha = Decimal(event["alpha"])
+            rejected = p_value <= alpha
+            pending = [item for item in snapshot.pending_sequences if item != sequence]
+            rejections = list(snapshot.rejection_sequences)
+            if rejected and sequence not in rejections:
+                rejections.append(sequence)
+                rejections.sort()
+            snapshot = snapshot.model_copy(
+                update={
+                    "pending_sequences": pending,
+                    "rejection_sequences": rejections,
+                }
+            )
+            event_payload = json.loads(event["payload"])
+            event_payload.update(
+                {"status": "completed", "p_value": str(p_value), "rejected": rejected}
+            )
+            connection.execute(
+                """
+                UPDATE online_fdr_events
+                SET p_value = ?, rejected = ?, payload = ?, completed_at = ?
+                WHERE stream_id = ? AND sequence = ?
+                """,
+                (
+                    str(p_value),
+                    int(rejected),
+                    json.dumps(event_payload, sort_keys=True),
+                    now,
+                    stream_id,
+                    sequence,
+                ),
+            )
+            connection.execute(
+                "UPDATE online_fdr_streams SET payload = ?, updated_at = ? WHERE stream_id = ?",
+                (snapshot.model_dump_json(), now, stream_id),
+            )
+            connection.commit()
+        return snapshot.model_dump(mode="json")
+
+    def load_online_fdr_snapshot(self, stream_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM online_fdr_streams WHERE stream_id = ?", (stream_id,)
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def restore_online_fdr_snapshot(self, payload: dict) -> None:
+        from .research_integrity import OnlineFDRSnapshot
+
+        try:
+            snapshot = OnlineFDRSnapshot.model_validate(payload)
+        except Exception as exc:
+            raise RuntimeError(
+                "online FDR snapshot restore cannot roll back or accept inconsistent state"
+            ) from exc
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT payload FROM online_fdr_streams WHERE stream_id = ?",
+                (snapshot.stream_id,),
+            ).fetchone()
+            if existing is not None:
+                current = OnlineFDRSnapshot.model_validate_json(existing["payload"])
+                if snapshot.next_sequence < current.next_sequence or not set(
+                    current.rejection_sequences
+                ).issubset(snapshot.rejection_sequences):
+                    raise RuntimeError("online FDR snapshot restore cannot roll back spent wealth")
+            connection.execute(
+                """
+                INSERT INTO online_fdr_streams (stream_id, scope, payload, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(stream_id) DO UPDATE SET
+                    scope = excluded.scope,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    snapshot.stream_id,
+                    snapshot.scope,
+                    snapshot.model_dump_json(),
+                    now,
+                ),
+            )
+            connection.commit()
+
+    def save_research_hypothesis_v2(self, hypothesis, *, parent_id: str | None = None) -> dict:
+        now = datetime.now(UTC).isoformat()
+        payload = hypothesis.model_dump_json()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT payload FROM research_hypotheses_v2 WHERE hypothesis_id = ?",
+                (hypothesis.id,),
+            ).fetchone()
+            if existing is not None and existing["payload"] != payload:
+                raise RuntimeError("research hypothesis is immutable")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO research_hypotheses_v2
+                    (hypothesis_id, family_id, parent_hypothesis_id, payload, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (hypothesis.id, hypothesis.family_id, parent_id, payload, now),
+            )
+            connection.commit()
+        return json.loads(payload)
+
+    def create_autonomous_research_event(
+        self,
+        *,
+        run_id: str,
+        idempotency_key: str,
+        snapshot_ready_at: datetime,
+        payload: dict,
+    ) -> dict:
+        now = datetime.now(UTC).isoformat()
+        encoded = json.dumps(payload, sort_keys=True)
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT payload FROM autonomous_research_events WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO autonomous_research_events
+                        (run_id, idempotency_key, status, payload, snapshot_ready_at,
+                         created_at, updated_at)
+                    VALUES (?, ?, 'RUNNING', ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        idempotency_key,
+                        encoded,
+                        snapshot_ready_at.isoformat(),
+                        now,
+                        now,
+                    ),
+                )
+            connection.commit()
+        return json.loads(existing["payload"]) if existing is not None else payload
+
+    def consume_autonomous_research_budget(
+        self,
+        *,
+        research_event_id: str,
+        family_id: str,
+        budget_kind: str,
+        amount: int,
+        limit: int,
+        idempotency_key: str,
+    ) -> bool:
+        columns = {
+            "semantic_proposals": "semantic_proposals",
+            "empirical_trials": "empirical_trials",
+            "exact_finalists": "exact_finalists",
+            "evolution_rounds": "evolution_rounds",
+        }
+        if budget_kind not in columns or amount <= 0 or limit <= 0:
+            raise ValueError("invalid autonomous research budget request")
+        column = columns[budget_kind]
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                connection.execute(
+                    """
+                SELECT 1 FROM autonomous_research_budget_events
+                WHERE idempotency_key = ?
+                """,
+                    (idempotency_key,),
+                ).fetchone()
+                is not None
+            ):
+                connection.commit()
+                return True
+            row = connection.execute(
+                """
+                SELECT semantic_proposals, empirical_trials, exact_finalists,
+                       evolution_rounds
+                FROM autonomous_research_budgets
+                WHERE research_event_id = ? AND family_id = ?
+                """,
+                (research_event_id, family_id),
+            ).fetchone()
+            current = int(row[column]) if row else 0
+            if current + amount > limit:
+                connection.commit()
+                return False
+            connection.execute(
+                """
+                INSERT INTO autonomous_research_budgets
+                    (research_event_id, family_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(research_event_id, family_id) DO NOTHING
+                """,
+                (research_event_id, family_id, now),
+            )
+            connection.execute(
+                f"""
+                UPDATE autonomous_research_budgets
+                SET {column} = {column} + ?, updated_at = ?
+                WHERE research_event_id = ? AND family_id = ?
+                """,
+                (amount, now, research_event_id, family_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO autonomous_research_budget_events
+                    (idempotency_key, research_event_id, family_id, budget_kind,
+                     amount, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    idempotency_key,
+                    research_event_id,
+                    family_id,
+                    budget_kind,
+                    amount,
+                    now,
+                ),
+            )
+            connection.commit()
+        return True
+
+    def commit_autonomous_research_decision(
+        self,
+        result,
+        *,
+        trial_result: dict | None = None,
+    ) -> dict:
+        now = datetime.now(UTC).isoformat()
+        encoded = result.model_dump_json()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, payload FROM autonomous_research_events WHERE run_id = ?",
+                (result.run_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"autonomous research run not found: {result.run_id}")
+            if row["status"] == "COMMITTED":
+                connection.commit()
+                return json.loads(row["payload"])
+            if trial_result is not None:
+                trial_id = result.trial_id
+                if (
+                    not trial_id
+                    or connection.execute(
+                        "SELECT 1 FROM research_trials WHERE trial_id = ?", (trial_id,)
+                    ).fetchone()
+                    is None
+                ):
+                    raise RuntimeError("atomic research decision references no reserved trial")
+                connection.execute(
+                    """
+                    INSERT INTO research_trial_events
+                        (trial_id, event_type, payload, created_at)
+                    VALUES (?, 'result', ?, ?)
+                    """,
+                    (trial_id, json.dumps(trial_result, sort_keys=True), now),
+                )
+            connection.execute(
+                """
+                UPDATE autonomous_research_events
+                SET status = 'COMMITTED', payload = ?, decision_committed_at = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (encoded, now, now, result.run_id),
+            )
+            connection.commit()
+        return json.loads(encoded)
+
+    def load_autonomous_research_event(self, run_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM autonomous_research_events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def put_research_artifact(
+        self,
+        *,
+        artifact_fingerprint: str,
+        artifact_kind: str,
+        payload: dict,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        encoded = json.dumps(payload, sort_keys=True)
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT artifact_kind, payload FROM research_artifact_index
+                WHERE artifact_fingerprint = ?
+                """,
+                (artifact_fingerprint,),
+            ).fetchone()
+            if existing is not None and (
+                existing["artifact_kind"] != artifact_kind or existing["payload"] != encoded
+            ):
+                raise RuntimeError("content-addressed research artifact is immutable")
+            connection.execute(
+                """
+                INSERT INTO research_artifact_index
+                    (artifact_fingerprint, artifact_kind, payload, created_at, last_used_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(artifact_fingerprint) DO UPDATE SET last_used_at = excluded.last_used_at
+                """,
+                (artifact_fingerprint, artifact_kind, encoded, now, now),
+            )
+            connection.commit()
+
+    def load_research_artifact(self, artifact_fingerprint: str, artifact_kind: str) -> dict | None:
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT payload FROM research_artifact_index
+                WHERE artifact_fingerprint = ? AND artifact_kind = ?
+                """,
+                (artifact_fingerprint, artifact_kind),
+            ).fetchone()
+            if row is not None:
+                connection.execute(
+                    """
+                    UPDATE research_artifact_index SET last_used_at = ?
+                    WHERE artifact_fingerprint = ?
+                    """,
+                    (now, artifact_fingerprint),
+                )
+            connection.commit()
+        return json.loads(row["payload"]) if row else None
+
+    def register_behavior_fingerprint(
+        self,
+        *,
+        behavior_fingerprint: str,
+        ir_hash: str,
+        family_id: str,
+        payload: dict,
+    ) -> bool:
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO research_behavior_fingerprints
+                    (behavior_fingerprint, ir_hash, family_id, payload, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    behavior_fingerprint,
+                    ir_hash,
+                    family_id,
+                    json.dumps(payload, sort_keys=True),
+                    now,
+                ),
+            )
+            created = cursor.rowcount == 1
+            connection.commit()
+        return created
+
+    def register_research_novelty(
+        self,
+        *,
+        novelty_kind: str,
+        novelty_fingerprint: str,
+        family_id: str,
+        payload: dict,
+    ) -> bool:
+        if novelty_kind not in {"ast", "feature_graph"}:
+            raise ValueError("unsupported novelty fingerprint kind")
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO research_novelty_index
+                    (novelty_kind, novelty_fingerprint, family_id, payload, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    novelty_kind,
+                    novelty_fingerprint,
+                    family_id,
+                    json.dumps(payload, sort_keys=True),
+                    now,
+                ),
+            )
+            created = cursor.rowcount == 1
+            connection.commit()
+        return created
+
+    def save_candidate_lineage_v2(
+        self,
+        *,
+        lineage_id: str,
+        research_event_id: str,
+        family_id: str,
+        candidate_id: str,
+        parent_ids: list[str],
+        operation: str,
+        payload: dict,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        encoded = json.dumps(payload, sort_keys=True)
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT payload FROM research_candidate_lineage_v2 WHERE lineage_id = ?",
+                (lineage_id,),
+            ).fetchone()
+            if existing is not None and existing["payload"] != encoded:
+                raise RuntimeError("candidate lineage is immutable")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO research_candidate_lineage_v2
+                    (lineage_id, research_event_id, family_id, candidate_id,
+                     parent_ids, operation, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lineage_id,
+                    research_event_id,
+                    family_id,
+                    candidate_id,
+                    json.dumps(parent_ids),
+                    operation,
+                    encoded,
+                    now,
+                ),
+            )
+            connection.commit()
+
+    def save_generator_envelope(self, envelope) -> dict:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO generator_envelopes
+                    (envelope_id, fingerprint, payload, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    envelope.id,
+                    envelope.fingerprint,
+                    envelope.model_dump_json(),
+                    envelope.issued_at.isoformat(),
+                ),
+            )
+            connection.commit()
+        return envelope.model_dump(mode="json")
+
+    def load_generator_envelope(self, envelope_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM generator_envelopes WHERE envelope_id = ?",
+                (envelope_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_research_certificate(self, certificate, certificate_type: str) -> dict:
+        strategy_ir_hash = getattr(certificate, "strategy_ir_hash", "")
+        created_at = getattr(certificate, "issued_at", None) or getattr(
+            certificate, "created_at", datetime.now(UTC)
+        )
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO research_certificates_v2
+                    (certificate_id, certificate_type, strategy_ir_hash, payload, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    certificate.id,
+                    certificate_type,
+                    strategy_ir_hash,
+                    certificate.model_dump_json(),
+                    created_at.isoformat(),
+                ),
+            )
+            connection.commit()
+        return certificate.model_dump(mode="json")
+
+    def revoke_research_certificate(self, event) -> dict:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM research_certificates_v2 WHERE certificate_id = ?",
+                    (event.certificate_id,),
+                ).fetchone()
+                is None
+            ):
+                raise LookupError(f"research certificate not found: {event.certificate_id}")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO certificate_revocations
+                    (revocation_id, certificate_id, reason_code, payload, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.certificate_id,
+                    event.reason_code,
+                    event.model_dump_json(),
+                    event.revoked_at.isoformat(),
+                ),
+            )
+            connection.commit()
+        return event.model_dump(mode="json")
+
+    def load_research_certificate_status(self, certificate_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            certificate = connection.execute(
+                """
+                SELECT certificate_type, payload FROM research_certificates_v2
+                WHERE certificate_id = ?
+                """,
+                (certificate_id,),
+            ).fetchone()
+            if certificate is None:
+                return None
+            revocations = connection.execute(
+                """
+                SELECT payload FROM certificate_revocations
+                WHERE certificate_id = ? ORDER BY created_at
+                """,
+                (certificate_id,),
+            ).fetchall()
+        return {
+            "certificate_type": certificate["certificate_type"],
+            "certificate": json.loads(certificate["payload"]),
+            "revoked": bool(revocations),
+            "revocations": [json.loads(row["payload"]) for row in revocations],
+        }

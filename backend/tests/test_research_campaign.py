@@ -71,6 +71,13 @@ def _cell(
         one_sided_sharpe_p_value=Decimal(p_value or ("0.0001" if robust else "0.50")),
         one_sided_win_rate_p_value=Decimal(p_value or ("0.0001" if robust else "0.50")),
         deflated_sharpe_probability=Decimal("0.99" if robust else "0.10"),
+        expected_r=Decimal("0.25" if robust else "-0.10"),
+        cost_adjusted_expectancy=Decimal("12" if robust else "-4"),
+        expected_r_confidence_lower_bound=Decimal("0.05" if robust else "-0.20"),
+        expected_r_p_value=Decimal(p_value or ("0.0001" if robust else "0.50")),
+        expected_r_testable=True,
+        expected_r_passed=robust,
+        expected_r_observation_count=total_trades,
     )
 
 
@@ -552,7 +559,7 @@ def test_pbo_uses_largest_exact_dataset_cohort_when_feature_eligibility_differs(
     assert report.pbo.fold_count == 24
 
 
-def test_campaign_requires_joint_high_win_rate_payoff_and_profit_factor():
+def test_campaign_does_not_use_win_rate_payoff_or_profit_factor_as_universal_gates():
     cells = [
         _cell(
             "many_small_wins",
@@ -584,20 +591,9 @@ def test_campaign_requires_joint_high_win_rate_payoff_and_profit_factor():
     )
 
     for candidate in report.candidates:
-        assert candidate.cross_market_passed is False
-        assert candidate.high_quality_market_ratio == Decimal("0.000")
-    assert any(
-        "盈亏比中位数" in reason
-        for reason in next(
-            item for item in report.candidates if item.library_entry_id == "many_small_wins"
-        ).reasons
-    )
-    assert any(
-        "胜率中位数" in reason
-        for reason in next(
-            item for item in report.candidates if item.library_entry_id == "few_large_wins"
-        ).reasons
-    )
+        assert candidate.cross_market_passed is True
+        assert candidate.high_quality_market_ratio == Decimal("1.000")
+        assert all("胜率" not in reason and "盈亏比" not in reason for reason in candidate.reasons)
 
 
 def test_campaign_fdr_uses_cumulative_cross_campaign_family_size():
@@ -725,6 +721,15 @@ def test_joint_quality_requires_metrics_stress_and_time_stability_in_same_market
         )
         if index < 2:
             cell = cell.model_copy(update={"stress_return_percent": Decimal("-1")})
+        if index >= 3:
+            cell = cell.model_copy(
+                update={
+                    "expected_r": Decimal("-0.1"),
+                    "cost_adjusted_expectancy": Decimal("-2"),
+                    "expected_r_confidence_lower_bound": Decimal("-0.2"),
+                    "expected_r_passed": False,
+                }
+            )
         cells.append(cell)
 
     report = finalize_campaign(
