@@ -23,6 +23,27 @@ class CandidateStatus(StrEnum):
     RETIRED = "retired"
 
 
+class CandidateResearchContext(BaseModel):
+    """Immutable generation-time context for v2 research candidates."""
+
+    generation_contract_version: str = "strategy_generation_v2"
+    exchange: str
+    market_type: str
+    symbol: str
+    timeframe: str
+    entry_profile: str = "balanced_5m_v1"
+    market_as_of: datetime
+    summary_fingerprint: str
+    fee_bps: Decimal
+    slippage_bps: Decimal
+    risk_fraction: Decimal
+    max_gross_exposure: Decimal
+    max_leverage: Decimal
+    required_features: list[str] = Field(default_factory=lambda: ["ohlcv"])
+    trial_group: str
+    trial_count: int = Field(default=1, ge=1)
+
+
 class ValidatedStrategyArtifact(BaseModel):
     """Immutable attestation that an AI/ML candidate passed research isolation."""
 
@@ -61,6 +82,7 @@ class StrategyCandidate(BaseModel):
     backtest: BacktestResult | None = None
     execution_artifact: ValidatedStrategyArtifact | None = None
     parent_candidate_id: str | None = None
+    research_context: CandidateResearchContext | None = None
     decision_reasons: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -158,6 +180,7 @@ def create_candidate(
     raw_spec: StrategySpec | dict,
     *,
     parent_candidate_id: str | None = None,
+    research_context: CandidateResearchContext | None = None,
 ) -> StrategyCandidate:
     spec = validate_strategy_spec(raw_spec)
     return StrategyCandidate(
@@ -165,6 +188,7 @@ def create_candidate(
         spec_fingerprint=spec.fingerprint,
         source=spec.source,
         parent_candidate_id=parent_candidate_id,
+        research_context=research_context,
         decision_reasons=[
             "候选规格已通过字段范围、策略家族和交叉参数约束",
             "候选仍不可执行，必须绑定不可变数据集并通过独立回测",

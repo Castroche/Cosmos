@@ -1,0 +1,221 @@
+{
+  "results": [
+    {
+      "section": "intelligence",
+      "viewport": 1600,
+      "overflow": false,
+      "title": "自动量化交易台PRO",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "portfolio",
+      "viewport": 1600,
+      "overflow": false,
+      "title": "持仓、订单与收益",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "risk",
+      "viewport": 1600,
+      "overflow": false,
+      "title": "风险控制",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "researchAgent",
+      "viewport": 1600,
+      "overflow": false,
+      "title": "离线研究",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "library",
+      "viewport": 1600,
+      "overflow": false,
+      "title": "策略库",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "editor",
+      "viewport": 1600,
+      "overflow": false,
+      "title": "策略编辑器",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "logs",
+      "viewport": 1600,
+      "overflow": false,
+      "title": "运行日志",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "ai",
+      "viewport": 1600,
+      "overflow": false,
+      "title": "AI 服务",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "settings",
+      "viewport": 1600,
+      "overflow": false,
+      "title": "系统设置",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "intelligence",
+      "viewport": 768,
+      "overflow": false,
+      "title": "自动量化交易台PRO",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "portfolio",
+      "viewport": 768,
+      "overflow": false,
+      "title": "持仓、订单与收益",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "risk",
+      "viewport": 768,
+      "overflow": false,
+      "title": "风险控制",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "researchAgent",
+      "viewport": 768,
+      "overflow": false,
+      "title": "离线研究",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "library",
+      "viewport": 768,
+      "overflow": false,
+      "title": "策略库",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "editor",
+      "viewport": 768,
+      "overflow": false,
+      "title": "策略编辑器",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "logs",
+      "viewport": 768,
+      "overflow": false,
+      "title": "运行日志",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "ai",
+      "viewport": 768,
+      "overflow": false,
+      "title": "AI 服务",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "settings",
+      "viewport": 768,
+      "overflow": false,
+      "title": "系统设置",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "intelligence",
+      "viewport": 390,
+      "overflow": false,
+      "title": "自动量化交易台PRO",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "portfolio",
+      "viewport": 390,
+      "overflow": false,
+      "title": "持仓、订单与收益",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "risk",
+      "viewport": 390,
+      "overflow": false,
+      "title": "风险控制",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "researchAgent",
+      "viewport": 390,
+      "overflow": false,
+      "title": "离线研究",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "library",
+      "viewport": 390,
+      "overflow": false,
+      "title": "策略库",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "editor",
+      "viewport": 390,
+      "overflow": false,
+      "title": "策略编辑器",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "logs",
+      "viewport": 390,
+      "overflow": false,
+      "title": "运行日志",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "ai",
+      "viewport": 390,
+      "overflow": false,
+      "title": "AI 服务",
+      "accent": "#ff64bb",
+      "alerts": []
+    },
+    {
+      "section": "settings",
+      "viewport": 390,
+      "overflow": false,
+      "title": "系统设置",
+      "accent": "#ff64bb",
+      "alerts": []
+    }
+  ],
+  "issues": []
+}

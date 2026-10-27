@@ -136,6 +136,17 @@ class ExecutionEligibilityGrant(BaseModel, frozen=True):
     artifact_fingerprint: str
     generator_envelope_fingerprint: str
     build_identity: RuntimeBuildIdentity
+    evidence_tier: Literal[
+        "paper_eligible", "sandbox_canary", "sandbox_mature", "live_capped"
+    ] = "sandbox_canary"
+    market_scope: tuple[str, ...] = ()
+    revocation_conditions: tuple[str, ...] = (
+        "certificate_expired",
+        "strategy_or_data_fingerprint_changed",
+        "market_data_stale",
+        "execution_integrity_failure",
+        "forward_performance_deteriorated",
+    )
     target_timeframe_seconds: int = Field(gt=0)
     risk_budget_fraction: Decimal = Field(gt=0, le=Decimal("0.10"))
     maximum_active_instances: Literal[1] = 1
@@ -156,6 +167,10 @@ class ExecutionEligibilityGrant(BaseModel, frozen=True):
         requested_risk_budget: Decimal,
         mature_reference_risk_budget: Decimal,
         build_identity: RuntimeBuildIdentity,
+        evidence_tier: Literal[
+            "paper_eligible", "sandbox_canary", "sandbox_mature", "live_capped"
+        ] = "sandbox_canary",
+        market_scope: tuple[str, ...] = (),
         issued_at: datetime | None = None,
     ) -> ExecutionEligibilityGrant:
         if not build_identity.formal_certificate_eligible:
@@ -175,6 +190,8 @@ class ExecutionEligibilityGrant(BaseModel, frozen=True):
             artifact_fingerprint=artifact_fingerprint,
             generator_envelope_fingerprint=generator_envelope_fingerprint,
             build_identity=build_identity,
+            evidence_tier=evidence_tier,
+            market_scope=market_scope,
             target_timeframe_seconds=target_timeframe_seconds,
             risk_budget_fraction=permitted,
             issued_at=issued,

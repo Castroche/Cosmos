@@ -18,6 +18,14 @@ class RiskControlState(BaseModel):
 class RiskStateService:
     """Durable fail-closed trading switch shared by API and execution workers."""
 
+    _LEGACY_STRATEGY_GOVERNANCE_HALTS = {
+        (
+            "No cross-market robust Champion; block all new risk until strategy "
+            "certification is enforced"
+        ),
+        "没有跨市场稳健 Champion；在策略认证完成前禁止所有新增风险",
+    }
+
     _SOURCE_PRIORITY = {
         "": 0,
         "maintenance": 10,
@@ -34,6 +42,11 @@ class RiskStateService:
 
     def __init__(self, store: SqliteStore):
         self.store = store
+        # In-flight commands cannot survive a stop/resume cycle in this process.
+        self.entry_generation = 0
+
+    def invalidate_entries(self) -> None:
+        self.entry_generation += 1
 
     def get(self) -> RiskControlState:
         payload = self.store.load_risk_state()
@@ -49,6 +62,7 @@ class RiskStateService:
         return state
 
     def halt(self, reason: str, source: str = "manual") -> RiskControlState:
+        self.invalidate_entries()
         current = self.get()
         current_priority = self._SOURCE_PRIORITY.get(current.source, 70)
         requested_priority = self._SOURCE_PRIORITY.get(source, 70)
@@ -70,6 +84,7 @@ class RiskStateService:
     def resume(self, confirmation: str) -> RiskControlState:
         if confirmation != "RESUME TRADING":
             raise ValueError("恢复交易确认短语必须为 RESUME TRADING")
+        self.invalidate_entries()
         state = RiskControlState()
         self._save(state)
         return state
@@ -88,6 +103,21 @@ class RiskStateService:
         if not current.halted or not (
             current.source == "reconciliation_transport" or legacy_transport_halt
         ):
+            return current
+        state = RiskControlState()
+        self._save(state)
+        return state
+
+    def recover_demo_reconciliation_integrity(self) -> RiskControlState:
+        """Clear a Demo-only integrity latch after a fully clean venue report.
+
+        The RuntimeManager calls this only in SANDBOX and only after uncertain,
+        unknown-position, unknown-order and unprotected-order sets are all empty.
+        Live integrity incidents remain operator-latched.
+        """
+
+        current = self.get()
+        if not current.halted or current.source != "reconciliation_integrity":
             return current
         state = RiskControlState()
         self._save(state)
@@ -114,6 +144,27 @@ class RiskStateService:
 
         current = self.get()
         if not current.halted or current.source != "maintenance":
+            return current
+        state = RiskControlState()
+        self._save(state)
+        return state
+
+    def recover_legacy_strategy_governance_halt(self) -> RiskControlState:
+        """Clear the obsolete global halt that represented missing strategy evidence.
+
+        A missing Champion is a strategy-level admission failure: the candidate must
+        remain WAIT and cannot reach the risk-increasing execution tool.  It is not an
+        operational incident and must not latch the account-wide emergency stop.
+        Only the exact historical manual reason is migrated; operator halts, drawdown,
+        reconciliation, uncertain execution, and protection failures remain latched.
+        """
+
+        current = self.get()
+        if not (
+            current.halted
+            and current.source == "manual"
+            and current.reason in self._LEGACY_STRATEGY_GOVERNANCE_HALTS
+        ):
             return current
         state = RiskControlState()
         self._save(state)

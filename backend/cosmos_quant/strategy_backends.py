@@ -344,6 +344,12 @@ class NumpyFastVectorBackend:
             filter_signal = np.asarray(values[ir.filter_signal], dtype=bool)
             long_signal &= filter_signal
             short_signal &= filter_signal
+        if ir.regime_gates:
+            regime_mask = np.ones(length, dtype=bool)
+            for _, reference in ir.regime_gates:
+                regime_mask &= np.asarray(values[reference], dtype=bool)
+            long_signal &= regime_mask
+            short_signal &= regime_mask
         entry = long_signal.astype(np.int8) - short_signal.astype(np.int8)
         position = np.zeros(length, dtype=np.int8)
         exit_intent = np.zeros(length, dtype=bool)

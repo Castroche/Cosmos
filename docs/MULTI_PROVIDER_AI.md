@@ -4,7 +4,7 @@
 
 ## 目标
 
-AI 只负责提出满足 `StrategySpec` 约束的研究假设，不直接创建、激活或执行交易计划。所有输出都必须经过本地 Pydantic 校验、不可变数据集回测、压力测试、Champion/Challenger 比较和人工确认。
+Research AI 只负责提出满足 `StrategySpec` 约束的离线研究假设，不创建、激活或执行实时交易计划。所有输出都必须经过本地 Pydantic 校验、不可变数据集回测、压力测试和 Champion/Challenger 比较；研究结果不会自动交接到 Trading Intelligence v2。
 
 系统不把“最新”实现为永久写死的模型名。每个供应商包含：
 
@@ -22,7 +22,7 @@ AI 只负责提出满足 `StrategySpec` 约束的研究假设，不直接创建�
 | Anthropic | Messages API | `/v1/models` | `output_config.format` JSON Schema | Claude 4.6 系列，按模型能力字段选择 |
 | Google Gemini | Interactions API | Models API | `response_format` + JSON Schema | Gemini 3 系列；稳定版优先于 Preview |
 | xAI | Chat Completions / xAI SDK | `/v1/models` | `response_format=json_schema` | Grok 4.5 系列 |
-| DeepSeek | OpenAI 或 Anthropic 兼容接口 | 配置目录 + 健康探测 | JSON mode 后本地严格校验 | `deepseek-v4-flash` / `deepseek-v4-pro` |
+| DeepSeek | OpenAI 或 Anthropic 兼容接口 | 配置目录 + 健康探测 | JSON mode 后本地严格校验 | `deepseek-flash`（DeepSeek V4.1 Flash） |
 | Mistral | Chat Completions | `/v1/models` | Custom Structured Outputs | `mistral-*-latest` 能力探测后解析到实际模型 |
 | Alibaba Qwen | OpenAI-compatible / Responses | 模型目录 | JSON mode 后本地严格校验 | Qwen 3.7 系列；按区域端点隔离 |
 | Custom | OpenAI-compatible Chat Completions | 可选 `/v1/models` | JSON Schema 或 JSON mode | 用于 Azure、自托管和其他兼容服务 |
@@ -78,7 +78,8 @@ immutable dataset -> walk-forward/stress -> Challenger -> manual promotion
 1. 先按结构化输出能力、地区端点、模型稳定性和管理员允许列表过滤。
 2. 策略生成使用质量路由；批量参数候选使用成本路由；Champion 复核可采用双模型独立评审。
 3. 仅对超时、429 和 5xx 做带抖动的有限重试；认证、权限、Schema 错误不跨供应商盲目重试。
-4. 熔断器按“供应商 + 模型 + 端点”隔离。连续失败后进入冷却，半开探测成功才恢复。
+4. 熔断器按供应商隔离。连续 3 次失败后进入 60 秒冷却，冷却结束由下一次有效研究事件自动半开探测，成功后清零连续失败；`GET /api/ai/health` 返回最近错误、失败/成功时间、冷却截止时间和半开次数。熔断仅降级 AI 研究生成，不得停掉本地审核、交易执行、保护、退出或对账。
+   自动 Agent 结构化决策另有滚动质量闸门：最近 20 次中样本不少于 5 次、成功率低于 80% 且最后一次仍失败时暂停该厂商 15 分钟；其他合格厂商仍可接管，冷却后允许一次恢复探测。人工连接测试和显式手动研究不被自动质量闸门阻断。
 5. Fallback 每次重新使用相同的版本化输入和 Schema；禁止把上一供应商的自由文本喂给下一家。
 6. 多模型意见不直接投票决定交易。每个输出形成独立候选，使用同一不可变数据集公平回测。
 
@@ -88,7 +89,7 @@ immutable dataset -> walk-forward/stress -> Challenger -> manual promotion
 - 自定义 `base_url` 默认只允许 HTTPS；私网/回环地址需要管理员显式开启，阻止 SSRF 和云元数据访问。
 - 禁止任意模型工具调用、代码执行、网页访问和直接调用交易 API。
 - 输出必须先通过 JSON 解码、`StrategySpec` 字段范围、交叉参数、来源和指纹校验。
-- AI 候选保持 `source=ai`；现有 RiskEngine 会拒绝它直接执行。晋升 Champion 也不会自动激活交易。
+- AI 候选保持 `source=ai`；研究代码没有实时执行入口。晋升 Champion 只更新离线证据，不能创建 Thesis、TradePlan、RiskAllocation 或订单。
 - 预算按供应商设置单次 token、每分钟请求、每日费用软限额和硬限额；硬限额触发 fail closed。
 - 日志只保留指纹、计量和截断后的错误类别；供应商原始正文为可选的加密调试数据并设短期 TTL。
 

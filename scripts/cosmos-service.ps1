@@ -3,6 +3,7 @@ param(
     [ValidateSet("start", "stop", "status")]
     [string]$Action = "status",
     [switch]$Build,
+    [switch]$StartPaused,
     [ValidateRange(1024, 65535)]
     [int]$Port = 8000
 )
@@ -127,6 +128,7 @@ function Show-Status {
         pid = if ($process) { $process.Id } else { $null }
         port = $healthPort
         url = "http://127.0.0.1:$healthPort"
+        data_dir = if ($state) { $state.data_dir } else { $null }
         state_file = $StatePath
     }
 }
@@ -145,9 +147,19 @@ switch ($Action) {
             throw "Python runtime is missing: $PythonPath"
         }
         New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
+        Push-Location $ProjectRoot
+        try {
+            $dataDirectory = & $PythonPath -c "import sys; sys.path.insert(0, 'backend'); from cosmos_quant.settings import Settings; print(Settings().cosmos_data_dir.resolve())"
+            if ($LASTEXITCODE -ne 0) { throw "Cannot resolve the configured data directory." }
+            $dataDirectory = ([string]$dataDirectory).Trim()
+        }
+        finally { Pop-Location }
         $existingState = Get-CosmosState
         $existingProcess = Get-OwnedCosmosProcess -State $existingState
         if ($existingProcess) {
+            if (-not $existingState.data_dir -or $existingState.data_dir -ne $dataDirectory) {
+                throw "A managed instance uses a different or unknown data directory; stop it before starting this configuration."
+            }
             $existingPort = [int]$existingState.port
             if (Test-CosmosHealth -HealthPort $existingPort) {
                 Write-Output "COSMOS API is already healthy on port $existingPort (PID $($existingProcess.Id))."
@@ -180,6 +192,9 @@ switch ($Action) {
             "--host", "127.0.0.1",
             "--port", "$Port"
         )
+        $previousStartPaused = $env:COSMOS_AUTOMATION_START_PAUSED
+        if ($StartPaused) { $env:COSMOS_AUTOMATION_START_PAUSED = "true" }
+        try {
         $process = Start-Process `
             -FilePath $PythonPath `
             -ArgumentList $arguments `
@@ -188,14 +203,19 @@ switch ($Action) {
             -RedirectStandardOutput $StdoutPath `
             -RedirectStandardError $StderrPath `
             -PassThru
+        }
+        finally { $env:COSMOS_AUTOMATION_START_PAUSED = $previousStartPaused }
         @{
             pid = $process.Id
             port = $Port
             project_root = $ProjectRoot
+            data_dir = $dataDirectory
             started_at = [DateTimeOffset]::UtcNow.ToString("o")
         } | ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding utf8
 
-        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        # A large local research ledger may need time for an integrity-checked
+        # pre-migration SQLite backup before FastAPI can report healthy.
+        $deadline = [DateTime]::UtcNow.AddSeconds(180)
         while ([DateTime]::UtcNow -lt $deadline) {
             if ($process.HasExited) {
                 $tail = if (Test-Path -LiteralPath $StderrPath) {
@@ -218,7 +238,7 @@ switch ($Action) {
             Stop-CosmosProcessTree -Process $process
         }
         Remove-StaleState
-        throw "COSMOS API did not become healthy within 30 seconds; inspect $StderrPath."
+        throw "COSMOS API did not become healthy within 180 seconds; inspect $StderrPath."
     }
     "stop" {
         $state = Get-CosmosState

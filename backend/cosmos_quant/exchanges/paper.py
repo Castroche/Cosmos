@@ -17,6 +17,7 @@ from ..domain import (
     OrderType,
     PortfolioState,
     Position,
+    PositionSide,
     Side,
     StrategyPlan,
     TradingMode,
@@ -34,6 +35,7 @@ def _money(value: Decimal) -> Decimal:
 
 class PaperPosition(BaseModel):
     symbol: str
+    position_side: PositionSide | None = None
     signed_quantity: Decimal = Decimal("0")
     average_entry: Decimal = Decimal("0")
     realized_pnl: Decimal = Decimal("0")
@@ -50,6 +52,8 @@ class PaperBracket(BaseModel):
     symbol: str
     side: Side
     entry_order_id: str
+    entry_filled: dict[str, Decimal] = Field(default_factory=dict)
+    position_side: PositionSide | None = None
     stop_loss: Decimal
     targets: list[PaperTarget]
     original_quantity: Decimal = Decimal("0")
@@ -109,7 +113,10 @@ class PaperExchange(ExchangeAdapter):
         self.cash = state.cash
         self.daily_start_equity = state.daily_start_equity
         self.orders = {order.id: order for order in state.orders}
-        self.positions = {position.symbol: position for position in state.positions}
+        self.positions = {
+            self._position_key(position.symbol, position.position_side): position
+            for position in state.positions
+        }
         self.brackets = {bracket.plan_id: bracket for bracket in state.brackets}
         self.idempotency = state.idempotency
         self.session_date = state.session_date
@@ -196,7 +203,11 @@ class PaperExchange(ExchangeAdapter):
                 (
                     item
                     for item in self.brackets.values()
-                    if item.symbol == state.symbol and item.active and not item.completed
+                    if item.symbol == state.symbol
+                    and item.active
+                    and not item.completed
+                    and item.position_side == state.position_side
+                    and (item.side == Side.LONG) == (state.signed_quantity > 0)
                 ),
                 None,
             )
@@ -256,8 +267,39 @@ class PaperExchange(ExchangeAdapter):
         )
 
     async def place_order(self, intent: OrderIntent) -> Order:
+        if intent.quantity <= 0:
+            raise ValueError("order quantity must be positive")
+        if intent.order_type == OrderType.LIMIT and (
+            intent.limit_price is None or intent.limit_price <= 0
+        ):
+            raise ValueError("limit orders require a positive limit_price")
+        if intent.order_type == OrderType.MARKET and intent.limit_price is not None:
+            raise ValueError("market orders must not carry limit_price")
+        if intent.position_side:
+            if self.market_type != "swap":
+                raise ValueError("position_side requires a swap account")
+            opening_side = (
+                OrderSide.BUY if intent.position_side == PositionSide.LONG else OrderSide.SELL
+            )
+            if (intent.side == opening_side) == intent.reduce_only:
+                raise ValueError("side/position_side does not match opening or reducing intent")
         if intent.idempotency_key in self.idempotency:
-            return self.orders[self.idempotency[intent.idempotency_key]]
+            previous = self.orders[self.idempotency[intent.idempotency_key]]
+            if any(
+                getattr(previous, field) != getattr(intent, field)
+                for field in (
+                    "plan_id",
+                    "symbol",
+                    "side",
+                    "position_side",
+                    "order_type",
+                    "quantity",
+                    "limit_price",
+                    "reduce_only",
+                )
+            ):
+                raise ValueError("idempotency key reused for a different order")
+            return previous
         snapshot = await self.market_snapshot(intent.symbol)
         order = Order(
             id=f"ord_{uuid4().hex[:12]}",
@@ -265,6 +307,8 @@ class PaperExchange(ExchangeAdapter):
             plan_id=intent.plan_id,
             symbol=intent.symbol,
             side=intent.side,
+            position_side=intent.position_side,
+            reduce_only=intent.reduce_only,
             order_type=intent.order_type,
             status=OrderStatus.OPEN,
             quantity=intent.quantity,
@@ -284,7 +328,7 @@ class PaperExchange(ExchangeAdapter):
         order = self.orders[order_id]
         if order.symbol != symbol:
             raise ValueError("symbol does not match order")
-        if order.status == OrderStatus.OPEN:
+        if order.status in {OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED}:
             order.status = OrderStatus.CANCELED
             order.updated_at = datetime.now(UTC)
             bracket = self.brackets.get(order.plan_id)
@@ -294,7 +338,15 @@ class PaperExchange(ExchangeAdapter):
         return order
 
     async def open_orders(self) -> list[Order]:
-        return [order for order in self.orders.values() if order.status == OrderStatus.OPEN]
+        return [
+            order
+            for order in self.orders.values()
+            if order.status
+            in {
+                OrderStatus.OPEN,
+                OrderStatus.PARTIALLY_FILLED,
+            }
+        ]
 
     async def fetch_order(self, order_id: str, symbol: str) -> Order:
         order = self.orders[order_id]
@@ -346,7 +398,15 @@ class PaperExchange(ExchangeAdapter):
         intent: OrderIntent,
         current_quantity: Decimal,
     ) -> Order:
-        del entry_orders
+        if not intent.reduce_only or intent.order_type != OrderType.MARKET:
+            raise PositionProtectionError("position reduction requires a reduce-only market order")
+        if intent.quantity > current_quantity:
+            raise PositionProtectionError("reduction exceeds the attributed position")
+        if intent.idempotency_key in self.idempotency:
+            return await self.place_order(intent)
+        if entry_orders and intent.position_side is None:
+            intent = intent.model_copy(update={"position_side": entry_orders[0].position_side})
+        await self.sync_position_protection(plan, entry_orders, current_quantity)
         bracket = self.brackets.get(plan.id)
         if not bracket or not bracket.active or bracket.completed:
             raise PositionProtectionError("paper position has no active protection bracket")
@@ -380,7 +440,12 @@ class PaperExchange(ExchangeAdapter):
         entry_orders: list[Order],
         current_quantity: Decimal,
     ) -> bool:
-        del entry_orders
+        if any(
+            order.symbol != plan.symbol
+            or order.side != (OrderSide.BUY if plan.side == Side.LONG else OrderSide.SELL)
+            for order in entry_orders
+        ):
+            return False
         bracket = self.brackets.get(plan.id)
         if current_quantity <= 0:
             return bool(not bracket or (bracket.completed and not bracket.active))
@@ -392,14 +457,23 @@ class PaperExchange(ExchangeAdapter):
         )
 
     async def verify_protection(self, order: Order) -> bool:
-        bracket = self.brackets.get(order.plan_id)
-        return bool(bracket and bracket.entry_order_id == order.id)
+        return any(
+            (bracket.entry_order_id == order.id or order.id in bracket.entry_filled)
+            and (order.filled_quantity == 0 or (bracket.active and not bracket.completed))
+            for bracket in self.brackets.values()
+        )
 
-    async def protection_available(self, symbol: str) -> bool:
-        del symbol
+    async def protection_available(self, symbol: str, position_side=None) -> bool:
+        del symbol, position_side
         return True
 
     async def place_protected_order(self, plan: StrategyPlan, intent: OrderIntent) -> list[Order]:
+        if (
+            intent.reduce_only
+            or intent.symbol != plan.symbol
+            or intent.side != (OrderSide.BUY if plan.side == Side.LONG else OrderSide.SELL)
+        ):
+            raise ValueError("protected entry must open the plan's symbol and direction")
         order = await self.place_order(intent)
         if order.status == OrderStatus.REJECTED:
             raise RuntimeError("纸面账户拒绝入场订单，未创建保护单")
@@ -407,11 +481,27 @@ class PaperExchange(ExchangeAdapter):
         return [order]
 
     async def attach_bracket(self, plan: StrategyPlan, entry_order: Order) -> None:
+        for bracket in self.brackets.values():
+            if entry_order.id == bracket.entry_order_id or entry_order.id in bracket.entry_filled:
+                self._activate_bracket_if_filled(bracket)
+                self._persist()
+                return
+        if plan.id in self.brackets:
+            bracket = self.brackets[plan.id]
+            if bracket.position_side != entry_order.position_side or bracket.side != plan.side:
+                raise PositionProtectionError("cannot merge different paper position legs")
+            self._activate_bracket_if_filled(bracket)
+            bracket.entry_filled[entry_order.id] = Decimal("0")
+            self._activate_bracket_if_filled(bracket)
+            self._persist()
+            return
         self.brackets[plan.id] = PaperBracket(
             plan_id=plan.id,
             symbol=plan.symbol,
             side=plan.side,
             entry_order_id=entry_order.id,
+            position_side=entry_order.position_side,
+            entry_filled={entry_order.id: Decimal("0")},
             stop_loss=plan.exit.stop_loss,
             targets=[
                 PaperTarget(price=target.price, close_fraction=target.close_fraction)
@@ -436,11 +526,73 @@ class PaperExchange(ExchangeAdapter):
         self._persist()
 
     def _activate_bracket_if_filled(self, bracket: PaperBracket) -> None:
-        entry = self.orders.get(bracket.entry_order_id)
-        if entry and entry.status == OrderStatus.FILLED and not bracket.active:
-            bracket.original_quantity = entry.filled_quantity
-            bracket.remaining_quantity = entry.filled_quantity
-            bracket.active = True
+        if not bracket.entry_filled:
+            bracket.entry_filled[bracket.entry_order_id] = (
+                bracket.original_quantity if bracket.active or bracket.completed else Decimal("0")
+            )
+        for entry_id, accounted in list(bracket.entry_filled.items()):
+            entry = self.orders.get(entry_id)
+            if entry and entry.filled_quantity > accounted:
+                delta = entry.filled_quantity - accounted
+                bracket.original_quantity += delta
+                bracket.remaining_quantity += delta
+                bracket.entry_filled[entry_id] = entry.filled_quantity
+                bracket.active = True
+                bracket.completed = False
+
+    async def rebalance_position_protection(
+        self, plan: StrategyPlan, entry_orders: list[Order], current_quantity: Decimal
+    ) -> bool:
+        if not entry_orders:
+            raise PositionProtectionError("paper protection sync requires attributed entry orders")
+        side = OrderSide.BUY if plan.side == Side.LONG else OrderSide.SELL
+        leg = entry_orders[0].position_side
+        if any(
+            entry.symbol != plan.symbol
+            or entry.side != side
+            or entry.position_side != leg
+            or entry.reduce_only
+            for entry in entry_orders
+        ):
+            raise PositionProtectionError("paper protection pool mixes symbols or position legs")
+        state = self.positions.get(self._position_key(plan.symbol, leg))
+        if current_quantity < 0 or current_quantity > abs(state.signed_quantity if state else 0):
+            raise PositionProtectionError("paper protection quantity exceeds actual position")
+        # Keep all entry identities accounted so subsequent fills add only their delta.
+        accounted = {entry.id: entry.filled_quantity for entry in entry_orders}
+        for bracket in self.brackets.values():
+            if bracket.entry_order_id in accounted or set(bracket.entry_filled) & accounted.keys():
+                bracket.remaining_quantity = Decimal("0")
+                bracket.active = False
+                bracket.completed = True
+        self.brackets[plan.id] = PaperBracket(
+            plan_id=plan.id,
+            symbol=plan.symbol,
+            side=plan.side,
+            position_side=leg,
+            entry_order_id=entry_orders[0].id,
+            entry_filled=accounted,
+            stop_loss=plan.exit.stop_loss,
+            targets=[
+                PaperTarget(price=t.price, close_fraction=t.close_fraction)
+                for t in plan.exit.take_profits
+            ],
+            original_quantity=current_quantity,
+            remaining_quantity=current_quantity,
+            active=current_quantity > 0,
+            completed=current_quantity == 0,
+        )
+        self._persist()
+        return True
+
+    async def clear_position_protection(
+        self, plan: StrategyPlan, entry_orders: list[Order]
+    ) -> bool:
+        return await self.sync_position_protection(plan, entry_orders, Decimal("0"))
+
+    @staticmethod
+    def _position_key(symbol: str, position_side: PositionSide | None) -> str:
+        return f"{symbol}:{position_side.value}" if position_side else symbol
 
     def _match_open_orders(self, snapshot: MarketSnapshot) -> None:
         changed = False
@@ -477,10 +629,23 @@ class PaperExchange(ExchangeAdapter):
             else snapshot.bid * (Decimal("1") - multiplier)
         )
         fill = raw_fill.quantize(Decimal("0.01"))
+        if order.order_type == OrderType.LIMIT and order.limit_price is not None:
+            fill = (
+                min(fill, order.limit_price)
+                if order.side == OrderSide.BUY
+                else max(fill, order.limit_price)
+            )
         notional = _money(fill * order.quantity)
-        position = self.positions.get(order.symbol, PaperPosition(symbol=order.symbol))
+        position_key = self._position_key(order.symbol, order.position_side)
+        position = self.positions.get(
+            position_key,
+            PaperPosition(
+                symbol=order.symbol,
+                position_side=order.position_side,
+            ),
+        )
         signed_delta = order.quantity if order.side == OrderSide.BUY else -order.quantity
-        if reduce_only and (
+        if (reduce_only or order.reduce_only) and (
             position.signed_quantity == 0
             or position.signed_quantity * signed_delta >= 0
             or abs(signed_delta) > abs(position.signed_quantity)
@@ -509,7 +674,7 @@ class PaperExchange(ExchangeAdapter):
                         else state.average_entry
                     )
                     for state in self.positions.values()
-                    if state.symbol != order.symbol
+                    if self._position_key(state.symbol, state.position_side) != position_key
                 ),
                 Decimal("0"),
             )
@@ -532,7 +697,7 @@ class PaperExchange(ExchangeAdapter):
                 order.updated_at = datetime.now(UTC)
                 return
         realized = self._apply_position_fill(position, signed_delta, fill)
-        self.positions[order.symbol] = position
+        self.positions[position_key] = position
         fee = _money(abs(notional) * self.fee_bps / Decimal("10000"))
         if self.market_type == "spot":
             self.cash += -notional if signed_delta > 0 else notional
@@ -633,6 +798,8 @@ class PaperExchange(ExchangeAdapter):
             plan_id=bracket.plan_id,
             symbol=bracket.symbol,
             side=side,
+            position_side=bracket.position_side,
+            reduce_only=True,
             order_type=OrderType.MARKET,
             status=OrderStatus.OPEN,
             quantity=quantity,

@@ -15,11 +15,13 @@ import {
   type IChartApi,
   type IPriceLine,
   type ISeriesApi,
+  type ISeriesPrimitive,
   type LineData,
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import type { Candle, Plan } from './types'
+import type { Candle, EntryOrderRuntime, Plan, TradePlanV2 } from './types'
+import { entryStatusLabel, isPendingEntry } from './api'
 import { PRIMARY_CHART_TIMEFRAMES, timeframeLabel } from './timeframes'
 import { chartTimeZoneLabel, formatChartDateTime, formatChartTick, localUtcOffsetLabel, type ChartTimeZone } from './chartTime'
 
@@ -28,6 +30,38 @@ type IndicatorKey = 'volume' | 'ema20' | 'ema50' | 'sma20' | 'bollinger' | 'vwap
 type Point = { time: number; price: number }
 type Drawing = { id: string; tool: Exclude<DrawingTool, 'cursor'>; points: Point[] }
 type Ohlcv = { open: number; high: number; low: number; close: number; volume: number; time: number }
+type ChartPlan = Plan | TradePlanV2
+
+function chartPlanLevels(plan: ChartPlan | null, entryOrder?: EntryOrderRuntime | null) {
+  const lines: Array<{ price: number; title: string; color: string; solid?: boolean }> = []
+  const v2 = plan && 'entry_zone' in plan ? plan : null
+  const legacy = plan && 'entry' in plan ? plan : null
+  const band = entryOrder?.valid_price_range ?? v2?.valid_price_range ?? (v2 && !v2.order_type ? v2.entry_zone : legacy?.entry.zone)
+  if (entryOrder) {
+    if (entryOrder.order_type === 'LIMIT' && isPendingEntry(entryOrder)) {
+      lines.push({ price: Number(entryOrder.submitted_price ?? entryOrder.requested_price ?? NaN), title: entryOrder.submitted_price != null ? 'LIMIT 委托' : 'LIMIT 请求（待确认）', color: '#e8a94b', solid: entryOrder.submitted_price != null })
+    }
+    if (entryOrder.status !== 'SHADOW_RECORDED' && Number(entryOrder.filled_quantity) > 0 && entryOrder.average_fill_price != null) {
+      lines.push({ price: Number(entryOrder.average_fill_price), title: `${entryOrder.order_type} 成交均价`, color: '#5aa6ff', solid: true })
+    } else if (entryOrder.order_type === 'MARKET' && entryOrder.reference_price != null && isPendingEntry(entryOrder)) {
+      lines.push({ price: Number(entryOrder.reference_price), title: 'MARKET 参考（未确认成交）', color: '#82949d' })
+    }
+  } else if (v2?.order_type === 'LIMIT') {
+    lines.push({ price: Number(v2.limit_price ?? NaN), title: 'LIMIT 计划（未确认委托）', color: '#e8a94b' })
+  } else if (v2?.order_type === 'MARKET') {
+    lines.push({ price: Number(v2.reference_price ?? NaN), title: 'MARKET 参考', color: '#82949d' })
+  } else if (band) {
+    lines.push({ price: (Number(band.lower) + Number(band.upper)) / 2, title: '旧计划区间中点', color: '#82949d' })
+  }
+  if (band) {
+    lines.push({ price: Number(band.lower), title: '有效范围下沿', color: '#e8a94b66' }, { price: Number(band.upper), title: '有效范围上沿', color: '#e8a94b66' })
+  }
+  const stop = v2?.management.hard_stop ?? legacy?.exit.stop_loss
+  if (stop != null) lines.push({ price: Number(stop), title: 'STOP', color: '#ef5b68' })
+  const targets = v2?.management.take_profits ?? legacy?.exit.take_profits ?? []
+  targets.forEach((target, index) => lines.push({ price: Number(target.price), title: `TP${index + 1}`, color: '#19b394' }))
+  return { band, lines: lines.filter(line => Number.isFinite(line.price) && line.price > 0) }
+}
 type ScaleMode = 'normal' | 'log' | 'percent'
 type VisibleBars = 50 | 100 | 200 | 'all'
 type LineIndicatorKey = 'ema20' | 'ema50' | 'sma20' | 'vwap' | 'bb-upper' | 'bb-basis' | 'bb-lower' | 'rsi' | 'macd' | 'macd-signal'
@@ -198,7 +232,7 @@ function macd(values: number[]) {
 }
 
 function formatPrice(value: number) {
-  return new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value)
+  return new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 8 }).format(value)
 }
 
 function formatVolume(value: number) {
@@ -229,9 +263,10 @@ function readChartTimeZone(): ChartTimeZone {
   return localStorage.getItem('cosmos-chart-time-zone') === 'utc' ? 'utc' : 'local'
 }
 
-function ProfessionalChart({ candles, plan, exchange, symbol, timeframe, timeframes, busy, showPlan, onTimeframeChange }: {
+function ProfessionalChart({ candles, plan, entryOrder, exchange, symbol, timeframe, timeframes, busy, showPlan, onTimeframeChange }: {
   candles: Candle[]
-  plan: Plan | null
+  plan: ChartPlan | null
+  entryOrder?: EntryOrderRuntime | null
   exchange: string
   symbol: string
   timeframe: string
@@ -247,8 +282,10 @@ function ProfessionalChart({ candles, plan, exchange, symbol, timeframe, timefra
   const lineSeriesRef = useRef<Partial<Record<LineIndicatorKey, ISeriesApi<'Line'>>>>({})
   const histogramSeriesRef = useRef<Partial<Record<HistogramIndicatorKey, ISeriesApi<'Histogram'>>>>({})
   const priceLinesRef = useRef<IPriceLine[]>([])
+  const priceBandRef = useRef<ISeriesPrimitive | null>(null)
   const initialFitRef = useRef(true)
   const dataScopeRef = useRef('')
+  const previousCandlesRef = useRef<Candle[] | null>(null)
   const [tool, setTool] = useState<DrawingTool>('cursor')
   const [indicatorMenu, setIndicatorMenu] = useState(false)
   const [timeframeMenu, setTimeframeMenu] = useState(false)
@@ -283,15 +320,14 @@ function ProfessionalChart({ candles, plan, exchange, symbol, timeframe, timefra
   const scaleLabel = SCALE_MODES.find(item => item.key === scaleMode)?.label ?? '普通坐标'
   const indicatorValues = useMemo(() => {
     const closes = uniqueCandles(candles).map(([, candle]) => Number(candle.close))
-    const bands = bollinger(closes)
     return {
-      ema20: lastNumber(ema(closes, 20)),
-      ema50: lastNumber(ema(closes, 50)),
-      sma20: lastNumber(sma(closes, 20)),
-      vwap: lastNumber(vwap(candles)),
-      bollinger: lastNumber(bands.basis),
+      ema20: indicators.ema20 ? lastNumber(ema(closes, 20)) : null,
+      ema50: indicators.ema50 ? lastNumber(ema(closes, 50)) : null,
+      sma20: indicators.sma20 ? lastNumber(sma(closes, 20)) : null,
+      vwap: indicators.vwap ? lastNumber(vwap(candles)) : null,
+      bollinger: indicators.bollinger ? lastNumber(bollinger(closes).basis) : null,
     }
-  }, [candles])
+  }, [candles, indicators])
 
   useEffect(() => {
     localStorage.setItem(drawingStorageKey(symbol, timeframe), JSON.stringify(drawings))
@@ -301,24 +337,28 @@ function ProfessionalChart({ candles, plan, exchange, symbol, timeframe, timefra
     const container = containerRef.current
     if (!container) return
     initialFitRef.current = true
+    const theme = getComputedStyle(container)
+    const surface = theme.getPropertyValue('--chart-bg').trim() || '#171420'
+    const divider = theme.getPropertyValue('--ops-divider').trim() || '#332b3e'
+    const muted = theme.getPropertyValue('--muted').trim() || '#938ba3'
     const chart = createChart(container, {
       autoSize: true,
       layout: {
-        background: { type: ColorType.Solid, color: '#0a0d10' },
-        textColor: '#7f8996',
-        fontFamily: '"IBM Plex Mono", "Microsoft YaHei", monospace',
+        background: { type: ColorType.Solid, color: surface },
+        textColor: muted,
+        fontFamily: theme.getPropertyValue('--mono').trim(),
         fontSize: 12,
-        panes: { separatorColor: '#20262d', separatorHoverColor: '#343d47', enableResize: true },
+        panes: { separatorColor: divider, separatorHoverColor: '#65516f', enableResize: true },
       },
-      grid: { vertLines: { color: '#151a20' }, horzLines: { color: '#151a20' } },
+      grid: { vertLines: { color: '#292332' }, horzLines: { color: '#292332' } },
       crosshair: {
         mode: CrosshairMode.Magnet,
-        vertLine: { color: '#64748b', width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#34404c' },
-        horzLine: { color: '#64748b', width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#34404c' },
+        vertLine: { color: muted, width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#4c3453' },
+        horzLine: { color: muted, width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#4c3453' },
       },
-      rightPriceScale: { borderColor: '#20262d', scaleMargins: { top: 0.08, bottom: 0.18 } },
+      rightPriceScale: { borderColor: divider, scaleMargins: { top: 0.08, bottom: 0.18 } },
       timeScale: {
-        borderColor: '#20262d', timeVisible: true, secondsVisible: false, rightOffset: 8, barSpacing: 7, minBarSpacing: 2,
+        borderColor: divider, timeVisible: true, secondsVisible: false, rightOffset: 8, barSpacing: 7, minBarSpacing: 2,
         tickMarkFormatter: (time: Time, tickMarkType: TickMarkType) => formatChartTick(time, tickMarkType, chartTimeZone),
       },
       handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
@@ -416,8 +456,10 @@ function ProfessionalChart({ candles, plan, exchange, symbol, timeframe, timefra
       lineSeriesRef.current = {}
       histogramSeriesRef.current = {}
       priceLinesRef.current = []
+      priceBandRef.current = null
       candleSeriesRef.current = null
       chartRef.current = null
+      previousCandlesRef.current = null
       chart.remove()
     }
   // Rebuild only when the selected indicator pane structure changes.
@@ -430,33 +472,54 @@ function ProfessionalChart({ candles, plan, exchange, symbol, timeframe, timefra
     if (!series || !chart) return
     const dataScope = `${symbol}:${timeframe}`
     const scopeChanged = dataScopeRef.current !== dataScope
-    series.setData(priceData(candles))
+    const previous = previousCandlesRef.current
+    const tailOnly = !scopeChanged && previous !== null && previous.length === candles.length
+      && candles.length > 0 && previous.at(-1)?.timestamp === candles.at(-1)?.timestamp
+      && candles.slice(0, -1).every((candle, index) => candle === previous[index])
+    const prices = priceData(candles)
+    if (tailOnly && prices.length) series.update(prices[prices.length - 1])
+    else series.setData(prices)
     const rows = uniqueCandles(candles)
     candleByTimeRef.current = new Map(rows)
     const closes = rows.map(([, candle]) => Number(candle.close))
-    const updateLine = (key: LineIndicatorKey, values: Array<number | null>) => lineSeriesRef.current[key]?.setData(lineData(values, candles))
-    updateLine('ema20', ema(closes, 20))
-    updateLine('ema50', ema(closes, 50))
-    updateLine('sma20', sma(closes, 20))
-    updateLine('vwap', vwap(candles))
-    const bands = bollinger(closes)
-    updateLine('bb-upper', bands.upper)
-    updateLine('bb-basis', bands.basis)
-    updateLine('bb-lower', bands.lower)
-    updateLine('rsi', rsi(closes))
-    const macdValues = macd(closes)
-    updateLine('macd', macdValues.line)
-    updateLine('macd-signal', macdValues.signal)
-    histogramSeriesRef.current.volume?.setData(rows.map(([time, candle]) => ({
-      time: time as UTCTimestamp,
-      value: Number(candle.volume),
+    const updateLine = (key: LineIndicatorKey, calculate: () => Array<number | null>) => {
+      const line = lineSeriesRef.current[key]
+      if (!line) return
+      const data = lineData(calculate(), candles)
+      if (tailOnly && data.length) line.update(data[data.length - 1])
+      else line.setData(data)
+    }
+    const updateHistogram = (key: HistogramIndicatorKey, data: HistogramData[]) => {
+      const histogram = histogramSeriesRef.current[key]
+      if (!histogram) return
+      if (tailOnly && data.length) histogram.update(data[data.length - 1])
+      else histogram.setData(data)
+    }
+    updateLine('ema20', () => ema(closes, 20))
+    updateLine('ema50', () => ema(closes, 50))
+    updateLine('sma20', () => sma(closes, 20))
+    updateLine('vwap', () => vwap(candles))
+    if (lineSeriesRef.current['bb-basis']) {
+      const bands = bollinger(closes)
+      updateLine('bb-upper', () => bands.upper)
+      updateLine('bb-basis', () => bands.basis)
+      updateLine('bb-lower', () => bands.lower)
+    }
+    updateLine('rsi', () => rsi(closes))
+    if (lineSeriesRef.current.macd || histogramSeriesRef.current['macd-histogram']) {
+      const values = macd(closes)
+      updateLine('macd', () => values.line)
+      updateLine('macd-signal', () => values.signal)
+      updateHistogram('macd-histogram', rows.flatMap(([time], index) => values.histogram[index] == null ? [] : [{
+        time: time as UTCTimestamp, value: values.histogram[index] as number,
+        color: (values.histogram[index] as number) >= 0 ? '#19b39499' : '#ef5b6899',
+      }]))
+    }
+    if (histogramSeriesRef.current.volume) updateHistogram('volume', rows.map(([time, candle]) => ({
+      time: time as UTCTimestamp, value: Number(candle.volume),
       color: Number(candle.close) >= Number(candle.open) ? '#1d6e61aa' : '#853944aa',
     })))
-    histogramSeriesRef.current['macd-histogram']?.setData(rows.flatMap(([time], index) => macdValues.histogram[index] == null ? [] : [{
-      time: time as UTCTimestamp,
-      value: macdValues.histogram[index] as number,
-      color: (macdValues.histogram[index] as number) >= 0 ? '#19b39499' : '#ef5b6899',
-    }]))
+    previousCandlesRef.current = candles
     if (initialFitRef.current || scopeChanged) {
       if (visibleBars === 'all') {
         chart.timeScale().fitContent()
@@ -491,13 +554,39 @@ function ProfessionalChart({ candles, plan, exchange, symbol, timeframe, timefra
     if (!series) return
     priceLinesRef.current.forEach(line => series.removePriceLine(line))
     priceLinesRef.current = []
-    if (!showPlan || !plan) return
-    priceLinesRef.current = [
-      series.createPriceLine({ price: (Number(plan.entry.zone.lower) + Number(plan.entry.zone.upper)) / 2, color: '#e8a94b', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'ENTRY' }),
-      series.createPriceLine({ price: Number(plan.exit.stop_loss), color: '#ef5b68', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'STOP' }),
-      ...plan.exit.take_profits.map((target, index) => series.createPriceLine({ price: Number(target.price), color: '#19b394', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: `TP${index + 1}` })),
-    ]
-  }, [plan, indicatorSignature, showPlan])
+    if (priceBandRef.current) series.detachPrimitive(priceBandRef.current)
+    priceBandRef.current = null
+    if (!showPlan) return
+    const matchingPlan = plan?.symbol === symbol ? plan : null
+    const matchingEntry = entryOrder?.symbol === symbol ? entryOrder : null
+    if (!matchingPlan && !matchingEntry) return
+    const levels = chartPlanLevels(matchingPlan, matchingEntry)
+    priceLinesRef.current = levels.lines.map(line => series.createPriceLine({
+      price: line.price, color: line.color, lineWidth: 1,
+      lineStyle: line.solid ? LineStyle.Solid : LineStyle.Dashed,
+      axisLabelVisible: true, title: line.title,
+    }))
+    const lower = Number(levels.band?.lower)
+    const upper = Number(levels.band?.upper)
+    if (Number.isFinite(lower) && Number.isFinite(upper) && lower > 0 && upper >= lower) {
+      // A chart primitive follows panning, zooming and price-scale changes automatically.
+      const primitive: ISeriesPrimitive = {
+        paneViews: () => [view],
+      }
+      const view: ReturnType<NonNullable<ISeriesPrimitive['paneViews']>>[number] = {
+        zOrder: () => 'bottom',
+        renderer: () => ({ draw: target => target.useMediaCoordinateSpace(({ context, mediaSize }) => {
+          const top = series.priceToCoordinate(upper)
+          const bottom = series.priceToCoordinate(lower)
+          if (top == null || bottom == null) return
+          context.fillStyle = '#e8a94b14'
+          context.fillRect(0, Math.min(top, bottom), mediaSize.width, Math.max(Math.abs(bottom - top), 1))
+        }) }),
+      }
+      series.attachPrimitive(primitive)
+      priceBandRef.current = primitive
+    }
+  }, [plan, entryOrder, symbol, indicatorSignature, showPlan])
 
   useEffect(() => {
     const onFullscreen = () => setFullscreen(document.fullscreenElement === containerRef.current?.closest('.chart-workbench'))
@@ -661,7 +750,7 @@ function ProfessionalChart({ candles, plan, exchange, symbol, timeframe, timefra
           <button type="button" data-tooltip="清空绘图" aria-label="清空绘图" disabled={!drawings.length} onClick={() => { if (window.confirm('清空当前品种与周期的全部绘图？')) setDrawings([]) }}><Trash2 aria-hidden="true" /></button>
         </aside>
         <div className="chart-canvas-shell">
-          <div className="chart-watermark"><strong>{symbol}</strong><span>{timeframe.toUpperCase()} · {exchange.toUpperCase()} · {chartTimeZoneLabel(chartTimeZone)} · {showPlan && plan ? '策略点位已叠加' : '行情观察（当前无可执行计划）'}</span></div>
+          <div className="chart-watermark"><strong>{symbol}</strong><span>{timeframe.toUpperCase()} · {exchange.toUpperCase()} · {chartTimeZoneLabel(chartTimeZone)} · {showPlan && entryOrder ? `${entryOrder.order_type} · ${entryStatusLabel(entryOrder.status)}` : showPlan && plan ? '计划点位（委托未确认）' : '行情观察'}</span></div>
           <div className="chart-indicator-legend">
             {indicators.ema20 && <span className="ema20">EMA 20 <b>{indicatorValues.ema20 == null ? '—' : formatPrice(indicatorValues.ema20)}</b></span>}{indicators.ema50 && <span className="ema50">EMA 50 <b>{indicatorValues.ema50 == null ? '—' : formatPrice(indicatorValues.ema50)}</b></span>}{indicators.sma20 && <span className="sma20">SMA 20 <b>{indicatorValues.sma20 == null ? '—' : formatPrice(indicatorValues.sma20)}</b></span>}{indicators.bollinger && <span>BB 20 2 <b>{indicatorValues.bollinger == null ? '—' : formatPrice(indicatorValues.bollinger)}</b></span>}{indicators.vwap && <span>VWAP <b>{indicatorValues.vwap == null ? '—' : formatPrice(indicatorValues.vwap)}</b></span>}
           </div>

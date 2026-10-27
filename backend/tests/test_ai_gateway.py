@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -22,7 +22,7 @@ from cosmos_quant.ai_gateway import (
     OpenAIChatAdapter,
     OpenAIResponsesAdapter,
 )
-from cosmos_quant.ai_usage import estimate_deepseek_cost_cny
+from cosmos_quant.ai_usage import AIUsage, AIUsageEvent, estimate_deepseek_cost_cny
 from cosmos_quant.storage import SqliteStore
 
 
@@ -166,7 +166,9 @@ def test_deepseek_usage_exposes_cache_reasoning_and_visible_output_tokens():
     response = {
         "id": "request_test",
         "model": "deepseek-v4-flash",
-        "choices": [{"message": {"content": '{"status":"ok"}'}}],
+        "choices": [
+            {"message": {"content": '{"status":"ok"}'}, "finish_reason": "stop"}
+        ],
         "usage": {
             "prompt_tokens": 1_000,
             "prompt_cache_hit_tokens": 600,
@@ -199,6 +201,8 @@ def test_deepseek_usage_exposes_cache_reasoning_and_visible_output_tokens():
     run(adapter.close())
 
     assert result.provider_request_id == "request_test"
+    assert result.finish_reason == "stop"
+    assert result.response_char_count == len('{"status":"ok"}')
     assert result.usage.cache_hit_input_tokens == 600
     assert result.usage.cache_miss_input_tokens == 400
     assert result.usage.reasoning_tokens == 150
@@ -213,13 +217,19 @@ def test_deepseek_usage_exposes_cache_reasoning_and_visible_output_tokens():
         (datetime(2026, 8, 14, 12, tzinfo=UTC), Decimal("3.02000000"), "legacy"),
         (datetime(2026, 8, 17, 2, tzinfo=UTC), Decimal("12.10000000"), "peak"),
         (datetime(2026, 8, 17, 12, tzinfo=UTC), Decimal("6.05000000"), "off_peak"),
+        (datetime(2026, 9, 10, 6, tzinfo=UTC), Decimal("1.50600000"), "peak"),
+        (datetime(2026, 9, 10, 12, tzinfo=UTC), Decimal("0.75300000"), "off_peak"),
     ],
 )
 def test_deepseek_cost_estimator_tracks_effective_peak_pricing(
     at, expected_cost, expected_tier
 ):
     cost, tier = estimate_deepseek_cost_cny(
-        model="deepseek-v4-flash",
+        model=(
+            "deepseek-flash"
+            if at >= datetime(2026, 9, 10, 4, tzinfo=UTC)
+            else "deepseek-v4-flash"
+        ),
         at=at,
         cache_hit_input_tokens=1_000_000,
         cache_miss_input_tokens=1_000_000,
@@ -313,3 +323,248 @@ def test_gateway_failover_uses_next_enabled_provider(tmp_path, monkeypatch):
 
     assert result.provider == AIProvider.DEEPSEEK
     assert attempted == [AIProvider.OPENAI, AIProvider.DEEPSEEK]
+
+
+def test_agent_decision_quality_gate_skips_bad_provider_for_healthy_fallback(
+    tmp_path, monkeypatch
+):
+    secrets = MemorySecrets()
+    service = AIConfigurationService(SqliteStore(tmp_path / "cosmos.db"), secrets)
+    configuration = AIConfiguration()
+    configuration.primary_provider = AIProvider.DEEPSEEK
+    configuration.providers = [
+        item.model_copy(
+            update={"enabled": item.provider in {AIProvider.OPENAI, AIProvider.DEEPSEEK}}
+        )
+        for item in configuration.providers
+    ]
+    for provider in (AIProvider.OPENAI, AIProvider.DEEPSEEK):
+        secrets.set_credentials(service.credential_scope(provider), {"api_key": "test-key"})
+    service.save(AIConfigurationUpdate(configuration=configuration))
+    baseline = datetime.now(UTC) - timedelta(minutes=2)
+    for index in range(5):
+        service.record_usage(
+            AIUsageEvent(
+                provider=AIProvider.DEEPSEEK,
+                model="deepseek-v4-flash",
+                operation="agent_decision",
+                succeeded=index == 0,
+                error_code=None if index == 0 else "invalid_response",
+                usage=AIUsage(),
+                latency_ms=100,
+                created_at=baseline + timedelta(seconds=index),
+            )
+        )
+
+    called = []
+
+    class FakeAdapter:
+        def __init__(self, provider):
+            self.provider = provider
+
+        async def generate_json(self, **_kwargs):
+            called.append(self.provider)
+            return gateway_module.AICompletionResult(
+                provider=self.provider,
+                model="healthy-model",
+                data={"status": "ok"},
+                latency_ms=5,
+                operation="agent_decision",
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        gateway_module,
+        "create_adapter",
+        lambda configuration, *_args, **_kwargs: FakeAdapter(configuration.provider),
+    )
+    gateway = AIGateway(service)
+    result, attempted = run(
+        gateway.generate_json(
+            system="system",
+            prompt="prompt",
+            schema={"type": "object"},
+            schema_name="test",
+            operation="agent_decision",
+        )
+    )
+
+    assert result.provider == AIProvider.OPENAI
+    assert attempted == [AIProvider.DEEPSEEK, AIProvider.OPENAI]
+    assert called == [AIProvider.OPENAI]
+    deepseek = gateway.health_snapshot()[str(AIProvider.DEEPSEEK)]
+    assert deepseek["automatic_agent_decisions_allowed"] is False
+    assert deepseek["agent_decision_quality"]["status"] == "quality_blocked"
+
+
+def test_gateway_circuit_exposes_diagnostics_and_recovers_half_open(tmp_path, monkeypatch):
+    secrets = MemorySecrets()
+    service = AIConfigurationService(SqliteStore(tmp_path / "cosmos.db"), secrets)
+    configuration = AIConfiguration()
+    configuration.providers = [
+        item.model_copy(update={"enabled": item.provider == AIProvider.DEEPSEEK})
+        for item in configuration.providers
+    ]
+    secrets.set_credentials(
+        service.credential_scope(AIProvider.DEEPSEEK),
+        {"api_key": "key-deepseek"},
+    )
+    service.save(AIConfigurationUpdate(configuration=configuration))
+    available = False
+
+    class FakeAdapter:
+        async def generate_json(self, **_kwargs):
+            if not available:
+                raise AIProviderError(
+                    AIProvider.DEEPSEEK,
+                    AIErrorCode.UNAVAILABLE,
+                    "temporary provider outage",
+                    retryable=True,
+                )
+            return gateway_module.AICompletionResult(
+                provider=AIProvider.DEEPSEEK,
+                model="deepseek-v4-flash",
+                data={"status": "ok"},
+                latency_ms=3,
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(gateway_module, "create_adapter", lambda *_args, **_kwargs: FakeAdapter())
+    gateway = AIGateway(service)
+    for _ in range(3):
+        with pytest.raises(AIProviderError):
+            run(
+                gateway.generate_json(
+                    system="system",
+                    prompt="prompt",
+                    schema={"type": "object"},
+                    schema_name="test",
+                )
+            )
+    health = gateway.health_snapshot()[str(AIProvider.DEEPSEEK)]
+    assert health["status"] == "circuit_open"
+    assert health["consecutive_failures"] == 3
+    assert health["last_error_code"] == str(AIErrorCode.UNAVAILABLE)
+    assert health["deterministic_fallback_available"] is True
+
+    opened_at = gateway.circuits[AIProvider.DEEPSEEK].opened_at
+    for _ in range(5):
+        with pytest.raises(AIProviderError) as captured:
+            run(
+                gateway.generate_json(
+                    system="system",
+                    prompt="prompt",
+                    schema={"type": "object"},
+                    schema_name="test",
+                )
+            )
+        assert captured.value.code == AIErrorCode.CIRCUIT_OPEN
+    cooling = gateway.health_snapshot()[str(AIProvider.DEEPSEEK)]
+    assert cooling["consecutive_failures"] == 3
+    assert gateway.circuits[AIProvider.DEEPSEEK].opened_at == opened_at
+
+    gateway.circuits[AIProvider.DEEPSEEK].opened_at = datetime.now(UTC) - timedelta(seconds=61)
+    available = True
+    result, _ = run(
+        gateway.generate_json(
+            system="system",
+            prompt="prompt",
+            schema={"type": "object"},
+            schema_name="test",
+        )
+    )
+    assert result.data == {"status": "ok"}
+    recovered = gateway.health_snapshot()[str(AIProvider.DEEPSEEK)]
+    assert recovered["status"] == "ready"
+    assert recovered["consecutive_failures"] == 0
+    assert recovered["half_open_attempts"] == 1
+
+
+def test_invalid_json_persists_failure_usage_and_finish_reason(tmp_path, monkeypatch):
+    secrets = MemorySecrets()
+    store = SqliteStore(tmp_path / "cosmos.db")
+    service = AIConfigurationService(store, secrets)
+    configuration = AIConfiguration()
+    configuration.providers = [
+        item.model_copy(update={"enabled": item.provider == AIProvider.DEEPSEEK})
+        for item in configuration.providers
+    ]
+    secrets.set_credentials(
+        service.credential_scope(AIProvider.DEEPSEEK),
+        {"api_key": "key-deepseek"},
+    )
+    service.save(AIConfigurationUpdate(configuration=configuration))
+
+    response = {
+        "id": "request_invalid",
+        "model": "deepseek-v4-flash",
+        "choices": [
+            {"message": {"content": '{"status":'}, "finish_reason": "length"}
+        ],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 1200,
+            "total_tokens": 1300,
+        },
+    }
+
+    class InvalidAdapter:
+        async def generate_json(self, **kwargs):
+            configuration = service.provider_configuration(AIProvider.DEEPSEEK)
+            adapter = OpenAIChatAdapter(
+                configuration,
+                "key-deepseek",
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(200, json=response)
+                ),
+            )
+            try:
+                return await adapter.generate_json(**kwargs)
+            finally:
+                await adapter.close()
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        gateway_module,
+        "create_adapter",
+        lambda *_args, **_kwargs: InvalidAdapter(),
+    )
+    gateway = AIGateway(service)
+    with pytest.raises(AIProviderError) as captured:
+        run(
+            gateway.generate_json(
+                system="system",
+                prompt="prompt",
+                schema={"type": "object"},
+                schema_name="test",
+            )
+        )
+
+    assert captured.value.code == AIErrorCode.INVALID_RESPONSE
+    report = service.usage_report(days=1)
+    assert report.summary.failed_request_count == 1
+    assert report.recent[0].succeeded is False
+    assert report.recent[0].finish_reason == "length"
+    assert report.recent[0].usage.output_tokens == 1200
+    assert "JSONDecodeError" in (report.recent[0].error_detail or "")
+
+
+def test_gateway_rejects_output_budget_above_hard_limit(tmp_path):
+    service = AIConfigurationService(SqliteStore(tmp_path / "cosmos.db"), MemorySecrets())
+    gateway = AIGateway(service)
+    with pytest.raises(ValueError, match="10000"):
+        run(
+            gateway.generate_json(
+                system="system",
+                prompt="prompt",
+                schema={"type": "object"},
+                schema_name="test",
+                max_tokens=10_001,
+            )
+        )

@@ -152,6 +152,42 @@ def test_fast_and_exact_intent_backends_are_pointwise_equal():
     assert not result.long_signal[: result.warmup].any()
 
 
+def test_explicit_regime_gates_are_fingerprinted_and_suppress_entries():
+    dsl = _valid_dsl()
+    dsl.nodes.append(
+        DSLNode(
+            id="liquidity_gate",
+            operator="greater_than",
+            inputs=["volume"],
+            parameters={"scalar": 10_000},
+        )
+    )
+    dsl.regime_gates = {
+        "trend": "long",
+        "volatility": "long",
+        "liquidity": "liquidity_gate",
+        "funding": "long",
+        "open_interest": "long",
+        "basis": "long",
+        "order_flow": "long",
+    }
+    ir = compile_strategy_dsl(dsl)
+    assert dict(ir.regime_gates)["liquidity"] == "liquidity_gate"
+    close = np.linspace(100.0, 130.0, 120) + np.sin(np.arange(120)) * 3
+    result = NumpyFastVectorBackend().evaluate(
+        ir,
+        {
+            "open": close,
+            "high": close + 1,
+            "low": close - 1,
+            "close": close,
+            "volume": np.ones(120),
+        },
+    )
+    assert not result.long_signal.any()
+    assert not result.short_signal.any()
+
+
 def test_cross_section_rank_uses_same_time_asset_panel_without_future_rows():
     dsl = StrategyDSLV2(
         hypothesis_id="cross_section_test",

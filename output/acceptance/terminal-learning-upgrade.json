@@ -1,0 +1,45 @@
+{
+  "verified_at": "2026-09-05T07:07:54.548059+00:00",
+  "backend_full_regression": {
+    "passed": 629,
+    "warnings": [
+      "Existing Starlette/httpx TestClient deprecation"
+    ]
+  },
+  "backend_followup_regression": {
+    "passed": 51,
+    "scope": "final learning prompt, setup tagging, fill-outage recovery, portfolio risk"
+  },
+  "frontend": {
+    "lint": "passed",
+    "typecheck": "passed",
+    "unit_tests_passed": 3,
+    "production_build": "passed",
+    "entry_js_kb": 467.61
+  },
+  "browser": {
+    "desktop": "1600x1100",
+    "mobile": "390x844",
+    "horizontal_overflow": false,
+    "verified": [
+      "all three symbol positions",
+      "ETH chart switching",
+      "1h timeframe",
+      "indicator menu",
+      "learning panel",
+      "empty state",
+      "unavailable market state"
+    ],
+    "console_errors_final": 0,
+    "fixtures": "Populated visual checks use synthetic UI fixtures, not trading results"
+  },
+  "limitations": [
+    "No exchange orders were placed during verification",
+    "Base Quant model is not automatically retrained",
+    "Single API execution process per account"
+  ],
+  "screenshots": [
+    "output/playwright/terminal-desktop-final-fixture.png",
+    "output/playwright/terminal-mobile-fixture.png"
+  ]
+}

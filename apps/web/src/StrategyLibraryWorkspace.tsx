@@ -16,6 +16,8 @@ type OriginFilter = 'all' | StrategyLibraryItem['origin']
 const originLabel = { builtin: '内置', personal: '个人', agent: 'Agent' }
 const familyLabel: Record<string, string> = { trend: '趋势', mean_reversion: '均值回归', breakout: '突破' }
 
+const isArchived = (item: StrategyLibraryItem) => item.hidden || item.status === 'archived' || item.status === 'retired'
+
 function parameterValue(spec: Record<string, unknown>, key: string) {
   const parameters = spec.parameters as Record<string, unknown> | undefined
   return parameters?.[key] == null ? '' : String(parameters[key])
@@ -39,6 +41,37 @@ export default function StrategyLibraryWorkspace() {
   const [busy, setBusy] = useState('')
   const [message, setMessage] = useState('')
 
+  useEffect(() => {
+    if (!editorOpen && !selected) return
+    const previousFocus = document.activeElement as HTMLElement | null
+    const dialog = document.querySelector<HTMLElement>(editorOpen ? '.strategy-editor-panel' : '.detail-drawer')
+    if (!dialog) return
+    const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, a[href]')).filter(element => element.getClientRects().length)
+    focusable()[0]?.focus()
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        if (busy === 'save') return
+        event.preventDefault()
+        setEditorOpen(false)
+        setSelected(null)
+      } else if (event.key === 'Tab') {
+        const elements = focusable()
+        const first = elements[0]
+        const last = elements.at(-1)
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      document.removeEventListener('keydown', onKeyDown)
+      previousFocus?.focus()
+    }
+  }, [editorOpen, selected, busy])
+
   const refresh = useCallback(async () => {
     try {
       const result = await getStrategyLibrary({ includeHidden: true })
@@ -51,6 +84,7 @@ export default function StrategyLibraryWorkspace() {
   useEffect(() => {
     const kickoff = window.setTimeout(() => {
       void Promise.all([refresh(), getStrategySpecContract().then(result => setDefaults(result.defaults))])
+        .catch(cause => setMessage(cause instanceof Error ? cause.message : '策略参数读取失败'))
     }, 0)
     return () => window.clearTimeout(kickoff)
   }, [refresh])
@@ -59,36 +93,40 @@ export default function StrategyLibraryWorkspace() {
     const needle = search.trim().toLowerCase()
     return items.filter(item => (origin === 'all' || item.origin === origin)
       && (family === 'all' || item.family === family)
-      && (showHidden || !item.hidden)
+      && (showHidden || !isArchived(item))
       && (!needle || item.name.toLowerCase().includes(needle) || item.id.toLowerCase().includes(needle) || item.description.toLowerCase().includes(needle)))
   }, [family, items, origin, search, showHidden])
 
   const counts = useMemo(() => ({
-    total: items.filter(item => !item.hidden).length,
-    personal: items.filter(item => item.origin === 'personal' && !item.hidden).length,
-    agent: items.filter(item => item.origin === 'agent' && !item.hidden).length,
+    total: items.filter(item => !isArchived(item)).length,
+    personal: items.filter(item => item.origin === 'personal' && !isArchived(item)).length,
+    agent: items.filter(item => item.origin === 'agent' && !isArchived(item)).length,
     certified: items.filter(item => item.status === 'champion').length,
   }), [items])
 
   const openNew = (source?: StrategyLibraryItem) => {
     const nextFamily = source?.family ?? 'trend'
     const nextSpec = source?.strategy_spec ?? defaults[nextFamily] ?? {}
+    setMessage('')
     setEditingId('')
     setName(source ? `${source.name} · 个人副本` : '我的新策略')
     setDescription(source?.description ?? '')
     setEditorFamily(nextFamily)
     setSpec(nextSpec)
     setAdvanced(JSON.stringify(nextSpec, null, 2))
+    setSelected(null)
     setEditorOpen(true)
   }
 
   const openEdit = (item: StrategyLibraryItem) => {
+    setMessage('')
     setEditingId(item.id)
     setName(item.name)
     setDescription(item.description)
     setEditorFamily(item.family)
     setSpec(item.strategy_spec)
     setAdvanced(JSON.stringify(item.strategy_spec, null, 2))
+    setSelected(null)
     setEditorOpen(true)
   }
 
@@ -173,8 +211,8 @@ export default function StrategyLibraryWorkspace() {
     <div className="library-status-strip"><div><span>可见策略</span><strong>{counts.total}</strong></div><div><span>个人策略</span><strong>{counts.personal}</strong></div><div><span>Agent 候选</span><strong>{counts.agent}</strong></div><div><span>Champion</span><strong>{counts.certified}</strong></div></div>
     <div className="library-filterbar"><div className="search-field"><Search /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="搜索名称、ID 或描述" /></div><label><Filter /><select value={origin} onChange={event => setOrigin(event.target.value as OriginFilter)}><option value="all">全部来源</option><option value="personal">个人策略</option><option value="agent">Agent 策略</option><option value="builtin">内置策略</option></select></label><label><select value={family} onChange={event => setFamily(event.target.value)}><option value="all">全部策略族</option><option value="trend">趋势</option><option value="mean_reversion">均值回归</option><option value="breakout">突破</option></select></label><label className="hidden-toggle"><input type="checkbox" checked={showHidden} onChange={event => setShowHidden(event.target.checked)} />显示已归档/隐藏</label><span>{filtered.length} 项</span></div>
     <div className="library-table"><div className="table-head"><span>策略</span><span>来源</span><span>策略族</span><span>状态</span><span>验证证据</span><span>更新时间</span><span>操作</span></div>{filtered.map(item => <article key={`${item.origin}-${item.id}`} className={item.hidden || item.status === 'archived' || item.status === 'retired' ? 'muted' : ''}><button className="library-identity" onClick={() => setSelected(item)}><strong>{item.name}</strong><small>{item.id} · v{item.version} · {item.spec_fingerprint}</small></button><span className={`origin ${item.origin}`}>{originLabel[item.origin]}</span><span>{familyLabel[item.family] ?? item.family}</span><b className={item.status}>{item.hidden ? 'hidden' : item.status}</b><span className="evidence-copy">{item.evidence_summary}</span><time>{item.updated_at ? new Date(item.updated_at).toLocaleDateString('zh-CN') : '内置版本'}</time><div className="row-actions">{item.can_edit && <button title="编辑" onClick={() => openEdit(item)}><Pencil /></button>}<button title="复制到个人库" disabled={busy === item.id} onClick={() => void clone(item)}><Copy /></button>{item.can_archive && <button title={item.origin === 'builtin' ? '隐藏' : '归档'} disabled={busy === item.id} onClick={() => void archive(item)}>{item.origin === 'builtin' ? <EyeOff /> : <Archive />}</button>}{item.can_restore && <button title="恢复" disabled={busy === item.id} onClick={() => void restore(item)}><Eye /></button>}{item.can_delete && <button className="danger" title="永久删除草稿" disabled={busy === item.id} onClick={() => void remove(item)}><Trash2 /></button>}</div></article>)}{!filtered.length && <p className="ops-empty">没有符合筛选条件的策略。</p>}</div>
-    {selected && <div className="detail-drawer-backdrop" onMouseDown={() => setSelected(null)}><aside className="detail-drawer strategy-detail-drawer" onMouseDown={event => event.stopPropagation()}><header><div><span>{originLabel[selected.origin]}策略</span><strong>{selected.name}</strong></div><button onClick={() => setSelected(null)}><X /></button></header><div className="strategy-detail-summary"><p>{selected.description}</p><dl><div><dt>策略族</dt><dd>{familyLabel[selected.family] ?? selected.family}</dd></div><div><dt>状态</dt><dd>{selected.status}</dd></div><div><dt>规格指纹</dt><dd>{selected.spec_fingerprint}</dd></div><div><dt>执行资格</dt><dd>{selected.executable ? '已编译' : '不可直接执行'}</dd></div></dl></div><details open><summary>常用参数</summary><div className="parameter-list">{Object.entries((selected.strategy_spec.parameters as Record<string, unknown> | undefined) ?? {}).slice(0, 20).map(([key, value]) => <div key={key}><span>{key}</span><strong>{String(value)}</strong></div>)}</div></details><details><summary>完整 StrategySpec</summary><pre>{JSON.stringify(selected.strategy_spec, null, 2)}</pre></details></aside></div>}
-    {editorOpen && <div className="editor-overlay"><section className="strategy-editor-panel"><header><div><span className="ops-kicker">StrategySpec 编辑器</span><h2>{editingId ? '编辑个人策略' : '创建个人策略'}</h2></div><button onClick={() => setEditorOpen(false)}><X /></button></header><div className="editor-form"><label><span>策略名称</span><input value={name} onChange={event => setName(event.target.value)} /></label><label><span>策略族</span><select value={editorFamily} onChange={event => changeFamily(event.target.value)}><option value="trend">趋势</option><option value="mean_reversion">均值回归</option><option value="breakout">突破</option></select></label><label className="wide"><span>研究假设</span><textarea rows={3} value={description} onChange={event => setDescription(event.target.value)} /></label><div className="editor-section-title"><strong>常用参数</strong><span>复杂字段可在高级参数中编辑</span></div>{['mean_window', 'stop_atr', 'maximum_holding_bars', 'first_target_reward_risk', 'trailing_stop_atr'].map(key => <label key={key}><span>{key}</span><input value={parameterValue(spec, key)} onChange={event => setParameter(key, event.target.value)} placeholder="使用策略默认值" /></label>)}<details className="advanced-editor wide"><summary>高级 StrategySpec JSON</summary><textarea rows={16} value={advanced} onChange={event => setAdvanced(event.target.value)} /><button className="button ghost" onClick={applyAdvanced}>应用高级参数</button></details></div><footer><span>保存前由后端执行完整字段范围和交叉参数校验。</span><div><button className="button ghost" onClick={() => setEditorOpen(false)}>取消</button><button className="button primary" disabled={busy === 'save' || name.trim().length < 2} onClick={() => void save()}>{busy === 'save' ? '校验并保存…' : '保存到个人策略库'}</button></div></footer></section></div>}
+    {selected && <div className="detail-drawer-backdrop" onMouseDown={() => setSelected(null)}><aside role="dialog" aria-modal="true" aria-label="策略详情" className="detail-drawer strategy-detail-drawer" onMouseDown={event => event.stopPropagation()}><header><div><span>{originLabel[selected.origin]}策略</span><strong>{selected.name}</strong></div><button aria-label="关闭策略详情" onClick={() => setSelected(null)}><X /></button></header><div className="strategy-detail-summary"><p>{selected.description}</p><dl><div><dt>策略族</dt><dd>{familyLabel[selected.family] ?? selected.family}</dd></div><div><dt>状态</dt><dd>{selected.status}</dd></div><div><dt>规格指纹</dt><dd>{selected.spec_fingerprint}</dd></div><div><dt>执行资格</dt><dd>{selected.executable ? '已编译' : '不可直接执行'}</dd></div></dl></div><details open><summary>常用参数</summary><div className="parameter-list">{Object.entries((selected.strategy_spec.parameters as Record<string, unknown> | undefined) ?? {}).slice(0, 20).map(([key, value]) => <div key={key}><span>{key}</span><strong>{String(value)}</strong></div>)}</div></details><details><summary>完整 StrategySpec</summary><pre>{JSON.stringify(selected.strategy_spec, null, 2)}</pre></details></aside></div>}
+    {editorOpen && <div className="editor-overlay"><section className="strategy-editor-panel" role="dialog" aria-modal="true" aria-label={editingId ? '编辑个人策略' : '创建个人策略'}><header><div><span className="ops-kicker">StrategySpec 编辑器</span><h2>{editingId ? '编辑个人策略' : '创建个人策略'}</h2></div><button aria-label="关闭策略编辑器" onClick={() => setEditorOpen(false)}><X /></button></header><div className="editor-form"><label><span>策略名称</span><input value={name} onChange={event => setName(event.target.value)} /></label><label><span>策略族</span><select value={editorFamily} onChange={event => changeFamily(event.target.value)}><option value="trend">趋势</option><option value="mean_reversion">均值回归</option><option value="breakout">突破</option></select></label><label className="wide"><span>研究假设</span><textarea rows={3} value={description} onChange={event => setDescription(event.target.value)} /></label><div className="editor-section-title"><strong>常用参数</strong><span>复杂字段可在高级参数中编辑</span></div>{['mean_window', 'stop_atr', 'maximum_holding_bars', 'first_target_reward_risk', 'trailing_stop_atr'].map(key => <label key={key}><span>{key}</span><input value={parameterValue(spec, key)} onChange={event => setParameter(key, event.target.value)} placeholder="使用策略默认值" /></label>)}<details className="advanced-editor wide"><summary>高级 StrategySpec JSON</summary><textarea rows={16} value={advanced} onChange={event => setAdvanced(event.target.value)} /><button className="button ghost" onClick={applyAdvanced}>应用高级参数</button></details></div>{message && <div className="editor-message" role="alert">{message}</div>}<footer><span>保存前由后端执行完整字段范围和交叉参数校验。</span><div><button className="button ghost" onClick={() => setEditorOpen(false)}>取消</button><button className="button primary" disabled={busy === 'save' || name.trim().length < 2} onClick={() => void save()}>{busy === 'save' ? '校验并保存…' : '保存到个人策略库'}</button></div></footer></section></div>}
     {message && <div className="ops-toast">{message}<button onClick={() => setMessage('')}><X /></button></div>}
   </section>
 }

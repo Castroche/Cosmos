@@ -1,32 +1,34 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Activity, BookOpen, BrainCircuit, Coins, FlaskConical, LayoutDashboard, ListOrdered, PanelLeftClose, PanelLeftOpen, ScrollText, Settings, ShieldCheck, SlidersHorizontal, Workflow } from 'lucide-react'
-import { activateStrategy, cancelOrder, executeStrategy, getAgentOverview, getDashboard, getMarketWindow, getSettings, haltTrading, openMarketStream, resumeTrading } from './api'
+import { Activity, BookOpen, BrainCircuit, Coins, FlaskConical, LayoutDashboard, ListOrdered, PanelLeftClose, PanelLeftOpen, ScrollText, Settings, ShieldCheck, SlidersHorizontal } from 'lucide-react'
+import { cancelOrder, getDashboard, getMarketWindow, haltTrading, openMarketStream, resumeTrading } from './api'
+import BootstrapGate from './BootstrapGate'
 import { PortfolioWorkspace, RiskWorkspace } from './AccountWorkspaces'
-import AISettingsWorkspace from './AISettingsWorkspace'
-import AuditWorkspace from './AuditWorkspace'
 import ProfessionalChart from './ProfessionalChart'
-import ResearchAgentWorkspace from './ResearchAgentWorkspace'
-import SettingsWorkspace from './SettingsWorkspace'
-import StrategyEditorWorkspace from './StrategyEditorWorkspace'
-import StrategyLibraryWorkspace from './StrategyLibraryWorkspace'
-import TradingAgentWorkspace from './TradingAgentWorkspace'
+import TradingIntelligenceWorkspace from './TradingIntelligenceWorkspace'
 import { CHART_TIMEFRAMES } from './timeframes'
-import type { AgentRuntimeOverview, ConfigurationView, DashboardData, MarketStreamEvent, Plan, StrategySignal, TradingMode } from './types'
+import type { ConfigurationView, DashboardData, MarketStreamEvent } from './types'
+
+const AISettingsWorkspace = lazy(() => import('./AISettingsWorkspace'))
+const AuditWorkspace = lazy(() => import('./AuditWorkspace'))
+const ResearchAgentWorkspace = lazy(() => import('./ResearchAgentWorkspace'))
+const SettingsWorkspace = lazy(() => import('./SettingsWorkspace'))
+const StrategyEditorWorkspace = lazy(() => import('./StrategyEditorWorkspace'))
+const StrategyLibraryWorkspace = lazy(() => import('./StrategyLibraryWorkspace'))
 
 const money = new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-const compact = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 2 })
 const CHART_CANDLE_LIMIT = 300
-type AppSection = 'overview' | 'portfolio' | 'risk' | 'researchAgent' | 'agent' | 'library' | 'editor' | 'logs' | 'ai' | 'settings'
+type AppSection = 'overview' | 'portfolio' | 'risk' | 'researchAgent' | 'intelligence' | 'library' | 'editor' | 'logs' | 'ai' | 'settings'
 
 function initialSection(): AppSection {
   const requested = new URLSearchParams(window.location.search).get('section')
   const aliases: Record<string, AppSection> = {
     positions: 'portfolio', orders: 'portfolio', lab: 'researchAgent', strategy: 'editor',
+    agent: 'intelligence', reviewAgent: 'researchAgent', overview: 'intelligence',
   }
-  const supported: AppSection[] = ['overview', 'portfolio', 'risk', 'researchAgent', 'agent', 'library', 'editor', 'logs', 'ai', 'settings']
+  const supported: AppSection[] = ['portfolio', 'risk', 'researchAgent', 'intelligence', 'library', 'editor', 'logs', 'ai', 'settings']
   if (requested && aliases[requested]) return aliases[requested]
-  return supported.includes(requested as AppSection) ? requested as AppSection : 'overview'
+  return supported.includes(requested as AppSection) ? requested as AppSection : 'intelligence'
 }
 
 function fmt(value: string | number) {
@@ -47,7 +49,7 @@ function modeLabel(mode: string) {
 
 const sectionTitles: Record<AppSection, string> = {
   overview: '交易台', portfolio: '持仓与订单', risk: '风险控制',
-  researchAgent: '研究 Agent', agent: '交易 Agent', library: '策略库',
+  researchAgent: '离线研究', intelligence: '交易智能', library: '策略库',
   editor: '策略编辑器', logs: '运行日志', ai: 'AI 服务', settings: '系统设置',
 }
 
@@ -64,14 +66,14 @@ function AppNavigation({
 }) {
   const item = (key: AppSection, label: string, icon: ReactNode) => <button type="button" className={section === key ? 'active' : ''} aria-label={label} title={collapsed ? label : undefined} onClick={() => onNavigate(key)}>{icon}<span>{label}</span></button>
   return <nav className={`primary-navigation ${collapsed ? 'collapsed' : ''}`} aria-label="主导航">
-    <button className="navigation-brand" onClick={() => onNavigate('overview')}><span>CQ</span><strong>COSMOS</strong><small>QUANT OPS</small></button>
+    <button className="navigation-brand" onClick={() => onNavigate('intelligence')}><span>CQ</span><strong>COSMOS</strong><small>QUANT OPS</small></button>
     <div className="navigation-groups">
-      <section><label>交易</label>{item('overview', '交易台', <LayoutDashboard />)}{item('portfolio', '持仓与订单', <ListOrdered />)}{item('risk', '风险控制', <ShieldCheck />)}</section>
-      <section><label>智能系统</label>{item('agent', '交易 Agent', <Workflow />)}{item('researchAgent', '研究 Agent', <FlaskConical />)}</section>
+      <section><label>交易</label>{item('intelligence', '交易工作台', <LayoutDashboard />)}{item('portfolio', '持仓与订单', <ListOrdered />)}{item('risk', '风险控制', <ShieldCheck />)}</section>
+      <section><label>智能系统</label>{item('researchAgent', '离线研究', <FlaskConical />)}</section>
       <section><label>策略</label>{item('library', '策略库', <BookOpen />)}{item('editor', '策略编辑器', <SlidersHorizontal />)}</section>
       <section><label>系统</label>{item('logs', '运行日志', <ScrollText />)}{item('ai', 'AI 服务', <BrainCircuit />)}{item('settings', '设置', <Settings />)}</section>
     </div>
-    <button className="navigation-collapse" onClick={onToggle}>{collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}<span>{collapsed ? '展开导航' : '收起导航'}</span></button>
+    <button className="navigation-collapse" aria-label={collapsed ? '展开导航' : '收起导航'} onClick={onToggle}>{collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}<span>{collapsed ? '展开导航' : '收起导航'}</span></button>
   </nav>
 }
 
@@ -80,7 +82,6 @@ function GlobalTopbar({
   settings,
   dashboard,
   streamState,
-  agentOverview,
   density,
   onOpenAgent,
   onToggleDensity,
@@ -89,156 +90,131 @@ function GlobalTopbar({
   settings: ConfigurationView
   dashboard?: DashboardData | null
   streamState: 'connecting' | 'live' | 'stale' | 'offline'
-  agentOverview: AgentRuntimeOverview | null
   density: 'comfortable' | 'compact'
   onOpenAgent: () => void
   onToggleDensity: () => void
 }) {
+  const marketStreamOnDemand = ['researchAgent', 'intelligence'].includes(section)
   return <header className="global-topbar">
     <div><strong>{sectionTitles[section]}</strong><span>COSMOS QUANT OPERATIONS</span></div>
     <div className="global-runtime-strip">
-      <span><i className={streamState === 'live' ? 'online live-pulse' : 'offline'} />{streamState === 'live' ? '实时行情' : streamState === 'connecting' ? '行情连接中' : streamState === 'stale' ? '行情延迟' : '行情离线'}</span>
+      <span><i className={marketStreamOnDemand || streamState === 'live' ? `online${streamState === 'live' ? ' live-pulse' : ''}` : 'offline'} />{marketStreamOnDemand ? '行情按需' : streamState === 'live' ? '实时行情' : streamState === 'connecting' ? '行情连接中' : streamState === 'stale' ? '行情延迟' : '行情离线'}</span>
       {dashboard && <span>{dashboard.system.data_latency_ms} ms</span>}
       <span className="mode">{settings.configuration.exchange_id.toUpperCase()} · {modeLabel(settings.configuration.trading_mode)}</span>
       {dashboard && <span className={dashboard.system.risk_state.halted ? 'risk-halted' : 'risk-ready'}>{dashboard.system.risk_state.halted ? '风险停机' : '风险正常'}</span>}
-      <button className="global-agent-state" onClick={onOpenAgent}><Activity /><span>{agentOverview?.active_goal_count ?? 0} 个 Agent 运行</span><small>{agentOverview?.latest_heartbeat_at ? new Date(agentOverview.latest_heartbeat_at).toLocaleTimeString('zh-CN', { hour12: false }) : '无心跳'}</small></button>
+      <button className="global-agent-state" onClick={onOpenAgent}><Activity /><span>Trading Intelligence v2</span><small>事件驱动</small></button>
       <button className="density-toggle" onClick={onToggleDensity}>{density === 'comfortable' ? '舒适' : '紧凑'}</button>
       <span className="avatar" aria-label="当前操作者">OP</span>
     </div>
   </header>
 }
 
-function EquitySparkline({ values }: { values: string[] }) {
-  const width = 280
-  const height = 56
-  const numbers = values.map(Number)
-  const min = Math.min(...numbers)
-  const max = Math.max(...numbers)
-  const points = numbers.map((value, index) => `${index / (numbers.length - 1) * width},${height - (value - min) / Math.max(max - min, 1) * (height - 6)}`).join(' ')
-  return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="sparkline" aria-hidden="true">
-      <polyline points={points} fill="none" />
-    </svg>
-  )
-}
-
-function StrategyRail({ plan, signal, mode, onGenerate, onActivate, onExecute, busy, disabled }: {
-  plan: Plan | null
-  signal: StrategySignal
-  mode: TradingMode
+function TradingIntelligenceRail({ onOpenIntelligence, onGenerate, busy }: {
+  onOpenIntelligence: () => void
   onGenerate: () => void
-  onActivate: () => void
-  onExecute: () => void
   busy: boolean
-  disabled: boolean
 }) {
-  if (!plan) {
-    return (
-      <aside className="strategy-rail no-plan">
-        <div className="rail-heading"><div><span className="eyebrow">当前市场状态</span><h2>观望 / NO TRADE</h2></div><span className="state-dot paused">等待</span></div>
-        <div className={`live-signal ${signal.direction}`}><span>{signal.regime.toUpperCase()}</span><strong>暂无可执行计划 <small>{(Number(signal.confidence) * 100).toFixed(1)}%</small></strong><p>{signal.reasons.at(-1)}</p></div>
-        <p className="plan-summary">系统没有强行选择多空方向。只有最新已收盘 K 线和高周期确认同时达到门槛后，才会生成可审核计划。</p>
-        <div className="rail-actions"><button className="button primary" onClick={onGenerate} disabled={busy}>打开策略研究</button></div>
-      </aside>
-    )
-  }
   return (
-    <aside className="strategy-rail">
-      <div className="rail-heading">
-        <div>
-          <span className="eyebrow">当前交易计划</span>
-          <h2>{plan.side === 'long' ? '做多' : '做空'} {plan.symbol}</h2>
-        </div>
-        <span className={`state-dot ${plan.status}`}>{plan.status === 'active' ? '已激活' : plan.status === 'approved' ? '已审核' : '草稿'}</span>
-      </div>
-
-      <p className="plan-summary">{plan.human_summary}</p>
-
-      <div className={`live-signal ${signal.direction}`}>
-        <span>最新已收盘信号 · {signal.regime.toUpperCase()}</span>
-        <strong>{signal.direction === 'flat' ? '观望 / NO TRADE' : signal.direction === 'long' ? '做多候选' : '做空候选'} <small>{(Number(signal.confidence) * 100).toFixed(1)}%</small></strong>
-        <p>{signal.reasons.at(-1)}</p>
-      </div>
-
-      <div className="levels">
-        <div className="level entry">
-          <span>开仓区间</span>
-          <strong>{fmt(plan.entry.zone.lower)} <small>—</small> {fmt(plan.entry.zone.upper)}</strong>
-          <i>限价 · 最大滑点 {plan.entry.max_slippage_bps} bps</i>
-        </div>
-        {plan.exit.take_profits.map((target, index) => (
-          <div className="level target" key={target.price}>
-            <span>止盈 {index + 1} · {Number(target.close_fraction) * 100}%</span>
-            <strong>{fmt(target.price)}</strong>
-            <i>{target.rationale}</i>
-          </div>
-        ))}
-        <div className="level stop">
-          <span>硬止损</span>
-          <strong>{fmt(plan.exit.stop_loss)}</strong>
-          <i>
-            预计最大亏损 {fmt(plan.sizing.risk_amount)} USDT
-            {plan.exit.trailing_stop_atr
-              ? ` · ${plan.exit.trailing_stop_atr} ATR 追踪（${
-                  plan.exit.trailing_activation === 'immediate'
-                    ? '立即'
-                    : plan.exit.trailing_activation === 'one_r'
-                      ? '1R 后'
-                      : 'TP1 后'
-                }激活）`
-              : ''}
-          </i>
-        </div>
-      </div>
-
-      <div className="sizing-line">
-        <span>建议仓位</span>
-        <strong>{plan.sizing.suggested_quantity} {plan.symbol.split('/')[0]}</strong>
-        <span>{compact.format(Number(plan.sizing.notional))} USDT 名义价值{plan.market_type === 'swap' ? ` · ${plan.leverage}x ${plan.margin_mode === 'cross' ? '全仓' : '逐仓'} · 约 ${fmt(Number(plan.sizing.notional) / Number(plan.leverage))} USDT 保证金` : ''}</span>
-      </div>
-
-      <details className="rationale" open>
-        <summary>为什么是这些点位</summary>
-        <ul>{plan.reasons.map(reason => <li key={reason}>{reason}</li>)}</ul>
-      </details>
-
-      <div className="rail-actions">
-        <button className="button ghost" onClick={onGenerate} disabled={busy}>重新生成</button>
-        {plan.status === 'active' ? (
-          <button className="button primary" onClick={onExecute} disabled={busy || disabled}>{mode === 'live' ? '提交真实订单' : mode === 'sandbox' ? '提交测试网订单' : '提交纸面订单'}</button>
-        ) : plan.status === 'approved' ? (
-          <button className="button primary" onClick={onActivate} disabled={busy || disabled}>激活策略</button>
-        ) : (
-          <button className="button primary" onClick={onGenerate} disabled={busy}>先回测并审核</button>
-        )}
-      </div>
-      <div className="fingerprint">策略指纹 {plan.fingerprint} · v{plan.version}</div>
+    <aside className="strategy-rail no-plan">
+      <div className="rail-heading"><div><span className="eyebrow">Trading Intelligence v2</span><h2>事件驱动决策链</h2></div><span className="state-dot paused">隔离运行</span></div>
+      <div className="live-signal flat"><span>实时行情仅更新 MarketState</span><strong>普通波动不调用 LLM</strong><p>只有有效 Thesis、WakeCondition、重大官方事件或有界重试才能唤醒决策。</p></div>
+      <p className="plan-summary">实时工作台不再生成旧 StrategyPlan，也不会在页面加载时自动扫描或回测。当前 Thesis、TradePlan 与模拟盘状态统一在 v2 决策链查看。</p>
+      <div className="rail-actions"><button className="button primary" onClick={onOpenIntelligence} disabled={busy}>查看 v2 决策链</button><button className="button" onClick={onGenerate} disabled={busy}>打开离线研究</button></div>
     </aside>
   )
 }
 
-function App() {
+const AGENT_SECTIONS = new Set<AppSection>(['researchAgent', 'intelligence'])
+
+function PersistentAgentWorkspaces({ section, settings, visited }: {
+  section: AppSection
+  settings: ConfigurationView
+  visited: ReadonlySet<AppSection>
+}) {
+  return <>
+    {visited.has('researchAgent') && <div className="persistent-agent-workspace" hidden={section !== 'researchAgent'} aria-hidden={section !== 'researchAgent'}>
+      <ResearchAgentWorkspace settings={settings} active={section === 'researchAgent'} />
+    </div>}
+    {visited.has('intelligence') && <div className="persistent-agent-workspace" hidden={section !== 'intelligence'} aria-hidden={section !== 'intelligence'}>
+      <TradingIntelligenceWorkspace active={section === 'intelligence'} />
+    </div>}
+  </>
+}
+
+function DashboardFallbackWorkspace({
+  section,
+  error,
+  onRetry,
+}: {
+  section: 'overview' | 'portfolio' | 'risk' | 'editor'
+  error: string | null
+  onRetry: () => void
+}) {
+  const portfolio = section === 'portfolio'
+  const risk = section === 'risk'
+  const title = portfolio ? '持仓、订单与收益' : risk ? '风险控制' : '交易工作台'
+  const description = portfolio
+    ? '正在从 OKX Demo 同步账户净值、当前持仓和活动订单。'
+    : risk
+      ? '正在同步全局风险闸门与订单对账状态。'
+      : '正在同步行情、账户与交易状态。'
+
+  return <section className={`ops-page dashboard-fallback-page ${portfolio ? 'portfolio-fallback' : ''}`}>
+    <header className="ops-page-header">
+      <div>
+        <span className="ops-kicker">{portfolio ? '账户执行与历史归因' : risk ? '确定性风险引擎' : '交易运行时'}</span>
+        <h1>{title}</h1>
+        <p>{description}</p>
+      </div>
+    </header>
+    <div className={`dashboard-fallback-state ${error ? 'failed' : 'loading'}`} role={error ? 'alert' : 'status'}>
+      <i aria-hidden="true" />
+      <div>
+        <strong>{error ? `${portfolio ? '账户' : '运行时'}数据暂不可用` : '正在建立数据连接'}</strong>
+        <span>{error ?? '首次同步通常只需要几秒钟，页面会自动重试。'}</span>
+      </div>
+      {error && <button type="button" className="button ghost" onClick={onRetry}>立即重试</button>}
+    </div>
+    {portfolio && <>
+      <div className="account-summary-strip dashboard-skeleton" aria-hidden="true">
+        {['账户净值', '可用资金', '总敞口', '当前持仓', '活动订单'].map(label => <div key={label}><span>{label}</span><strong>—</strong></div>)}
+      </div>
+      <section className="account-table-section dashboard-skeleton-table" aria-label="持仓数据加载状态">
+        <div className="panel-title"><span>当前持仓</span><b>—</b></div>
+        <div className="account-data-table positions">
+          <div className="table-head"><span>品种</span><span>方向</span><span>数量</span><span>杠杆</span><span>平均价</span><span>标记价</span><span>未实现盈亏</span><span>清算 / 保护</span></div>
+          <p className="ops-empty">{error ? '账户连接恢复后将在这里显示真实持仓。' : '正在读取真实持仓…'}</p>
+        </div>
+      </section>
+    </>}
+  </section>
+}
+
+function TradingApp() {
   const [dashboard, setDashboard] = useState<DashboardData | null>(null)
   const [settingsView, setSettingsView] = useState<ConfigurationView | null>(null)
   const [dashboardError, setDashboardError] = useState<string | null>(null)
   const [section, setSection] = useState<AppSection>(initialSection)
+  const [visitedAgentSections, setVisitedAgentSections] = useState<Set<AppSection>>(
+    () => AGENT_SECTIONS.has(section) ? new Set([section]) : new Set(),
+  )
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
-  const [confirming, setConfirming] = useState(false)
-  const [planReviewed, setPlanReviewed] = useState(false)
   const [selectedTimeframe, setSelectedTimeframe] = useState('1h')
   const [selectedSymbol, setSelectedSymbol] = useState('')
   const [chartBusy, setChartBusy] = useState(false)
   const [streamState, setStreamState] = useState<'connecting' | 'live' | 'stale' | 'offline'>('connecting')
-  const [agentOverview, setAgentOverview] = useState<AgentRuntimeOverview | null>(null)
   const [navCollapsed, setNavCollapsed] = useState(() => localStorage.getItem('cosmos-nav-collapsed') === 'true' || window.innerWidth < 1440)
   const [density, setDensity] = useState<'comfortable' | 'compact'>(() => localStorage.getItem('cosmos-density') === 'compact' ? 'compact' : 'comfortable')
+  const requiresDashboard = ['overview', 'portfolio', 'risk', 'editor'].includes(section)
   const lastMarketEventAt = useRef(0)
-  const confirmationDialogRef = useRef<HTMLDivElement>(null)
-  const reviewInputRef = useRef<HTMLInputElement>(null)
 
   const navigate = (next: AppSection, replace = false) => {
     setSection(next)
+    if (window.innerWidth <= 1440) setNavCollapsed(true)
+    if (AGENT_SECTIONS.has(next)) {
+      setVisitedAgentSections(current => current.has(next) ? current : new Set([...current, next]))
+    }
     const url = new URL(window.location.href)
     url.searchParams.set('section', next)
     window.history[replace ? 'replaceState' : 'pushState']({}, '', url)
@@ -246,7 +222,13 @@ function App() {
   }
 
   useEffect(() => {
-    const handlePopState = () => setSection(initialSection())
+    const handlePopState = () => {
+      const next = initialSection()
+      setSection(next)
+      if (AGENT_SECTIONS.has(next)) {
+        setVisitedAgentSections(current => current.has(next) ? current : new Set([...current, next]))
+      }
+    }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
   }, [])
@@ -260,42 +242,6 @@ function App() {
     localStorage.setItem('cosmos-nav-collapsed', String(navCollapsed))
   }, [navCollapsed])
 
-  useEffect(() => {
-    let stopped = false
-    const refreshAgent = () => void getAgentOverview().then(result => { if (!stopped) setAgentOverview(result) }).catch(() => undefined)
-    refreshAgent()
-    const timer = window.setInterval(refreshAgent, 10_000)
-    return () => { stopped = true; window.clearInterval(timer) }
-  }, [])
-
-  useEffect(() => {
-    if (!confirming) return
-    const previouslyFocused = document.activeElement as HTMLElement | null
-    reviewInputRef.current?.focus()
-    const handleDialogKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setConfirming(false)
-        return
-      }
-      if (event.key !== 'Tab') return
-      const focusable = [...(confirmationDialogRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)') ?? [])]
-      if (!focusable.length) return
-      const first = focusable[0]
-      const last = focusable[focusable.length - 1]
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-    window.addEventListener('keydown', handleDialogKey)
-    return () => {
-      window.removeEventListener('keydown', handleDialogKey)
-      previouslyFocused?.focus()
-    }
-  }, [confirming])
 
   const refresh = async (view = settingsView, symbolOverride = selectedSymbol, timeframeOverride = selectedTimeframe) => {
     try {
@@ -319,22 +265,21 @@ function App() {
   }
 
   useEffect(() => {
+    if (!requiresDashboard || dashboard) return
     let cancelled = false
-    void getSettings().then(result => {
-      if (!cancelled) {
-        setSettingsView(result)
-        setSelectedTimeframe(result.configuration.default_timeframe)
-        setSelectedSymbol(result.configuration.default_symbol)
-      }
-    })
-    void getDashboard()
+    const load = () => void getDashboard()
       .then(result => { if (!cancelled) { setDashboard(result); setDashboardError(null) } })
-      .catch(error => { if (!cancelled) setDashboardError(error instanceof Error ? error.message : '真实行情连接失败') })
-    return () => { cancelled = true }
-  }, [])
+      .catch(error => { if (!cancelled) setDashboardError(error instanceof Error ? error.message : '运行时数据连接失败') })
+    load()
+    const retryTimer = window.setInterval(load, 20_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(retryTimer)
+    }
+  }, [dashboard, requiresDashboard])
 
   useEffect(() => {
-    if (!settingsView) return
+    if (!settingsView || !requiresDashboard) return
     let stopped = false
     let socket: WebSocket | null = null
     let reconnectTimer: number | undefined
@@ -425,7 +370,7 @@ function App() {
       window.clearInterval(staleTimer)
       window.clearInterval(reconcileTimer)
     }
-  }, [selectedSymbol, selectedTimeframe, settingsView])
+  }, [requiresDashboard, selectedSymbol, selectedTimeframe, settingsView])
 
   const selectTimeframe = async (timeframe: string) => {
     if (!settingsView || timeframe === selectedTimeframe) return
@@ -491,7 +436,11 @@ function App() {
   }
 
   if (!settingsView) {
-    return <div className="boot"><div className="boot-mark">C</div><span>正在读取本机配置…</span></div>
+    return <BootstrapGate onReady={view => {
+      setSettingsView(view)
+      setSelectedTimeframe(view.configuration.default_timeframe)
+      setSelectedSymbol(view.configuration.default_symbol)
+    }} />
   }
 
   if (!dashboard) {
@@ -499,37 +448,24 @@ function App() {
       <div className="app-shell redesigned-shell">
         <AppNavigation section={section} collapsed={navCollapsed} onNavigate={navigate} onToggle={() => setNavCollapsed(current => !current)} />
         <main className={`workspace redesigned-workspace ${navCollapsed ? 'nav-collapsed' : ''}`}>
-          <GlobalTopbar section={section} settings={settingsView} streamState="offline" agentOverview={agentOverview} density={density} onOpenAgent={() => navigate('agent')} onToggleDensity={() => setDensity(current => current === 'comfortable' ? 'compact' : 'comfortable')} />
-          {dashboardError && ['overview', 'portfolio', 'risk'].includes(section) && <div className="market-error" role="alert"><div><span className="eyebrow">行情不可用</span><strong>没有使用演示数据</strong><p>{dashboardError}</p></div><button className="button ghost" onClick={() => void refresh()}>重新连接</button></div>}
-          {section === 'agent' ? <TradingAgentWorkspace settings={settingsView} />
-            : section === 'researchAgent' ? <ResearchAgentWorkspace settings={settingsView} />
-              : section === 'library' ? <StrategyLibraryWorkspace />
+          <GlobalTopbar section={section} settings={settingsView} streamState="offline" density={density} onOpenAgent={() => navigate('intelligence')} onToggleDensity={() => setDensity(current => current === 'comfortable' ? 'compact' : 'comfortable')} />
+          <PersistentAgentWorkspaces section={section} settings={settingsView} visited={visitedAgentSections} />
+          {!AGENT_SECTIONS.has(section) && (section === 'library' ? <StrategyLibraryWorkspace />
                 : section === 'editor' ? <StrategyEditorWorkspace settings={settingsView} onGenerated={() => void refresh()} onOpenSettings={() => navigate('settings')} />
                   : section === 'logs' ? <AuditWorkspace />
                     : section === 'ai' ? <AISettingsWorkspace />
-                      : <SettingsWorkspace view={settingsView} onSaved={view => {
+                      : section === 'settings' ? <SettingsWorkspace view={settingsView} onSaved={view => {
                         const nextSymbol = view.configuration.strategy.watchlist.includes(selectedSymbol) ? selectedSymbol : view.configuration.default_symbol
                         const nextTimeframe = view.configuration.strategy.timeframes.includes(selectedTimeframe) ? selectedTimeframe : view.configuration.default_timeframe
                         setSettingsView(view); setSelectedSymbol(nextSymbol); setSelectedTimeframe(nextTimeframe)
                         void refresh(view, nextSymbol, nextTimeframe)
-                      }} />}
+                      }} />
+                        : <DashboardFallbackWorkspace section={section as 'overview' | 'portfolio' | 'risk' | 'editor'} error={dashboardError} onRetry={() => void refresh()} />)}
         </main>
       </div>
     )
   }
 
-  const plan = dashboard.plan
-  const activate = () => act(async () => {
-    if (!plan) throw new Error('当前没有可激活的策略计划')
-    const next = await activateStrategy(plan)
-    setDashboard(current => current ? { ...current, plan: next } : current)
-    setConfirming(false)
-  }, '策略已激活，正在等待计划入场区间')
-
-  const execute = () => act(() => {
-    if (!plan) throw new Error('当前没有可执行的策略计划')
-    return executeStrategy(plan)
-  }, `${settingsView.configuration.trading_mode === 'live' ? '真实' : settingsView.configuration.trading_mode === 'sandbox' ? '测试网' : '纸面'}订单已提交，保护单与幂等键已写入账本`)
   const toggleTradingHalt = () => {
     const state = dashboard.system.risk_state
     const confirmed = window.confirm(state.halted
@@ -547,13 +483,10 @@ function App() {
       <AppNavigation section={section} collapsed={navCollapsed} onNavigate={navigate} onToggle={() => setNavCollapsed(current => !current)} />
 
       <main className={`workspace redesigned-workspace ${navCollapsed ? 'nav-collapsed' : ''}`}>
-        <GlobalTopbar section={section} settings={settingsView} dashboard={dashboard} streamState={streamState} agentOverview={agentOverview} density={density} onOpenAgent={() => navigate('agent')} onToggleDensity={() => setDensity(current => current === 'comfortable' ? 'compact' : 'comfortable')} />
+        <GlobalTopbar section={section} settings={settingsView} dashboard={dashboard} streamState={streamState} density={density} onOpenAgent={() => navigate('intelligence')} onToggleDensity={() => setDensity(current => current === 'comfortable' ? 'compact' : 'comfortable')} />
 
-        {section === 'agent' ? (
-          <TradingAgentWorkspace settings={settingsView} />
-        ) : section === 'researchAgent' ? (
-          <ResearchAgentWorkspace settings={settingsView} />
-        ) : section === 'library' ? (
+        <PersistentAgentWorkspaces section={section} settings={settingsView} visited={visitedAgentSections} />
+        {!AGENT_SECTIONS.has(section) && (section === 'library' ? (
           <StrategyLibraryWorkspace />
         ) : section === 'logs' ? (
           <AuditWorkspace />
@@ -577,8 +510,7 @@ function App() {
         ) : section === 'editor' ? (
           <StrategyEditorWorkspace
             settings={settingsView}
-            initialPlan={dashboard.plan ?? undefined}
-            onGenerated={next => setDashboard(current => current ? { ...current, plan: next } : current)}
+            onGenerated={() => undefined}
             onOpenSettings={() => navigate('settings')}
           />
         ) : (<>
@@ -604,13 +536,13 @@ function App() {
           <section className="chart-panel">
             <ProfessionalChart
               candles={dashboard.candles}
-              plan={plan}
+              plan={null}
               exchange={dashboard.system.exchange}
               symbol={dashboard.market.symbol}
               timeframe={selectedTimeframe}
               timeframes={[...CHART_TIMEFRAMES]}
               busy={chartBusy}
-              showPlan={Boolean(plan && plan.symbol === dashboard.market.symbol)}
+              showPlan={false}
               onTimeframeChange={timeframe => void selectTimeframe(timeframe)}
             />
             <div className="quote-row">
@@ -623,28 +555,39 @@ function App() {
             </div>
           </section>
 
-          <StrategyRail
-            plan={plan}
-            signal={dashboard.signal}
-            mode={settingsView.configuration.trading_mode}
+          <TradingIntelligenceRail
+            onOpenIntelligence={() => navigate('intelligence')}
             onGenerate={() => navigate('editor')}
-            onActivate={() => { setPlanReviewed(false); setConfirming(true) }}
-            onExecute={execute}
             busy={busy}
-            disabled={dashboard.system.risk_state.halted || !dashboard.risk.approved}
           />
         </div>
+
+        <section className="trade-position-summary" aria-label="当前持仓状态">
+          <header className="summary-title">
+            <div><span>当前持仓</span><small>{dashboard.portfolio.open_positions.length > 0 ? `${dashboard.portfolio.open_positions.length} 个持仓正在由风险系统持续监控` : '当前没有未平仓头寸'}</small></div>
+            <button onClick={() => navigate('portfolio')}>管理持仓与订单</button>
+          </header>
+          {dashboard.portfolio.open_positions.length > 0 ? <div className="trade-position-list">
+            <div className="trade-position-head"><span>品种 / 方向</span><span>数量</span><span>开仓均价</span><span>标记价格</span><span>未实现盈亏</span><span>保护状态</span></div>
+            {dashboard.portfolio.open_positions.slice(0, 6).map(position => <article key={`${position.symbol}-${position.side}`}>
+              <div><strong>{position.symbol}</strong><b className={position.side}>{position.side === 'long' ? '多仓' : '空仓'}{position.leverage ? ` · ${position.leverage}x` : ''}</b></div>
+              <span>{position.quantity}</span>
+              <span>{fmt(position.average_entry)}</span>
+              <span>{fmt(position.mark_price)}</span>
+              <strong className={Number(position.unrealized_pnl) >= 0 ? 'positive' : 'negative'}>{Number(position.unrealized_pnl) > 0 ? '+' : ''}{fmt(position.unrealized_pnl)} USDT</strong>
+              <small>{position.stop_loss ? `止损 ${fmt(position.stop_loss)}` : '未设置止损'}{position.take_profit ? ` · 止盈 ${fmt(position.take_profit)}` : ''}</small>
+            </article>)}
+          </div> : <div className="trade-position-empty"><i /><div><strong>当前空仓</strong><span>Agent 启动不代表立即开仓；出现合格信号并通过硬风控后，持仓会实时显示在这里。</span></div></div>}
+        </section>
 
         <section className="lower-deck trade-overview-deck">
           <div className="overview-deck">
             <div className="backtest-summary">
-              <div className="summary-title"><span>最近回测</span><small>策略周期 {plan?.timeframe ?? selectedTimeframe} · 真实历史 K 线 · 含手续费与滑点</small></div>
-              <div><span>收益率</span><strong className={Number(dashboard.backtest.return_percent) >= 0 ? 'positive' : 'negative'}>{pct(dashboard.backtest.return_percent)}</strong></div>
-              <div><span>最大回撤</span><strong>{dashboard.backtest.max_drawdown_percent}%</strong></div>
-              <div><span>Sharpe</span><strong>{dashboard.backtest.sharpe}</strong></div>
-              <div><span>胜率</span><strong>{dashboard.backtest.win_rate_percent}%</strong></div>
-              <div><span>Profit Factor</span><strong>{dashboard.backtest.profit_factor}</strong></div>
-              <EquitySparkline values={dashboard.backtest.equity_curve} />
+              <div className="summary-title"><span>离线研究隔离</span><small>Strategy DSL · Campaign · PBO/CPCV · Walk-forward</small></div>
+              <div><span>实时自动扫描</span><strong>已移除</strong></div>
+              <div><span>页面加载回测</span><strong>已移除</strong></div>
+              <div><span>模拟盘决策</span><strong>Trading Intelligence v2</strong></div>
+              <button className="button" onClick={() => navigate('researchAgent')}>查看离线研究结果</button>
             </div>
             <div className="audit-stream">
               <div className="summary-title"><span>最近重要事件</span><button onClick={() => navigate('logs')}>查看全部日志</button></div>
@@ -652,25 +595,16 @@ function App() {
             </div>
           </div>
         </section>
-        </>)}
+        </>))}
       </main>
-
-      {confirming && plan && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirming(false)}>
-          <div ref={confirmationDialogRef} className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-description" onMouseDown={event => event.stopPropagation()}>
-            <span className="eyebrow">策略激活检查</span>
-            <h2 id="confirm-title">确认让系统等待开仓条件</h2>
-            <p id="confirm-description">{plan.human_summary}</p>
-            <div className="confirm-risk"><span>最大计划亏损</span><strong>{fmt(plan.sizing.risk_amount)} USDT</strong><span>占组合权益 {(Number(plan.sizing.risk_fraction) * 100).toFixed(2)}%{plan.market_type === 'swap' ? ` · ${plan.leverage}x ${plan.margin_mode === 'cross' ? '全仓' : '逐仓'} · 预计保证金 ${fmt(Number(plan.sizing.notional) / Number(plan.leverage))} USDT` : ''}</span></div>
-            <label><input ref={reviewInputRef} type="checkbox" checked={planReviewed} onChange={event => setPlanReviewed(event.target.checked)} /> 我已核对开仓、止盈、止损和失效条件</label>
-            <div className="modal-actions"><button className="button ghost" onClick={() => setConfirming(false)}>返回修改</button><button className="button primary" onClick={activate} disabled={busy || !planReviewed}>确认激活{settingsView.configuration.trading_mode === 'live' ? '实盘' : settingsView.configuration.trading_mode === 'sandbox' ? '测试网' : '纸面'}策略</button></div>
-          </div>
-        </div>
-      )}
 
       {notice && <div className="toast" role="status" aria-live="polite">{notice}</div>}
     </div>
   )
 }
 
-export default App
+export default function App() {
+  return <Suspense fallback={<div className="boot" role="status">正在加载工作区…</div>}>
+    <TradingApp />
+  </Suspense>
+}

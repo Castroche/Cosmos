@@ -67,7 +67,9 @@ CORE_EXCHANGES = ("okx", "binance")
 EXECUTION_FAULT_TESTS = (
     "backend/tests/test_execution.py",
     "backend/tests/test_order_ledger.py",
-    "backend/tests/test_agent_recovery.py",
+    "backend/tests/test_trading_intelligence_v2.py",
+    "backend/tests/test_v2_execution.py",
+    "backend/tests/test_v2_automation_runtime.py",
     "backend/tests/test_protected_exchange_orders.py",
     "backend/tests/test_agent_commissioning.py",
     "backend/tests/test_risk_state.py",

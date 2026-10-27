@@ -60,6 +60,8 @@ class OrderLedger:
     def __init__(self, store: SqliteStore, exchange_id: str):
         self.store = store
         self.exchange_id = exchange_id
+        self.managed_auxiliary_client_ids: set[str] = set()
+        self.native_protection_order_ids: set[str] = set()
         self.records: dict[str, OrderRecord] = {
             item["order"]["id"]: OrderRecord.model_validate(item)
             for item in store.load_order_records(exchange_id)
@@ -110,7 +112,17 @@ class OrderLedger:
         report = ReconciliationReport()
         open_orders = await exchange.open_orders()
         open_ids = set()
+        native_protection_client_ids = {
+            f"{record.order.client_order_id}p"[:32]
+            for record in self.records.values()
+            if record.protection_verified and record.order.client_order_id
+        }
         for order in open_orders:
+            if order.client_order_id in (
+                native_protection_client_ids | self.managed_auxiliary_client_ids
+            ):
+                self.native_protection_order_ids.add(order.id)
+                continue
             open_ids.add(order.id)
             existing = self.records.get(order.id) or self._by_client(order.client_order_id)
             if not existing:
@@ -121,6 +133,8 @@ class OrderLedger:
             report.confirmed += 1
 
         for record in list(self.records.values()):
+            if record.order.id in self.native_protection_order_ids:
+                continue
             if (
                 record.order.status
                 not in {
@@ -164,6 +178,8 @@ class OrderLedger:
             )
 
         for record in list(self.records.values()):
+            if record.order.id in self.native_protection_order_ids:
+                continue
             if record.order.status not in {
                 OrderStatus.OPEN,
                 OrderStatus.PARTIALLY_FILLED,
@@ -205,7 +221,11 @@ class OrderLedger:
             key=lambda item: item.order.updated_at,
             reverse=True,
         )
-        return [record.order for record in ordered[:limit]]
+        return [
+            record.order
+            for record in ordered
+            if record.order.id not in self.native_protection_order_ids
+        ][:limit]
 
     def _by_client(self, client_order_id: str) -> OrderRecord | None:
         if not client_order_id:

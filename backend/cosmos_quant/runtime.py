@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
+from decimal import Decimal
 from time import perf_counter
 
 from .config_service import ConfigurationService
@@ -26,6 +27,7 @@ from .market_evidence import MarketEvidenceSnapshot, build_market_evidence
 from .order_ledger import OrderLedger, ReconciliationHealth, ReconciliationReport
 from .private_order_stream import OkxPrivateOrderStream
 from .risk_state import RiskStateService
+from .trading_intelligence import V2_SYMBOLS
 from .websocket_market import PublicTickerStream
 
 
@@ -45,6 +47,7 @@ class RuntimeManager:
         self.execution: ExchangeAdapter | None = None
         self.market_data = MarketDataService(configuration.store)
         self.ticker_stream: PublicTickerStream | None = None
+        self.ticker_streams: list[PublicTickerStream] = []
         self.risk_state = risk_state
         self.order_ledger: OrderLedger | None = None
         self.reconciliation_report: ReconciliationReport | None = None
@@ -55,12 +58,17 @@ class RuntimeManager:
         self._reconciliation_task: asyncio.Task | None = None
         self.private_order_stream: OkxPrivateOrderStream | None = None
         self.reconciliation_plan_ids_provider: Callable[[], set[str]] | None = None
+        self._initialization_lock = asyncio.Lock()
 
     async def initialize(self, force: bool = False) -> None:
+        async with self._initialization_lock:
+            await self._initialize_locked(force)
+
+    async def _initialize_locked(self, force: bool = False) -> None:
         current = self.configuration_service.current_configuration()
         if not force and self.configuration == current and self.market and self.execution:
             return
-        await self.close()
+        await self._close_clients()
         credentials = self.configuration_service.credentials_for(current)
         if current.trading_mode == TradingMode.PAPER:
             self.market = CcxtExchangeAdapter(
@@ -106,19 +114,32 @@ class RuntimeManager:
         self.configuration = current
         ledger_key = f"{current.exchange_id}:{current.trading_mode}:{current.market_type}"
         self.order_ledger = OrderLedger(self.configuration_service.store, ledger_key)
-        self.ticker_stream = PublicTickerStream(
-            current.exchange_id,
-            current.default_symbol,
-            current.market_type,
-            self.market_data.update_websocket,
-            proxy_url=current.network_proxy_url,
-            timeframe=current.default_timeframe,
-            timeframes=list(
-                dict.fromkeys([current.default_timeframe, *current.strategy.timeframes])
-            ),
-            candle_callback=self.market_data.update_exchange_candle,
+        stream_timeframes = list(
+            dict.fromkeys([current.default_timeframe, *current.strategy.timeframes])
         )
-        self.ticker_stream.start()
+        stream_symbols = list(
+            dict.fromkeys([
+                current.default_symbol,
+                *current.strategy.watchlist,
+                *(symbol.removesuffix(":USDT") for symbol in V2_SYMBOLS),
+            ])
+        )
+        self.ticker_streams = [
+            PublicTickerStream(
+                current.exchange_id,
+                symbol,
+                current.market_type,
+                self.market_data.update_websocket,
+                proxy_url=current.network_proxy_url,
+                timeframe=current.default_timeframe,
+                timeframes=stream_timeframes,
+                candle_callback=self.market_data.update_exchange_candle,
+            )
+            for symbol in stream_symbols
+        ]
+        self.ticker_stream = self.ticker_streams[0] if self.ticker_streams else None
+        for stream in self.ticker_streams:
+            stream.start()
         # Do not strand initialization on one private REST timeout. New entries
         # remain blocked until a clean reconciliation pass succeeds.
         await self.reconcile_orders(raise_on_error=False)
@@ -195,6 +216,22 @@ class RuntimeManager:
                     )
                     if microstructure.get(key) is not None
                 }
+                trade_flow = microstructure.get("trade_flow_imbalance")
+                if trade_flow is not None:
+                    observed_at = microstructure.get("observed_at") or market.timestamp
+                    quote_volume = microstructure.get("trade_flow_quote")
+                    open_interest_update.update(
+                        {
+                            "order_flow_imbalance": trade_flow,
+                            "order_flow_time": observed_at,
+                            "order_flow_quote_volume": quote_volume,
+                            "order_flow_delta": (
+                                Decimal(str(trade_flow)) * Decimal(str(quote_volume))
+                                if quote_volume is not None
+                                else None
+                            ),
+                        }
+                    )
                 if open_interest_update:
                     if (
                         open_interest_update.get("open_interest") is not None
@@ -399,6 +436,10 @@ class RuntimeManager:
             await adapter.close()
 
     async def close(self) -> None:
+        async with self._initialization_lock:
+            await self._close_clients()
+
+    async def _close_clients(self) -> None:
         if self.private_order_stream:
             await self.private_order_stream.close()
             self.private_order_stream = None
@@ -407,9 +448,11 @@ class RuntimeManager:
             with suppress(asyncio.CancelledError):
                 await self._reconciliation_task
             self._reconciliation_task = None
-        if self.ticker_stream:
-            await self.ticker_stream.close()
-            self.ticker_stream = None
+        streams = self.ticker_streams or ([self.ticker_stream] if self.ticker_stream else [])
+        if streams:
+            await asyncio.gather(*(stream.close() for stream in streams))
+        self.ticker_streams = []
+        self.ticker_stream = None
         clients = {id(client): client for client in (self.market, self.execution) if client}
         for client in clients.values():
             close = getattr(client, "close", None)
@@ -478,6 +521,17 @@ class RuntimeManager:
                 )
                 if recover:
                     recover()
+                if (
+                    self.configuration
+                    and self.configuration.trading_mode == TradingMode.SANDBOX
+                ):
+                    recover_demo_integrity = getattr(
+                        self.risk_state,
+                        "recover_demo_reconciliation_integrity",
+                        None,
+                    )
+                    if recover_demo_integrity:
+                        recover_demo_integrity()
         return report
 
     async def _reconciliation_loop(self) -> None:

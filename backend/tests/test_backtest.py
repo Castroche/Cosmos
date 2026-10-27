@@ -681,6 +681,26 @@ def test_walk_forward_backtest_applies_historical_funding_costs():
     assert funded.final_equity < baseline.final_equity
 
 
+def test_walk_forward_records_intended_and_exposure_capped_position():
+    result = run_walk_forward_backtest(
+        demo_candles(),
+        maximum_gross_exposure=Decimal("0.05"),
+        maximum_leverage=Decimal("3"),
+    )
+
+    assert int(result.cost_model["gross_exposure_cap_count"]) > 0
+    assert int(result.cost_model["leverage_cap_count"]) == 0
+    assert result.trades
+    assert all(trade.intended_quantity is not None for trade in result.trades)
+    assert all(trade.actual_entry_quantity is not None for trade in result.trades)
+    assert all(
+        trade.actual_entry_quantity <= trade.intended_quantity
+        for trade in result.trades
+        if trade.actual_entry_quantity is not None and trade.intended_quantity is not None
+    )
+    assert any("gross_exposure" in trade.position_limit_reason for trade in result.trades)
+
+
 def test_historical_funding_context_is_causal_and_expires_when_stale():
     timestamp = datetime(2026, 1, 2, tzinfo=UTC)
     points = [

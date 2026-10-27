@@ -5,6 +5,7 @@ from decimal import Decimal
 import pytest
 from cosmos_quant.domain import (
     MarketSnapshot,
+    Order,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -81,6 +82,71 @@ def test_reconciliation_detects_exchange_order_missing_from_local_ledger(tmp_pat
 
         assert report.unknown_open_order_ids == [order.id]
         assert ledger.records[order.id].protection_verified is False
+
+    asyncio.run(scenario())
+
+
+def test_reconciliation_ignores_owned_native_protection_children(tmp_path):
+    async def scenario():
+        store = SqliteStore(tmp_path / "cosmos.db")
+        exchange = PaperExchange()
+        exchange.update_market(snapshot(Decimal("50000")))
+        entry = await exchange.place_order(
+            OrderIntent(
+                idempotency_key="owned-entry",
+                plan_id="active-plan",
+                plan_fingerprint="fingerprint",
+                symbol="BTC/USDT",
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                quantity=Decimal("0.1"),
+            )
+        )
+        child = Order(
+            id="native-protection-child",
+            client_order_id=f"{entry.client_order_id}p"[:32],
+            plan_id="unknown",
+            symbol="BTC/USDT",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            status=OrderStatus.OPEN,
+            quantity="0.1",
+        )
+        managed_close = child.model_copy(
+            update={
+                "id": "managed-v2-close",
+                "client_order_id": "ticownedclose",
+            }
+        )
+        ledger = OrderLedger(store, "paper:test")
+        ledger.record(entry, protection_verified=True)
+        ledger.managed_auxiliary_client_ids.add(managed_close.client_order_id)
+        # Reproduce a child that an older reconciliation pass persisted before
+        # the exchange exposed its stable Algo client identifier.
+        ledger.record(
+            child.model_copy(update={"client_order_id": "venue-generated-id"}),
+            protection_verified=False,
+        )
+        ledger.record(managed_close, protection_verified=False)
+
+        async def open_orders():
+            return [child, managed_close]
+
+        async def verified(_order):
+            return True
+
+        exchange.open_orders = open_orders
+        exchange.verify_protection = verified
+        report = await ledger.reconcile(
+            exchange,
+            protected_plan_ids={"active-plan"},
+        )
+
+        assert report.unknown_open_order_ids == []
+        assert report.uncertain_order_ids == []
+        assert report.unprotected_order_ids == []
+        assert child.id not in {order.id for order in ledger.recent_orders()}
+        assert managed_close.id not in {order.id for order in ledger.recent_orders()}
 
     asyncio.run(scenario())
 

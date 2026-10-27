@@ -71,6 +71,10 @@ class ResearchDataset(BaseModel):
     quality_status: str = "unknown"
     source: str = "unknown"
     gap_count: int = 0
+    largest_gap_bars: int = 0
+    segment_count: int = 1
+    training_segment_boundaries: tuple[datetime, ...] = ()
+    segment_reasons: tuple[str, ...] = ()
     duplicate_count: int = 0
     invalid_count: int = 0
     funding_count: int = 0
@@ -253,6 +257,23 @@ def build_research_dataset(
         Decimal(len(candles)) / Decimal(max(expected_count, 1)),
         Decimal("1"),
     )
+    missing_gap_bars = (
+        [
+            max(
+                int((right.timestamp - left.timestamp).total_seconds()) // interval_seconds - 1,
+                0,
+            )
+            for left, right in zip(candles, candles[1:], strict=False)
+        ]
+        if interval_seconds
+        else []
+    )
+    largest_gap_bars = max(missing_gap_bars, default=0)
+    training_segment_boundaries = tuple(
+        candles[index + 1].timestamp
+        for index, missing in enumerate(missing_gap_bars)
+        if missing > 3
+    )
     open_interest_points = sorted(
         open_interest or [],
         key=lambda item: item.timestamp,
@@ -342,6 +363,13 @@ def build_research_dataset(
         quality_status=getattr(quality, "status", "unknown"),
         source=getattr(quality, "source", "unknown"),
         gap_count=getattr(quality, "gap_count", 0),
+        largest_gap_bars=largest_gap_bars,
+        segment_count=1 + len(training_segment_boundaries),
+        training_segment_boundaries=training_segment_boundaries,
+        segment_reasons=tuple(
+            f"contiguous_gap_above_3_bars_before:{boundary.isoformat()}"
+            for boundary in training_segment_boundaries
+        ),
         duplicate_count=getattr(quality, "duplicate_count", 0),
         invalid_count=getattr(quality, "invalid_count", 0),
         funding_count=len(funding_rates or []),

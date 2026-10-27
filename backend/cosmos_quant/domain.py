@@ -46,6 +46,13 @@ class OrderType(StrEnum):
     LIMIT = "limit"
 
 
+class PositionSide(StrEnum):
+    """Explicit hedge leg; None on an order retains legacy net-mode semantics."""
+
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+
 class TradingMode(StrEnum):
     PAPER = "paper"
     SANDBOX = "sandbox"
@@ -433,6 +440,10 @@ class StrategyPlan(BaseModel):
     causal_policy_fingerprint: str | None = None
     causal_policy_selected_library_entry_id: str | None = None
     causal_policy_selection_evidence: dict[str, Any] | None = None
+    research_profile: str | None = None
+    alpha_artifact_fingerprint: str | None = None
+    sandbox_admission_certificate_id: str | None = None
+    full_strategy_certificate_id: str | None = None
     entry: EntryRule
     exit: ExitPlan
     sizing: PositionSizing
@@ -468,6 +479,14 @@ class StrategyPlan(BaseModel):
             excluded.add("causal_policy_selected_library_entry_id")
         if self.causal_policy_selection_evidence is None:
             excluded.add("causal_policy_selection_evidence")
+        if self.research_profile is None:
+            excluded.add("research_profile")
+        if self.alpha_artifact_fingerprint is None:
+            excluded.add("alpha_artifact_fingerprint")
+        if self.sandbox_admission_certificate_id is None:
+            excluded.add("sandbox_admission_certificate_id")
+        if self.full_strategy_certificate_id is None:
+            excluded.add("full_strategy_certificate_id")
         exit_excluded: dict[str, bool] = {}
         if self.exit.maximum_holding_bars is None:
             exit_excluded["maximum_holding_bars"] = True
@@ -512,6 +531,7 @@ class OrderIntent(BaseModel):
     plan_fingerprint: str
     symbol: str
     side: OrderSide
+    position_side: PositionSide | None = None
     order_type: OrderType
     quantity: Money
     limit_price: Money | None = None
@@ -525,6 +545,8 @@ class Order(BaseModel):
     plan_id: str
     symbol: str
     side: OrderSide
+    position_side: PositionSide | None = None
+    reduce_only: bool = False
     order_type: OrderType
     status: OrderStatus
     quantity: Money
@@ -564,6 +586,17 @@ class Position(BaseModel):
     liquidation_price: Money | None = None
     margin_mode: str | None = None
     margin_used: Money | None = None
+
+    @field_validator(
+        "quantity", "average_entry", "mark_price", "unrealized_pnl",
+        "stop_loss", "take_profit", "liquidation_price", "margin_used",
+        mode="before",
+    )
+    @classmethod
+    def normalize_money_precision(cls, value):
+        if value is None:
+            return value
+        return Decimal(str(value)).quantize(Decimal("0.00000001"))
 
 
 class PortfolioState(BaseModel):

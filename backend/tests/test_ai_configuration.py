@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -48,7 +48,10 @@ def enable(configuration: AIConfiguration, provider: AIProvider) -> AIConfigurat
 def request(method: str, path: str, json=None):
     async def run():
         transport = ASGITransport(app=api.app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {}
+        async with AsyncClient(
+            transport=transport, base_url="http://test", headers=headers
+        ) as client:
             return await client.request(method, path, json=json)
 
     return asyncio.run(run())
@@ -158,3 +161,53 @@ def test_ai_usage_report_aggregates_cache_reasoning_and_cost(tmp_path, monkeypat
     assert response.status_code == 200
     assert response.json()["summary"]["request_count"] == 1
     assert response.json()["recent"][0]["reasoning_effort"] == "high"
+
+
+def test_operation_quality_blocks_bad_latest_sample_and_recovers_on_success(tmp_path):
+    service = AIConfigurationService(SqliteStore(tmp_path / "cosmos.db"), MemorySecrets())
+    baseline = datetime.now(UTC) - timedelta(minutes=5)
+    for index in range(5):
+        succeeded = index == 0
+        service.record_usage(
+            AIUsageEvent(
+                provider=AIProvider.DEEPSEEK,
+                model="deepseek-v4-flash",
+                operation="agent_decision",
+                succeeded=succeeded,
+                error_code=None if succeeded else "invalid_response",
+                usage=AIUsage(),
+                latency_ms=100 + index,
+                created_at=baseline + timedelta(seconds=index),
+            )
+        )
+
+    blocked = service.operation_quality(
+        provider=AIProvider.DEEPSEEK,
+        operation="agent_decision",
+    )
+
+    assert blocked["request_count"] == 5
+    assert blocked["success_rate"] == pytest.approx(0.2)
+    assert blocked["invalid_response_count"] == 4
+    assert blocked["automatic_allowed"] is False
+    assert blocked["status"] == "quality_blocked"
+
+    service.record_usage(
+        AIUsageEvent(
+            provider=AIProvider.DEEPSEEK,
+            model="deepseek-v4-flash",
+            operation="agent_decision",
+            succeeded=True,
+            usage=AIUsage(),
+            latency_ms=90,
+            created_at=datetime.now(UTC),
+        )
+    )
+    recovered = service.operation_quality(
+        provider=AIProvider.DEEPSEEK,
+        operation="agent_decision",
+    )
+
+    assert recovered["automatic_allowed"] is True
+    assert recovered["status"] == "probe_allowed"
+    assert recovered["latest_succeeded"] is True

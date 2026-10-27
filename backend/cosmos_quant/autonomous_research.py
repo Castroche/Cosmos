@@ -8,11 +8,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .backtest import run_canonical_ir_exact_replay
 from .build_identity import RuntimeBuildIdentity
@@ -40,7 +40,11 @@ from .research_integrity import (
     TrialResult,
     moving_block_expected_r,
 )
-from .strategy_backends import NumpyFastVectorBackend, assert_backend_intent_parity
+from .strategy_backends import (
+    NumpyFastVectorBackend,
+    StrategyIntentSeries,
+    assert_backend_intent_parity,
+)
 from .strategy_dsl import (
     CanonicalStrategyIR,
     ResearchHypothesisV2,
@@ -203,6 +207,32 @@ class AutonomousResearchRunRequest(BaseModel):
     maximum_spread_bps: Decimal = Field(default=Decimal("20"), ge=0)
     liquidity_passed: bool | None = None
     portfolio_evidence: dict[str, str] | None = None
+    research_profile: Literal["crypto_5m_v1"] | None = None
+    horizons: tuple[Literal[3], Literal[6], Literal[12]] = (3, 6, 12)
+    model_artifact_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def enforce_crypto_5m_contract(self):
+        if self.research_profile != "crypto_5m_v1":
+            return self
+        required = {
+            "trend",
+            "volatility",
+            "liquidity",
+            "funding",
+            "open_interest",
+            "basis",
+            "order_flow",
+        }
+        if self.snapshot.timeframe_seconds != 300:
+            raise ValueError("crypto_5m_v1 requires a 5m feature snapshot")
+        if set(self.dsl.regime_gates) != required:
+            raise ValueError("crypto_5m_v1 requires all seven explicit regime gates")
+        if self.dsl.risk.maximum_holding_bars not in self.horizons:
+            raise ValueError("holding period must be one of the frozen 3/6/12 bar horizons")
+        if len(self.model_artifact_ids) < 3:
+            raise ValueError("linear, LightGBM, and ensemble artifact references are required")
+        return self
 
 
 class ResearchRunResult(BaseModel, frozen=True):
@@ -269,8 +299,15 @@ def _artifact(
         slippage_model_version="existing-exact-engine-v1",
         slippage_parameters_fingerprint=cost_parameters_fingerprint,
         compiler_version="strategy-dsl-v2",
-        purge_bars=max(node.warmup for node in ir.nodes),
-        embargo_bars=max(1, ir.maximum_holding_bars),
+        purge_bars=max(
+            12 if request.research_profile == "crypto_5m_v1" else 1,
+            *(node.warmup for node in ir.nodes),
+        ),
+        embargo_bars=(
+            12
+            if request.research_profile == "crypto_5m_v1"
+            else max(1, ir.maximum_holding_bars)
+        ),
         validation_config_fingerprint=request.validation_config_fingerprint,
         git_commit_sha=build_identity.git_commit_sha,
         source_tree_hash=build_identity.source_tree_hash,
@@ -329,6 +366,63 @@ def _purged_oof_evidence(
         return False, Decimal("1")
     negative_ratio = Decimal(sum(value <= 0 for value in fold_means)) / Decimal(len(fold_means))
     return sum(value > 0 for value in fold_means) >= 3, negative_ratio
+
+
+def _crypto_pre_return_cost_turnover_gate(
+    intent: StrategyIntentSeries,
+    features: dict[str, np.ndarray],
+    *,
+    timeframe_seconds: int,
+    market_count: int,
+    transaction_cost_bps: Decimal,
+) -> tuple[list[str], dict[str, str]]:
+    """Reject structurally expensive 5m candidates before any return is read."""
+
+    positions = np.asarray(intent.position_intent, dtype=np.int8)
+    previous = np.roll(positions, 1)
+    if previous.size:
+        previous[0] = 0
+    entries = (positions != 0) & ((previous == 0) | (np.sign(previous) != np.sign(positions)))
+    observation_days = max(
+        Decimal(str(len(positions) * timeframe_seconds)) / Decimal("86400"),
+        Decimal("0.000001"),
+    )
+    entries_per_symbol_day = Decimal(int(np.count_nonzero(entries))) / observation_days
+    portfolio_entries_day = entries_per_symbol_day * Decimal(max(1, market_count))
+
+    close = np.asarray(features.get("close", []), dtype=np.float64)
+    stops = np.asarray(intent.stop_distance, dtype=np.float64)
+    usable = (
+        np.isfinite(close)
+        & np.isfinite(stops)
+        & (close > 0)
+        & (np.abs(stops) > 0)
+    )
+    if np.any(usable):
+        median_stop_fraction = Decimal(str(float(np.median(np.abs(stops[usable]) / close[usable]))))
+    else:
+        median_stop_fraction = Decimal("0")
+    round_trip_fraction = transaction_cost_bps * Decimal("2") / Decimal("10000")
+    round_trip_cost_r = (
+        round_trip_fraction / median_stop_fraction
+        if median_stop_fraction > 0
+        else Decimal("Infinity")
+    )
+
+    reasons: list[str] = []
+    if round_trip_cost_r > Decimal("0.25"):
+        reasons.append("round_trip_cost_above_0_25r")
+    if entries_per_symbol_day > Decimal("2"):
+        reasons.append("symbol_turnover_above_two_per_day")
+    if portfolio_entries_day > Decimal("6"):
+        reasons.append("portfolio_turnover_above_six_per_day")
+    evidence = {
+        "estimated_round_trip_cost_r": str(round_trip_cost_r),
+        "estimated_entries_per_symbol_day": str(entries_per_symbol_day),
+        "estimated_portfolio_entries_day": str(portfolio_entries_day),
+        "return_data_accessed": "false",
+    }
+    return reasons, evidence
 
 
 class FastGateEngine:
@@ -603,6 +697,32 @@ class FastGateEngine:
                 },
             )
 
+            if request.research_profile == "crypto_5m_v1":
+                structural_reasons, structural_evidence = _crypto_pre_return_cost_turnover_gate(
+                    intent,
+                    features,
+                    timeframe_seconds=request.snapshot.timeframe_seconds,
+                    market_count=len(set(request.snapshot.market_scope)),
+                    transaction_cost_bps=request.transaction_cost_bps,
+                )
+                CostScenarioCache(self.store).put(
+                    artifact.fingerprint,
+                    {"pre_return_gate": structural_evidence},
+                )
+                evidence.append(
+                    "pre-return-cost-turnover:"
+                    + json.dumps(structural_evidence, sort_keys=True, separators=(",", ":"))
+                )
+                if structural_reasons:
+                    return self._commit(
+                        run_id=run_id,
+                        disposition=ResearchDisposition.REJECTED,
+                        reasons=structural_reasons,
+                        evidence=evidence,
+                        deadline=budget,
+                        artifact=artifact,
+                    )
+
             # This atomic reservation is the last operation before reading close
             # returns and strategy PnL below.
             empirical_budget = self.store.consume_autonomous_research_budget(
@@ -664,8 +784,15 @@ class FastGateEngine:
             budget.checkpoint(FastGateStage.PURGED_OOF)
             oof_passed, pbo_upper_bound = _purged_oof_evidence(
                 net,
-                purge_bars=max(node.warmup for node in ir.nodes),
-                embargo_bars=ir.maximum_holding_bars,
+                purge_bars=max(
+                    12 if request.research_profile == "crypto_5m_v1" else 1,
+                    *(node.warmup for node in ir.nodes),
+                ),
+                embargo_bars=(
+                    12
+                    if request.research_profile == "crypto_5m_v1"
+                    else ir.maximum_holding_bars
+                ),
             )
             exact_budget = self.store.consume_autonomous_research_budget(
                 research_event_id=request.research_event_id,
@@ -723,13 +850,18 @@ class FastGateEngine:
             fdr.record_result(family_allocation, p_value=p_value)
             online_alpha = min(global_allocation.alpha, family_allocation.alpha)
             deflated_sharpe_probability = Decimal("1") - p_value
+            pbo_threshold = (
+                Decimal("0.20")
+                if request.research_profile == "crypto_5m_v1"
+                else Decimal("0.25")
+            )
             stressed_net = np.roll(intent.position_intent, 1) * returns - turnover * cost * 2
             cost_stress_passed = bool(np.nanmean(stressed_net) > 0)
             statistical_passed = bool(
                 expected_r.passed
                 and p_value <= online_alpha
                 and deflated_sharpe_probability >= Decimal("0.90")
-                and pbo_upper_bound <= Decimal("0.25")
+                and pbo_upper_bound <= pbo_threshold
                 and oof_passed
                 and cost_stress_passed
             )
@@ -747,7 +879,7 @@ class FastGateEngine:
             elif not oof_passed:
                 disposition = ResearchDisposition.REJECTED
                 reasons.append("purged_oof_stability_failed")
-            elif pbo_upper_bound > Decimal("0.25"):
+            elif pbo_upper_bound > pbo_threshold:
                 disposition = ResearchDisposition.REJECTED
                 reasons.append("pbo_upper_bound_failed")
             elif not cost_stress_passed:

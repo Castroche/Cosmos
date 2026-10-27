@@ -9,6 +9,16 @@ from pydantic import BaseModel
 from .storage import SqliteStore
 
 
+def sha256_file(path: Path, *, chunk_size: int = 8 * 1024 * 1024) -> str:
+    """Hash large database backups without loading them into memory."""
+
+    digest = sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class BackupResult(BaseModel):
     path: str
     created_at: datetime
@@ -34,7 +44,7 @@ class BackupService:
         # from overwriting one another.
         path = self.directory / f"cosmos-{now.strftime('%Y%m%dT%H%M%S%fZ')}.db"
         self.store.backup_to(path)
-        digest = sha256(path.read_bytes()).hexdigest()
+        digest = sha256_file(path)
         self._prune()
         return BackupResult(
             path=str(path.resolve()),
@@ -61,7 +71,7 @@ class BackupService:
             path=str(path.resolve()),
             created_at=datetime.fromtimestamp(path.stat().st_mtime, tz=UTC),
             size_bytes=path.stat().st_size,
-            sha256=sha256(path.read_bytes()).hexdigest(),
+            sha256=sha256_file(path),
             integrity=self._verify(path),
         )
 

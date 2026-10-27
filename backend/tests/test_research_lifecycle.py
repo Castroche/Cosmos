@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from cosmos_quant import api
 from cosmos_quant.backtest import run_walk_forward_backtest
-from cosmos_quant.configuration import StrategyKind
+from cosmos_quant.configuration import StrategyKind, UserConfiguration
 from cosmos_quant.demo import demo_candles
 from cosmos_quant.research import ResearchDataset
 from cosmos_quant.research_lifecycle import (
@@ -31,6 +31,53 @@ def test_ai_candidate_is_validated_but_never_directly_executable():
     assert candidate.source == "ai"
     assert candidate.status == CandidateStatus.PROPOSED
     assert candidate.backtest is None
+
+
+def test_cost_preflight_rejects_narrow_stop_and_accepts_feasible_stop():
+    configuration = UserConfiguration()
+    summary = {"last_price": "100", "atr_14": "1"}
+    default_spec = default_strategy_spec(StrategyKind.TREND)
+    narrow_spec = default_spec.model_copy(
+        update={
+            "parameters": default_spec.parameters.model_copy(
+                update={"stop_atr": Decimal("0.5")}
+            )
+        }
+    )
+
+    narrow = api.build_candidate_preflight(
+        narrow_spec,
+        origin_summary=summary,
+        configuration=configuration,
+    )
+    feasible = api.build_candidate_preflight(
+        default_spec,
+        origin_summary=summary,
+        configuration=configuration,
+    )
+
+    assert narrow["eligible"] is False
+    assert Decimal(str(narrow["estimated_round_trip_cost_r"])) > Decimal("0.25")
+    assert feasible["eligible"] is True
+
+
+def test_required_derivative_features_are_determined_from_strategy_spec():
+    spec = default_strategy_spec(StrategyKind.MEAN_REVERSION)
+    parameters = spec.parameters.model_copy(
+        update={
+            "entry_model": "funding_contrarian",
+            "open_interest_mode": "confirm_expansion",
+            "order_flow_mode": "confirm_direction",
+        }
+    )
+    raw_spec = spec.model_copy(update={"parameters": parameters}).model_dump(mode="json")
+
+    assert api.strategy_required_features(raw_spec) == [
+        "funding_rate",
+        "ohlcv",
+        "open_interest",
+        "order_flow",
+    ]
 
 
 def test_stale_candidate_fingerprint_is_isolated_instead_of_reinterpreted():

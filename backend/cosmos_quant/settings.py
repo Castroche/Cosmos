@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     cosmos_api_port: int = 8000
     cosmos_cors_origins: str = "http://localhost:5173"
     cosmos_data_dir: Path = Path("data")
+    cosmos_automation_start_paused: bool = False
     exchange_id: str = "okx"
     exchange_sandbox: bool = True
     exchange_api_key: str = ""

@@ -1,13 +1,11 @@
 import { useEffect, useState } from 'react'
-import { commissionAgentPositionManagement, commissionProtection, getAgentForwardPerformance, getAgentState, getRiskState, getSettings, saveSettings, testConnection } from './api'
+import { commissionAgentPositionManagement, commissionProtection, getRiskState, getSettings, saveSettings, testConnection } from './api'
 import { CHART_TIMEFRAMES } from './timeframes'
 import type {
   ConfigurationUpdate,
   ConfigurationView,
   ConnectionTestResult,
   CredentialDraft,
-  AgentControlState,
-  AgentForwardPerformance,
   RiskControlState,
   UserConfiguration,
 } from './types'
@@ -28,26 +26,14 @@ export default function SettingsWorkspace({ view, onSaved }: SettingsWorkspacePr
   const [busy, setBusy] = useState<'save' | 'test' | 'commission' | 'agent-commission' | null>(null)
   const [result, setResult] = useState<ConnectionTestResult | null>(null)
   const [message, setMessage] = useState<string | null>(null)
+  const [messageTone, setMessageTone] = useState<'success' | 'error'>('success')
   const [riskState, setRiskState] = useState<RiskControlState | null>(null)
-  const [agentState, setAgentState] = useState<AgentControlState | null>(null)
-  const [forwardPerformance, setForwardPerformance] = useState<AgentForwardPerformance | null>(null)
-  const [promoteGoalId, setPromoteGoalId] = useState('')
 
   useEffect(() => {
-    void Promise.all([
-      getRiskState(),
-      getAgentState(),
-      getAgentForwardPerformance(),
-    ]).then(([risk, agent, performance]) => {
+    void getRiskState().then(risk => {
       setRiskState(risk)
-      setAgentState(agent)
-      setForwardPerformance(performance)
-      const eligible = agent.goals.find(goal => goal.status === 'active' && goal.autonomy_mode === 'sandbox')
-      setPromoteGoalId(current => current || eligible?.id || '')
     }).catch(() => {
       setRiskState(null)
-      setAgentState(null)
-      setForwardPerformance(null)
     })
   }, [])
 
@@ -104,32 +90,19 @@ export default function SettingsWorkspace({ view, onSaved }: SettingsWorkspacePr
       },
     }))
   }
-  const updateForwardValidation = <K extends keyof UserConfiguration['agent_forward_validation']>(
-    key: K,
-    value: UserConfiguration['agent_forward_validation'][K],
-  ) => {
-    setConfiguration(current => ({
-      ...current,
-      agent_forward_validation: {
-        ...current.agent_forward_validation,
-        [key]: value,
-      },
-    }))
-  }
   const updateCredential = <K extends keyof CredentialDraft>(key: K, value: CredentialDraft[K]) => {
     invalidateConnectionResult()
     setCredentials(current => ({ ...current, [key]: value }))
   }
 
   const payload = (): ConfigurationUpdate => ({
-    configuration,
+    configuration: {
+      ...configuration,
+      automatic_execution_enabled: false,
+      live_trading_enabled: false,
+    },
     credentials,
     live_unlock_phrase: livePhrase || undefined,
-    promote_agent_goal_id: (
-      view.configuration.trading_mode === 'sandbox'
-      && configuration.trading_mode === 'live'
-      && promoteGoalId
-    ) ? promoteGoalId : undefined,
   })
 
   const test = async () => {
@@ -140,6 +113,7 @@ export default function SettingsWorkspace({ view, onSaved }: SettingsWorkspacePr
       setResult(next)
       setRiskState(await getRiskState())
     } catch (error) {
+      setMessageTone('error')
       setResult(null)
       setMessage(error instanceof Error ? error.message : '连接测试失败')
     } finally {
@@ -156,10 +130,10 @@ export default function SettingsWorkspace({ view, onSaved }: SettingsWorkspacePr
       setLivePhrase('')
       setResult(null)
       onSaved(next)
-      setMessage(next.promoted_agent_goal_id
-        ? `实盘 API 已切换；Agent 目标已升级为 ${next.promoted_agent_goal_id}。`
-        : '设置已保存，行情与交易运行时已重新加载。')
+      setMessageTone('success')
+      setMessage('设置已保存。真实资金权限仍需在交易工作台签发 HumanLiveGrant。')
     } catch (error) {
+      setMessageTone('error')
       setMessage(error instanceof Error ? error.message : '保存设置失败')
     } finally {
       setBusy(null)
@@ -174,8 +148,10 @@ export default function SettingsWorkspace({ view, onSaved }: SettingsWorkspacePr
       const result = await commissionProtection(configuration.default_symbol)
       const next = await getSettings()
       onSaved(next)
+      setMessageTone(result.protection_verified && result.cancellation_confirmed ? 'success' : 'error')
       setMessage(result.message)
     } catch (error) {
+      setMessageTone('error')
       setMessage(error instanceof Error ? error.message : '测试网保护单验收失败')
     } finally {
       setBusy(null)
@@ -190,9 +166,11 @@ export default function SettingsWorkspace({ view, onSaved }: SettingsWorkspacePr
       const result = await commissionAgentPositionManagement(configuration.default_symbol)
       const next = await getSettings()
       onSaved(next)
+      setMessageTone(result.agent_reduction_verified && result.agent_exit_verified && result.position_flat_confirmed ? 'success' : 'error')
       setMessage(result.message)
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Agent 仓位管理验收失败')
+      setMessageTone('error')
+      setMessage(error instanceof Error ? error.message : '确定性仓位管理验收失败')
     } finally {
       setBusy(null)
     }
@@ -238,9 +216,6 @@ export default function SettingsWorkspace({ view, onSaved }: SettingsWorkspacePr
   const canSave = configuration.trading_mode === 'paper'
     || Boolean(result?.ok)
     || (commissioningConfigurationIsSaved && !hasUnsavedCredentials)
-  const sandboxGoals = agentState?.goals.filter(
-    goal => goal.status === 'active' && goal.autonomy_mode === 'sandbox',
-  ) ?? []
 
   return (
     <section className="settings-workspace">
@@ -338,24 +313,18 @@ export default function SettingsWorkspace({ view, onSaved }: SettingsWorkspacePr
                     {commissioningPassed && view.commissioning && <small>{view.commissioning.exchange.toUpperCase()} · {view.commissioning.market_type === 'spot' ? '现货' : 'USDT 永续'} · {new Date(view.commissioning.tested_at).toLocaleString()}</small>}
                   </div>
                   {configuration.exchange_id === 'okx' && configuration.market_type === 'swap' && <div className="commissioning-block">
-                    <div><strong>Agent 仓位管理验收</strong><p>真实成交测试仓位，验证部分减仓后的保护单缩量、最终平仓、Algo 单清理与空仓回查。</p></div>
+                    <div><strong>v2 确定性仓位管理验收</strong><p>真实成交测试仓位，验证部分减仓后的保护单缩量、最终平仓、Algo 单清理与空仓回查。</p></div>
                     <span className={agentCommissioningPassed ? 'ready' : ''}>{agentCommissioningPassed ? '已通过' : '未验收'}</span>
                     <button type="button" className="button ghost" onClick={commissionAgent} disabled={busy !== null || !canCommissionAgent} title={riskState?.halted ? '请先稳定通过对账、人工核对账户并解除全局 HALT' : undefined}>{busy === 'agent-commission' ? '正在成交并验收…' : '开始仓位管理验收'}</button>
-                    <small>{riskState?.halted ? `全局 HALT：${riskState.reason}` : '只使用 OKX Demo；未通过前 Agent 的交易所主动减仓与平仓保持锁定。'}</small>
+                    <small>{riskState?.halted ? `全局 HALT：${riskState.reason}` : '只使用 OKX Demo；未通过前 v2 Position Manager 的主动减仓与平仓保持锁定。'}</small>
                   </div>}
                 </>
               )}
 
               {configuration.trading_mode === 'live' && (
-                <div className="live-unlock">
-                  <div><strong>真实资金保护</strong><p>实盘模式需要同时打开开关并输入确认短语。</p></div>
-                  <label className="switch-line"><input type="checkbox" checked={configuration.live_trading_enabled} onChange={event => update('live_trading_enabled', event.target.checked)} /><span>允许真实下单</span></label>
-                  <label><span>确认短语</span><input value={livePhrase} onChange={event => setLivePhrase(event.target.value)} placeholder="I ACCEPT LIVE TRADING RISK" /></label>
-                  {view.configuration.trading_mode === 'sandbox' && <div className={`live-agent-promotion ${sandboxGoals.length > 0 ? 'ready' : 'blocked'}`}>
-                    <div><strong>Agent 实盘连续性</strong><p>实盘资格由每次策略的不可变历史数据、参数前推、胜率、平均盈亏比和成本压力决定，不要求等待固定观察天数。测试网已有 {forwardPerformance?.attributable_episodes ?? 0} 个完整回合，仅作为成交质量诊断。</p></div>
-                    {sandboxGoals.length > 0 && <label><span>同步升级目标</span><select value={promoteGoalId} onChange={event => setPromoteGoalId(event.target.value)}><option value="">不迁移 Agent</option>{sandboxGoals.map(goal => <option key={goal.id} value={goal.id}>{goal.symbols.join(' · ')} / {goal.timeframes.join(' · ')} · {goal.id}</option>)}</select></label>}
-                    <small>仍需通过实盘凭证、原生保护单验收和确认短语；迁移不会放大风险预算。</small>
-                  </div>}
+                <div className="live-grant-notice">
+                  <div><strong>真实凭证仅供授权模式</strong><p>保存 Live 凭证不会解锁真实下单。只有交易工作台中未过期、双重确认且配置指纹一致的 HumanLiveGrant 才能触达 Live API。</p></div>
+                  <label><span>保存凭证确认短语</span><input value={livePhrase} onChange={event => setLivePhrase(event.target.value)} placeholder="I ACCEPT LIVE TRADING RISK" /></label>
                 </div>
               )}
             </div>
@@ -398,16 +367,10 @@ export default function SettingsWorkspace({ view, onSaved }: SettingsWorkspacePr
                 <label><span>最大回撤 %</span><input type="number" min="1" max="80" step="1" value={configuration.strategy.validation.maximum_drawdown_percent} onChange={event => updateValidation('maximum_drawdown_percent', event.target.value)} /></label>
                 <label><span>压力手续费倍数</span><input type="number" min="1" max="5" step="0.1" value={configuration.strategy.validation.stress_fee_multiplier} onChange={event => updateValidation('stress_fee_multiplier', event.target.value)} /></label>
                 <label><span>压力滑点倍数</span><input type="number" min="1" max="10" step="0.5" value={configuration.strategy.validation.stress_slippage_multiplier} onChange={event => updateValidation('stress_slippage_multiplier', event.target.value)} /></label>
-                <label><span>诊断最少完整回合</span><input type="number" min="10" max="10000" step="5" value={configuration.agent_forward_validation.minimum_closed_episodes} onChange={event => updateForwardValidation('minimum_closed_episodes', Number(event.target.value))} /><small>只影响前向绩效诊断是否成熟，不再作为实盘解锁条件</small></label>
-                <label><span>最少独立执行批次</span><input type="number" min="5" max="10000" step="5" value={configuration.agent_forward_validation.minimum_independent_runs} onChange={event => updateForwardValidation('minimum_independent_runs', Number(event.target.value))} /><small>按独立 Agent 执行批次积累因果证据，不使用固定日历天数作为盈利门槛</small></label>
-                <label><span>近期回合窗口</span><input type="number" min="5" max="1000" step="5" value={configuration.agent_forward_validation.minimum_recent_episodes} onChange={event => updateForwardValidation('minimum_recent_episodes', Number(event.target.value))} /></label>
-                <label><span>前向最低 PF</span><input type="number" min="1" max="5" step="0.05" value={configuration.agent_forward_validation.minimum_profit_factor} onChange={event => updateForwardValidation('minimum_profit_factor', event.target.value)} /></label>
-                <label><span>最低单笔期望 R</span><input type="number" min="-1" max="5" step="0.01" value={configuration.agent_forward_validation.minimum_expectancy_r} onChange={event => updateForwardValidation('minimum_expectancy_r', event.target.value)} /></label>
-                <label><span>最大前向回撤 R</span><input type="number" min="0.1" max="100" step="0.5" value={configuration.agent_forward_validation.maximum_drawdown_r} onChange={event => updateForwardValidation('maximum_drawdown_r', event.target.value)} /></label>
-                <label><span>最大连续亏损</span><input type="number" min="1" max="100" step="1" value={configuration.agent_forward_validation.maximum_consecutive_losses} onChange={event => updateForwardValidation('maximum_consecutive_losses', Number(event.target.value))} /></label>
+                <label><span>最大预估往返成本 / R</span><input type="number" min="0.01" max="2" step="0.05" value={configuration.strategy.validation.maximum_estimated_round_trip_cost_r} onChange={event => updateValidation('maximum_estimated_round_trip_cost_r', event.target.value)} /><small>超限候选在完整审核前标记为设计不可行</small></label>
+                <label><span>跨市场最低通过数</span><input type="number" min="1" max="3" step="1" value={configuration.strategy.validation.cross_market_minimum_passes} onChange={event => updateValidation('cross_market_minimum_passes', Number(event.target.value))} /></label>
+                <label><span>审核合约版本</span><input type="number" min="2" max="2" step="1" value={configuration.strategy.validation.review_contract_version} disabled /><small>v1 历史记录保持只读</small></label>
                 <label><span>关注品种（逗号分隔）</span><input value={configuration.strategy.watchlist.join(', ')} onChange={event => updateStrategy('watchlist', event.target.value.split(',').map(item => item.trim()).filter(Boolean))} /></label>
-                <label><span>策略扫描间隔（秒）</span><input type="number" min="2" max="60" value={configuration.strategy_poll_seconds} onChange={event => update('strategy_poll_seconds', Number(event.target.value))} /></label>
-                <label className="switch-line"><input type="checkbox" checked={configuration.automatic_execution_enabled} onChange={event => update('automatic_execution_enabled', event.target.checked)} /><span>入场条件满足后自动执行</span></label>
                 <label className="switch-line"><input type="checkbox" checked={configuration.strategy.automatic_regime_selection} onChange={event => updateStrategy('automatic_regime_selection', event.target.checked)} /><span>按市场状态自动选择策略家族</span></label>
                 <label className="switch-line"><input type="checkbox" checked={configuration.strategy.validation.require_higher_timeframe_confirmation} onChange={event => updateValidation('require_higher_timeframe_confirmation', event.target.checked)} /><span>Sandbox / Live 强制高周期确认</span></label>
               </div>
@@ -419,7 +382,7 @@ export default function SettingsWorkspace({ view, onSaved }: SettingsWorkspacePr
             </div>
           )}
 
-          {message && <div className="settings-result success"><strong>{message}</strong></div>}
+          {message && <div className={`settings-result ${messageTone}`} role={messageTone === 'error' ? 'alert' : 'status'}><strong>{message}</strong></div>}
           <footer className="settings-actions"><span>设置保存在本机，不会上传到第三方服务。</span><button type="button" className="button ghost" onClick={test} disabled={busy !== null}>{busy === 'test' ? '正在连接…' : '测试连接'}</button><button type="button" className="button primary" onClick={save} disabled={busy !== null || !canSave} title={!canSave ? '交易所模式必须先通过连接测试' : undefined}>{busy === 'save' ? '正在保存…' : '保存并应用'}</button></footer>
         </form>
       </div>

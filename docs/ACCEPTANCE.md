@@ -1,5 +1,15 @@
 # COSMOS Quant 交易所验收记录
 
+## 2026-08-30 · Trading Intelligence v2 状态机与全自动 Demo 闭环
+
+- Wake 去重从全局 `condition_id` 修正为 Plan/WaitRuntime 实例级 exactly-once；真实运行中旧 SOL 同名条件已成功唤醒，创建时已经满足的重复 WAIT 被 Logic Validator 明确拒绝。
+- 拒绝后的等待状态不再丢失：有 Thesis 时仅允许一次五分钟重试，第二次失败撤销旧 Thesis；无 Thesis 时一次重试后进入三十分钟 fail-closed 冷却，普通行情不再每分钟调用 LLM。
+- Trader 现接收真实 MarketState Delta、持久化触发事件证据和 Previous WaitPlan；每品种只保留一个 Active Thesis，最大活跃四小时，NO_TRADE 不得残留 Thesis，后继决策会取消旧 Plan/Wait。
+- OKX Demo 恢复为 Quant advisory/counterfactual 模式，可以演练完整 LLM Plan → Wake → RiskAllocation → protected order 链；Live 仍要求健康 Quant 模型、方向一致、TTL 有效且成本后期望为正。现有三份模型因 OOF 指标未超过均匀基线而在 UI 标记为降级。
+- `MANAGE_EXISTING` 已进入确定性持仓管理器；`EXIT` 持久化退出请求并由五秒对账器以幂等 reduce-only 订单收口。原生 TP/SL 保护底线不会被 LLM 放松。
+- 官方事件即使提前入库，也会在风险窗口真正开始时生成一次幂等窗口事件并唤醒决策，不再依赖“首次发现时恰好处于窗口内”。
+- 验收为后端 594 项全通过；前端 TypeScript、Lint、3 项测试及生产构建通过。受管服务运行于 OKX_DEMO，故障预算为 0；当前市场决策仍为 WAIT/NO_TRADE，因此没有人为制造模拟仓位。
+
 ## 2026-08-22 · Binance 历史点时合约宇宙正式闭环
 
 - Arquivo.pt 的 CDX 保存了 2024-01-24 12:26:37 UTC 对 Binance 官方
@@ -265,22 +275,9 @@ PBO 为 6.0%并通过，但 0/31 策略通过完整跨市场稳健门槛，自�
 开仓过滤后，整批耗时 465.2 秒。验收结论是研究闭环和拒绝路径有效，但当前没有
 可宣称稳定盈利或可真实自主开仓的 Champion。
 
-## 2026-07-22 · 持久化交易 Agent 闭环
+## 2026-08-30 · 旧实时链退役
 
-- 已实现持久化目标、事件、运行状态、结构化决策、工具调用、Observation、交易回合与证据记忆；进程重启后可继续处理
-- 定时市场事件、订单/仓位事件与人工事件进入统一 Observe–Reason–Act 循环；动作和工具之间存在后端硬白名单
-- 工具参数向模型暴露 JSON Schema，未知的增仓、减仓与控制工具默认拒绝；调用结果和 Observation 原子落盘并按幂等键重放
-- Agent 计划绑定目标、运行、权限 ID 和权限指纹，必须依次经过真实数据回测、稳健性门槛、实时信号与确定性风险引擎
-- Paper 和 OKX Swap 均实现安全主动减仓/退出；OKX 路径会验证 reduce-only 成交、保护 Algo 缩量/撤销、最终保护状态与账户仓位
-- OKX Demo 对已成交普通订单或已终结附加 Algo 偶发返回 `51603 Order does not exist`；适配器会从 7 日订单历史恢复普通订单，并以待处理 OCO/conditional 列表确认 Algo 是否仍活跃，不能确认时仍保持 fail closed
-- 交易所订单与私有成交的数量、价格和手续费在进入领域模型前统一量化到 8 位小数，兼容 OKX 返回 9 位以上手续费精度，同时保留确定性舍入
-- 平仓复盘只使用可归因的私有成交，计算净收益、费用与 R 倍数；新生成的 Episode 记忆已由自动化测试证明会进入后续决策上下文
-- 新增 `GET /api/agent/readiness`，统一检查 AI、执行网关、仓位管理、风险闸、入场授权、活动目标和不确定回合
-- 交易所模式在 Agent 仓位管理 commissioning 通过前，开仓、主动减仓和退出均保持后端硬锁定
-
-本机真实页面只读验收显示当前 OKX Sandbox 自主交易就绪度为 `3/7`：DeepSeek 推理、执行网关、无待对账回合已通过；Agent 仓位管理 commissioning、全局风险闸、sandbox 入场授权和活动目标尚未通过。桌面与 390×844 窄屏布局均可读。验收未点击 commissioning、恢复交易或任何下单按钮，没有创建订单。
-
-因此，代码和 Paper 闭环已具备真正交易 Agent 的结构与安全边界，但当前 OKX Demo 账户尚不能宣称“自主交易已验收完成”。完成条件仍是：操作者先确认账户无仓位和挂单、人工恢复全局 HALT、明确触发 Agent 仓位管理验收，再建立低额度 sandbox 权限与活动目标。
+旧定时 Agent 的调度、工具执行、WebSocket、写接口与旧 Live 授权均已删除；旧路径返回 404。历史 episode/order/position 仅作为只读证据保留，实时验收统一迁移到 Trading Intelligence v2 与 OKX_DEMO。
 
 ## 2026-07-19 · 专业策略研究架构升级
 

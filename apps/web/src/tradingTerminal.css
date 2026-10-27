@@ -1,0 +1,170 @@
+/* The existing COSMOS palette, reorganized as a multi-market trading terminal. */
+.ti-terminal { padding: 0; background: #080d12; }
+.ti-terminal [hidden] { display: none !important; }
+.ti-terminal .ti-header { min-height: 76px; padding: 17px 22px; align-items: center; gap: 16px; }
+.ti-terminal .ti-header h1 { display: flex; align-items: center; gap: 10px; margin: 5px 0 0; font-size: 20px; }
+.ti-terminal .ti-header > div:first-child > span { font-size: 10px; }
+.ti-terminal-tag { padding: 3px 5px; border: 1px solid #2b5561; color: var(--ti-accent); font: 9px var(--mono); letter-spacing: .07em; }
+.ti-account-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); min-height: 82px; border-bottom: 1px solid #21303a; }
+.ti-account-strip > div, .ti-account-strip > button { display: grid; align-content: center; gap: 8px; padding: 12px 22px; border: 0; border-right: 1px solid #17242d; background: transparent; text-align: left; }
+.ti-account-strip > button { cursor: pointer; transition: background .18s; }
+.ti-account-strip > button:hover { background: #102029; }
+.ti-account-strip span { color: #82949d; font-size: 11px; }
+.ti-account-strip strong { color: #d9e3ea; font: 21px var(--mono); }
+.ti-account-strip small { color: #82949d; font: 11px var(--mono); }
+.ti-terminal .ti-runtime { grid-template-columns: 1.3fr 1fr 1fr auto; }
+.ti-terminal .ti-runtime > div { min-height: 68px; padding: 10px 18px; }
+.ti-terminal .ti-runtime span { font-size: 9px; }
+.ti-terminal .ti-runtime small { font-size: 10px; }
+.ti-terminal .ti-runtime strong { font-size: 12px; }
+.ti-terminal-grid { display: grid; grid-template-columns: minmax(0, 1fr) 330px; align-items: stretch; }
+.ti-terminal-center { min-width: 0; }
+.ti-terminal-inspector { min-width: 0; border-left: 1px solid #21303a; background: #0a1117; }
+.ti-terminal .ti-chart-plane { padding: 0; }
+.ti-terminal .ti-chart-plane > header { min-height: 61px; padding: 12px 17px; align-items: center; border-bottom: 1px solid #17242d; }
+.ti-terminal .ti-chart-plane > header h2 { margin: 4px 0 0; font-size: 15px; }
+.ti-terminal .ti-chart-plane > header span { font-size: 9px; }
+.ti-terminal .ti-chart-status { gap: 10px; }
+.ti-terminal .ti-stream-state { font-size: 10px !important; white-space: nowrap; }
+.ti-terminal .ti-live-chart { min-height: 440px; border: 0; }
+.ti-terminal .ti-live-chart .chart-workbench { min-height: 440px; }
+.ti-terminal .ti-live-chart .chart-stage { min-height: 390px; height: clamp(390px, 48vh, 650px); }
+.ti-terminal .ti-live-chart .chart-commandbar { min-height: 44px; padding-inline: 8px; gap: 6px; }
+.ti-terminal .ti-live-chart .timeframes button, .ti-terminal .ti-live-chart .command-button { font-size: 11px; height: 29px; }
+.ti-terminal .ti-live-chart .command-button { flex-shrink: 0; white-space: nowrap; }
+.ti-watchlist-heading { display: flex; align-items: center; justify-content: space-between; min-height: 45px; padding: 12px 16px; border-bottom: 1px solid #21303a; }
+.ti-watchlist-heading strong { font-size: 12px; font-weight: 500; }
+.ti-watchlist-heading > span { color: #66808e; font: 9px var(--mono); }
+.ti-watchlist button { display: grid; grid-template-columns: 28px 1fr auto; align-items: center; width: 100%; gap: 10px; padding: 13px 14px; border: 0; border-bottom: 1px solid #17242d; border-left: 2px solid transparent; border-radius: 0; background: transparent; cursor: pointer; text-align: left; transition: background .15s, border-color .15s; }
+.ti-watchlist button.active { background: #10212a; border-left-color: var(--ti-accent); }
+.ti-watchlist button:hover { background: #102029; }
+.ti-asset-letter { width: 27px; height: 27px; display: grid; place-items: center; color: #a5dce4; border: 1px solid #2b4551; border-radius: 50%; font: 13px var(--mono); }
+.ti-watchlist button > span:not(:first-child) { display: grid; gap: 6px; }
+.ti-watchlist button > span:last-child { text-align: right; }
+.ti-watchlist strong { display: flex; gap: 6px; align-items: center; font: 12px var(--mono); }
+.ti-watchlist button > span:last-child strong { justify-content: flex-end; }
+.ti-watchlist small { color: #82949d; font: 9px var(--mono); }
+.ti-terminal .ti-thesis-plane { padding: 20px 16px; border-left: 0; border-bottom: 1px solid #21303a; }
+.ti-terminal .ti-thesis-plane .ti-section-heading h2 { font-size: 15px; }
+.ti-terminal .ti-thesis-statement { min-height: 0; margin: 10px 0 18px; font-size: 13px; line-height: 1.8; }
+.ti-terminal .ti-invalidation { padding: 10px 0; }
+.ti-terminal .ti-invalidation p { font-size: 11px; }
+.ti-terminal .ti-plan-block { padding-top: 15px; }
+.ti-terminal .ti-plan-block h3 { font-size: 14px; line-height: 1.5; }
+.ti-terminal .ti-plan-block > small { display: block; margin-top: 12px; font-size: 11px; line-height: 1.7; }
+.ti-terminal .ti-plan-levels { flex-wrap: wrap; gap: 14px; }
+.ti-terminal .ti-wakes > div { grid-template-columns: 14px minmax(0, 1fr); }
+.ti-terminal .ti-wakes strong { grid-column: 2; margin-bottom: 8px; overflow-wrap: anywhere; }
+.ti-terminal .ti-wakes span { overflow-wrap: anywhere; }
+.ti-inspector-quant { padding: 18px 16px; }
+.ti-inspector-quant header { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; font-size: 12px; }
+.ti-inspector-quant header svg { width: 14px; color: var(--ti-accent); }
+.ti-inspector-quant header > span { margin-left: auto; color: #82949d; font-size: 10px; }
+.ti-inspector-quant > div { display: flex; justify-content: space-between; margin: 12px 0; font: 11px var(--mono); }
+.ti-inspector-quant > div > span, .ti-inspector-quant > small { color: #82949d; font-size: 11px; line-height: 1.8; }
+.ti-workbench-tabs { display: flex; min-height: 46px; padding: 0 15px; gap: 20px; overflow-x: auto; border-bottom: 1px solid #21303a; background: #0a1117; }
+.ti-workbench-tabs button { display: flex; align-items: center; gap: 6px; padding: 0 2px; border: 0; border-radius: 0; border-bottom: 2px solid transparent; background: transparent; color: #82949d; font-size: 12px; white-space: nowrap; cursor: pointer; transition: color .16s, border-color .16s; }
+.ti-workbench-tabs button.active { border-color: var(--ti-accent); color: #c9e8ec; }
+.ti-workbench-tabs button:hover { color: #c9e8ec; }
+.ti-workbench-tabs b { padding: 1px 5px; background: #182731; color: #9ab0ba; font: 10px var(--mono); }
+.ti-terminal .ti-primary-grid, .ti-terminal .ti-lower-grid { display: block; }
+.ti-terminal .ti-market-plane, .ti-terminal .ti-ledger, .ti-terminal .ti-grant, .ti-terminal .ti-plan-register { padding: 20px; border-left: 0; }
+.ti-terminal .ti-flow { border-top: 1px solid #21303a; }
+.ti-terminal .ti-flow > div { min-height: 63px; padding: 12px; }
+.ti-terminal .ti-flow span { font-size: 10px; }
+.ti-terminal .ti-flow strong { font-size: 11px; }
+.ti-positions-plane, .ti-learning-plane { min-height: 225px; animation: surfaceIn .2s ease both; }
+.ti-learning-heading { min-height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 14px 18px; }
+.ti-learning-heading > div { display: flex; align-items: center; gap: 8px; }
+.ti-learning-heading svg { width: 15px; color: #82949d; }
+.ti-learning-heading strong { font-size: 12px; font-weight: 500; }
+.ti-learning-heading span, .ti-learning-heading small { color: #82949d; font-size: 10px; }
+.ti-table-scroll { overflow-x: auto; }
+.ti-position-table { width: 100%; border-collapse: collapse; text-align: right; white-space: nowrap; font: 11px var(--mono); }
+.ti-position-table th { color: #82949d; font-size: 10px; font-weight: 400; background: #0a1117; }
+.ti-position-table th, .ti-position-table td { padding: 13px 14px; border-bottom: 1px solid #17242d; }
+.ti-position-table th:first-child, .ti-position-table td:first-child { text-align: left; }
+.ti-position-table button { display: flex; align-items: center; gap: 8px; padding: 0; border: 0; color: #d9e3ea; background: transparent; cursor: pointer; }
+.ti-position-table button svg { width: 12px; color: var(--ti-accent); }
+.ti-position-table tr:hover td { background: #0d181e; }
+.ti-account-entries { --ti-accent: #8dd9e5; }
+.ti-position-table td > small, .ti-entry-table details small { display: block; margin-top: 6px; color: #82949d; font-size: 10px; line-height: 1.6; }
+.ti-entry-table .ti-entry-reason { min-width: 200px; max-width: 320px; white-space: normal; overflow-wrap: anywhere; }
+.ti-entry-table details { max-width: 260px; white-space: normal; overflow-wrap: anywhere; }
+.ti-entry-table summary { cursor: pointer; }
+.ti-entry-table .ti-entry-status.uncertain, .ti-entry-table .ti-entry-status.cancel_pending { color: #e8a94b; }
+.ti-entry-table .ti-entry-status.rejected { color: #ef5b68; }
+.ti-entry-table .ti-entry-status.filled, .ti-entry-table .ti-entry-status.partially_filled { color: #19b394; }
+.ti-wait-list article { padding: 16px 18px; border-top: 1px solid #21303a; }
+.ti-wait-list header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.ti-wait-list button { display: flex; align-items: center; gap: 6px; border: 0; background: transparent; color: #d9e3ea; cursor: pointer; }
+.ti-wait-list button svg { width: 12px; color: var(--ti-accent); }
+.ti-wait-list small { color: #82949d; font-size: 10px; }
+.ti-wait-list p, .ti-wait-list li { color: #aabac3; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.ti-wait-list ul { padding-left: 18px; margin-bottom: 0; }
+.ti-wait-list li strong { margin-left: 12px; color: #c9e8ec; font-weight: 400; }
+.ti-operations-empty { display: grid; justify-items: center; align-content: center; min-height: 165px; gap: 12px; padding: 24px; text-align: center; }
+.ti-operations-empty svg { width: 22px; color: #66808e; }
+.ti-operations-empty strong { color: #aabac3; font-size: 13px; font-weight: 400; }
+.ti-operations-empty span { max-width: 560px; color: #82949d; font-size: 11px; line-height: 1.7; }
+.ti-learning-note { margin: 0; padding: 0 18px 14px; color: #82949d; font-size: 11px; line-height: 1.8; }
+.ti-learning-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(290px, 100%), 1fr)); }
+.ti-learning-groups article { padding: 16px 18px; border-top: 1px solid #21303a; border-right: 1px solid #17242d; }
+.ti-learning-groups article header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.ti-learning-groups header strong { font: 13px var(--mono); }
+.ti-learning-groups header b { margin-left: 8px; font-size: 10px; }
+.ti-learning-groups header span { color: #82949d; font: 9px var(--mono); }
+.ti-learning-groups dl { display: grid; grid-template-columns: repeat(3, 1fr); margin: 18px 0; }
+.ti-learning-groups dt { color: #82949d; font-size: 10px; }
+.ti-learning-groups dd { margin: 8px 0 0; font: 15px var(--mono); }
+.ti-learning-groups article p { color: #aabac3; font-size: 11px; line-height: 1.8; }
+.ti-learning-tape { display: flex; gap: 1px; overflow-x: auto; border-top: 1px solid #21303a; }
+.ti-learning-tape > span { display: grid; min-width: 140px; gap: 8px; padding: 14px 18px; font: 10px var(--mono); border-right: 1px solid #17242d; }
+.ti-learning-tape small { color: #82949d; }
+@media (min-width: 1800px) { .ti-terminal-grid { grid-template-columns: minmax(0, 1fr) 380px; } }
+@media (max-width: 1200px) {
+  .ti-terminal-grid { grid-template-columns: minmax(0, 1fr) 290px; }
+  .ti-account-strip > div, .ti-account-strip > button { padding-inline: 14px; }
+  .ti-account-strip strong { font-size: 18px; }
+  .ti-learning-heading > div > span { display: none; }
+  .ti-terminal .ti-chart-status > button { font-size: 10px; }
+  .ti-terminal .ti-runtime { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 950px) {
+  .ti-terminal-grid { grid-template-columns: minmax(0, 1fr); }
+  .ti-terminal-inspector { display: grid; grid-template-columns: 1fr 1fr; border-left: 0; border-top: 1px solid #21303a; }
+  .ti-watchlist-heading, .ti-watchlist { grid-column: 1 / -1; }
+  .ti-watchlist { display: grid; grid-template-columns: repeat(3, 1fr); }
+  .ti-watchlist button { grid-template-columns: 1fr; gap: 8px; }
+  .ti-watchlist .ti-asset-letter { display: none; }
+  .ti-watchlist button > span:last-child { text-align: left; }
+  .ti-watchlist button > span:last-child strong { justify-content: flex-start; }
+}
+@media (max-width: 600px) {
+  .ti-terminal .ti-live-chart .chart-watermark { left: 12px; top: 14px; }
+  .ti-terminal .ti-live-chart .chart-watermark strong { font-size: 12px; }
+  .ti-terminal .ti-live-chart .chart-watermark span { display: none; }
+  .ti-terminal .ti-live-chart .chart-indicator-legend { top: 35px; font-size: 10px; }
+  .ti-terminal .ti-header { display: grid; padding: 16px; }
+  .ti-terminal .ti-header-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .ti-terminal .ti-header-actions > span { font-size: 10px; }
+  .ti-account-strip { grid-template-columns: repeat(3, 1fr); }
+  .ti-account-strip > div, .ti-account-strip > button { min-height: 75px; border-bottom: 1px solid #17242d; padding: 12px; }
+  .ti-account-strip strong { font-size: 16px; }
+  .ti-account-strip small { font-size: 9px; }
+  .ti-terminal .ti-runtime { grid-template-columns: 1fr; }
+  .ti-terminal .ti-runtime > div { min-height: 56px; }
+  .ti-terminal .ti-runtime > div:nth-child(2), .ti-terminal .ti-runtime > div:nth-child(3) { display: none; }
+  .ti-terminal .ti-chart-plane > header { display: flex; flex-wrap: wrap; gap: 10px; }
+  .ti-terminal .ti-live-chart .chart-stage { min-height: 340px; height: 340px; }
+  .ti-terminal .ti-live-chart, .ti-terminal .ti-live-chart .chart-workbench { min-height: 390px; }
+  .ti-terminal-inspector { grid-template-columns: 1fr; }
+  .ti-terminal .ti-ledger summary { grid-template-columns: 1fr auto; }
+  .ti-terminal .ti-feature-list { grid-template-columns: 1fr; }
+  .ti-terminal .ti-quant-line { grid-template-columns: 1fr 1fr; }
+  .ti-terminal .ti-quant-line > span { grid-column: 1 / -1; }
+  .ti-learning-heading { align-items: flex-start; flex-direction: column; gap: 8px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ti-terminal, .ti-terminal *, .ti-terminal *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}

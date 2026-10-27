@@ -1,3 +1,8 @@
+# Keep acceptance artifacts, while allowing the exclusions below to take precedence.
+output/*
+!output/acceptance/
+!output/acceptance/**
+
 .venv/
 __pycache__/
 *.py[cod]
@@ -42,7 +47,5 @@ data/
 *.der
 id_rsa*
 id_ed25519*
-output/*
-!output/acceptance/
-!output/acceptance/**
-output/acceptance/*.log
+# Empty local shell artifact.
+/=

@@ -70,261 +70,6 @@ export type Plan = {
   approved_fingerprint?: string
 }
 
-export type AgentAutonomyMode = 'observe' | 'research' | 'paper' | 'sandbox' | 'live_capped'
-
-export type AgentPolicy = {
-  id: string
-  autonomy_mode: AgentAutonomyMode
-  allowed_symbols: string[]
-  allowed_timeframes: string[]
-  max_risk_per_trade: string
-  max_daily_drawdown: string
-  max_open_positions: number
-  max_trades_per_day: number
-  max_leverage: string
-  require_native_protection: boolean
-  allow_agent_entry: boolean
-  allow_agent_cancel_entry: boolean
-  allow_agent_reduce: boolean
-  allow_agent_exit: boolean
-  allow_agent_halt: boolean
-  fingerprint: string
-}
-
-export type AgentGoal = {
-  id: string
-  objective: string
-  symbols: string[]
-  timeframes: string[]
-  autonomy_mode: AgentAutonomyMode
-  risk_policy_id: string
-  poll_seconds: number
-  status: 'active' | 'paused' | 'completed' | 'archived'
-  valid_until?: string
-  created_at: string
-  updated_at: string
-}
-
-export type AgentRun = {
-  id: string
-  goal_id: string
-  trigger_event_id: string
-  status: 'running' | 'waiting' | 'completed' | 'failed' | 'halted'
-  step_count: number
-  max_steps: number
-  last_error: string
-  created_at: string
-  updated_at: string
-  completed_at?: string
-}
-
-export type AgentDecision = {
-  id: string
-  run_id: string
-  action: 'observe' | 'analyze' | 'research' | 'backtest' | 'propose_entry' | 'execute_entry' | 'wait' | 'cancel_entry' | 'reduce_position' | 'exit_position' | 'halt' | 'review'
-  reason: string
-  evidence: string[]
-  uncertainty: string
-  tool_call?: {
-    id: string
-    name: string
-    arguments: Record<string, unknown>
-  } | null
-  expected_outcome: string
-  abort_conditions: string[]
-  created_at: string
-}
-
-export type AgentObservation = {
-  id: string
-  run_id: string
-  kind: string
-  ok: boolean
-  summary: string
-  data: Record<string, unknown>
-  tool_call_id?: string | null
-  created_at: string
-}
-
-export type AgentRunTrace = {
-  run: AgentRun
-  decisions: AgentDecision[]
-  observations: AgentObservation[]
-}
-
-export type TradeEpisode = {
-  id: string
-  goal_id: string
-  policy_id?: string
-  run_id: string
-  plan_id: string
-  symbol: string
-  side: string
-  status: 'reserved' | 'pending_entry' | 'open' | 'awaiting_review' | 'closed' | 'canceled' | 'uncertain'
-  entry_order_ids: string[]
-  exit_order_ids: string[]
-  exit_client_order_ids: string[]
-  planned_risk: string
-  realized_pnl?: string
-  fees: string
-  return_on_risk?: string
-  summary: string
-  opened_at: string
-  closed_at?: string
-}
-
-export type AgentEpisodeRuntime = {
-  episode_id: string
-  plan_id: string
-  symbol: string
-  plan_status?: string | null
-  leverage?: string | null
-  entry_quantity: string
-  average_entry?: string | null
-  entry_fees: string
-  stop_loss?: string | null
-  take_profits: Array<{
-    price: string
-    close_fraction: string
-    rationale?: string
-  }>
-  native_protection_status: 'verified' | 'uncertain' | 'not_applicable'
-  protected_order_ids: string[]
-  last_reconciled_at?: string | null
-}
-
-export type AgentMemory = {
-  id: string
-  memory_type: 'episodic' | 'strategy' | 'operational'
-  content: string
-  tags: string[]
-  confidence: string
-  evidence_refs: string[]
-  created_at: string
-}
-
-export type AgentControlState = {
-  goals: AgentGoal[]
-  policies: AgentPolicy[]
-  runs: AgentRun[]
-  episodes: TradeEpisode[]
-  episode_runtime: AgentEpisodeRuntime[]
-  memories: AgentMemory[]
-  shadow_trials: ShadowValidationTrial[]
-  shadow_calibration: ShadowCalibrationSummary
-  market_coverage: AgentMarketCoverage[]
-  risk_state: RiskControlState
-}
-
-export type AgentMarketCoverage = {
-  event_id: string
-  goal_id: string
-  symbol: string
-  timeframe: string
-  event_status: string
-  event_created_at: string
-  event_processed_at?: string | null
-  dedupe_key: string
-  attempt_count: number
-  last_run_id?: string | null
-  last_run_status?: string | null
-  last_run_steps: number
-  last_run_error: string
-  retry_recovered: boolean
-  next_scheduled_at: string
-  coverage_status: 'healthy' | 'running' | 'queued' | 'degraded' | 'paused'
-}
-
-export type AgentStrategySummary = {
-  plan_id: string
-  name: string
-  symbol: string
-  timeframe: string
-  family: string
-  status: string
-  source: string
-  fingerprint: string
-  updated_at: string
-}
-
-export type AgentMarketSense = {
-  symbol: string
-  timeframe: string
-  status: string
-  last_event_at?: string | null
-  next_scan_at?: string | null
-  last_run_status?: string | null
-}
-
-export type AgentGoalOverview = {
-  goal_id: string
-  objective: string
-  status: string
-  autonomy_mode: string
-  symbols: string[]
-  timeframes: string[]
-  runtime_status: 'running' | 'waiting' | 'paused' | 'blocked' | 'offline'
-  last_heartbeat_at?: string | null
-  next_scan_at?: string | null
-  last_action?: string | null
-  last_action_summary?: string | null
-  current_strategy?: AgentStrategySummary | null
-  recently_generated_strategies: AgentStrategySummary[]
-  market_sense: AgentMarketSense[]
-  active_episode_count: number
-  uncertain_episode_count: number
-  blocking_reasons: string[]
-}
-
-export type AgentRuntimeOverview = {
-  generated_at: string
-  active_goal_count: number
-  latest_heartbeat_at?: string | null
-  risk_halted: boolean
-  risk_reason: string
-  goals: AgentGoalOverview[]
-}
-
-export type AgentLaunchRequest = {
-  profile_id: string
-  symbols: string[]
-  timeframes: string[]
-  autonomy_mode: AgentAutonomyMode
-  risk_template: string
-  objective: string
-  poll_seconds: number
-  authorize?: boolean
-  preview_fingerprint?: string
-}
-
-export type AgentLaunchPreview = {
-  profile_id: string
-  grant_fingerprint: string
-  confirmation_required: boolean
-  reuses_goal_id?: string | null
-  mode: AgentAutonomyMode
-  symbols: string[]
-  timeframes: string[]
-  risk_summary: Record<string, string | number | boolean>
-  blocking_reasons: string[]
-}
-
-export type AgentLaunchResult = {
-  profile: {
-    id: string
-    goal_id?: string | null
-    policy_id: string
-    symbols: string[]
-    timeframes: string[]
-    autonomy_mode: AgentAutonomyMode
-    risk_template: string
-    grant_fingerprint: string
-  }
-  goal_id: string
-  reused: boolean
-  status: string
-}
-
 export type StrategyLibraryItem = {
   id: string
   name: string
@@ -336,6 +81,10 @@ export type StrategyLibraryItem = {
   strategy_spec: Record<string, unknown>
   spec_fingerprint: string
   executable: boolean
+  evidence_tier: string
+  executable_environments: string[]
+  evidence_refs: string[]
+  invalidation_reason: string
   hidden: boolean
   can_edit: boolean
   can_archive: boolean
@@ -349,6 +98,198 @@ export type StrategyLibraryItem = {
 export type StrategyLibraryPage = {
   items: StrategyLibraryItem[]
   total: number
+}
+
+export type ReviewJobView = {
+  id: string
+  candidate_id?: string | null
+  candidate_name?: string | null
+  candidate_fingerprint?: string | null
+  review_contract_version: number
+  policy_fingerprint: string
+  origin_scope: Record<string, string>
+  scope_results: ReviewScopeResult[]
+  status: string
+  stage: string
+  evidence_tier: string
+  progress_percent: number
+  report_id?: string | null
+  candidate_count: number
+  selected_strategy_id?: string | null
+  rejection_reasons: string[]
+  evidence_refs: string[]
+  metrics: Record<string, string | number | boolean | null>
+  dataset_id?: string | null
+  attempt_count: number
+  error?: string | null
+  updated_at: string
+}
+
+export type AIHealth = {
+  generated_at: string
+  providers: Record<string, {
+    status: 'ready' | 'degraded' | 'circuit_open'
+    consecutive_failures: number
+    opened_at?: string | null
+    cooldown_until?: string | null
+    last_failure_at?: string | null
+    last_success_at?: string | null
+    last_error_code?: string | null
+    last_error_message: string
+    half_open_attempts: number
+    half_open_in_flight?: boolean
+    deterministic_fallback_available: boolean
+    automatic_agent_decisions_allowed: boolean
+    agent_decision_quality: {
+      operation: string
+      window_days: number
+      sample_size: number
+      request_count: number
+      succeeded_request_count: number
+      failed_request_count: number
+      invalid_response_count: number
+      success_rate?: number | null
+      minimum_success_rate: number
+      median_latency_ms?: number | null
+      p95_latency_ms?: number | null
+      latest_succeeded?: boolean | null
+      latest_at?: string | null
+      cooldown_until?: string | null
+      automatic_allowed: boolean
+      status: 'warming_up' | 'healthy' | 'probe_allowed' | 'quality_blocked'
+      reason: string
+    }
+  }>
+  research_fallback: 'deterministic'
+  review_llm_calls: 0
+  execution_llm_calls: 0
+  pipeline_continues_when_ai_unavailable: boolean
+  role_isolation: {
+    research: 'optional_ai_generation_with_quality_gate'
+    review: 'deterministic_only'
+    trading: 'deterministic_only'
+  }
+}
+
+export type ReviewOverview = {
+  generated_at: string
+  queued: number
+  unreviewed: number
+  running: number
+  blocked: number
+  paper_eligible: number
+  sandbox_canary: number
+  sandbox_mature: number
+  live_capped: number
+  rejected: number
+  legacy: number
+  data_blocked: number
+  jobs: ReviewJobView[]
+  pipeline: Record<string, string | number | boolean>
+}
+
+export type ReviewEvidenceItem = {
+  id: string
+  kind: 'strategy' | 'campaign'
+  name: string
+  status: string
+  evidence_tier: string
+  source: string
+  family: string
+  summary: string
+  reasons: string[]
+  metrics: Record<string, string | number | boolean | null>
+  evidence_refs: string[]
+  technical_details: string
+  review_contract_version: number
+  origin_scope: Record<string, string>
+  scope_results: ReviewScopeResult[]
+  updated_at: string
+}
+
+export type ReviewScopeResult = {
+  symbol: string
+  timeframe: string
+  role: string
+  status: string
+  stage: string
+  dataset_id?: string | null
+  dataset_fingerprint?: string | null
+  metrics: Record<string, string | number | boolean | null>
+  reasons: string[]
+  evidence_refs: string[]
+}
+
+export type Crypto5mDataContract = {
+  id: 'crypto_5m_v1'
+  status: 'READY' | 'NOT_READY' | 'UNTESTABLE'
+  fingerprint: string
+  minimum_days: 730
+  minimum_completeness: string
+  horizons: [3, 6, 12]
+  markets: Array<{
+    market: string
+    status: 'READY' | 'NOT_READY' | 'UNTESTABLE'
+    days: string
+    completeness: string
+    required_feature_coverage: string
+    reasons: string[]
+  }>
+}
+
+export type SandboxAdmissionView = {
+  certificate: {
+    id: string
+    strategy_ir_hash: string
+    artifact_fingerprint: string
+    model_artifact_ids: string[]
+    development_audit_certificate_id: string
+    maximum_risk_per_trade: string
+    issued_at: string
+  }
+  revoked: boolean
+  handoff?: {
+    status: string
+    exchange: 'okx'
+    maximum_risk_per_trade: string
+  } | null
+  progress: {
+    maturity: {
+      completed_episodes: number
+      independent_runs: number
+      recent_episodes: number
+      profit_factor: string
+      expected_r: string
+      maximum_drawdown_r: string
+      maximum_consecutive_losses: number
+      execution_cost_aligned: boolean
+      slippage_aligned: boolean
+      native_protection_aligned: boolean
+    }
+    execution_evidence_count: number
+    aligned_episode_count: number
+  }
+}
+
+export type DevelopmentAuditView = {
+  certificate: {
+    id: string
+    strategy_ir_hash: string
+    artifact_fingerprint: string
+    campaign_id: string
+    market_evaluation_fingerprints: Record<string, string>
+    evidence: {
+      expected_r_bootstrap_lower: string
+      profit_factor: string
+      stress_net_return: string
+      maximum_drawdown_fraction: string
+      pbo_95_upper: string
+      online_fdr_passed: boolean
+      passing_markets: string[]
+    }
+    issued_at: string
+  }
+  revoked: boolean
 }
 
 export type AuditEvent = {
@@ -420,79 +361,6 @@ export type ShadowCalibrationSummary = {
   independent_performance_evidence: boolean
 }
 
-export type AgentReadiness = {
-  ready_for_autonomous_trading: boolean
-  mode: AgentAutonomyMode
-  checks: Array<{
-    code: string
-    passed: boolean
-    message: string
-  }>
-  evaluated_at: string
-}
-
-export type AgentForwardPerformance = {
-  scope_mode: AgentAutonomyMode
-  status: 'collecting' | 'blocked' | 'failed' | 'qualified'
-  qualified_for_live_review: boolean
-  closed_episodes: number
-  attributable_episodes: number
-  independent_runs: number
-  uncertain_episodes: number
-  wins: number
-  losses: number
-  breakeven: number
-  win_rate_percent: string
-  net_pnl: string
-  total_fees: string
-  total_r: string
-  expectancy_r: string
-  recent_episodes: number
-  recent_total_r: string
-  recent_expectancy_r: string
-  profit_factor?: string | null
-  max_drawdown_r: string
-  max_consecutive_losses: number
-  observation_days: string
-  first_episode_at?: string | null
-  last_episode_at?: string | null
-  checks: Array<{
-    code: string
-    passed: boolean
-    current: string
-    requirement: string
-    message: string
-  }>
-  symbol_reports?: Array<{
-    symbol: string
-    status: 'collecting' | 'blocked' | 'failed' | 'qualified'
-    qualified: boolean
-    attributable_episodes: number
-    independent_runs: number
-    wins: number
-    losses: number
-    breakeven: number
-    win_rate_percent: string
-    net_pnl: string
-    total_r: string
-    expectancy_r: string
-    recent_episodes: number
-    recent_expectancy_r: string
-    profit_factor?: string | null
-    max_drawdown_r: string
-    max_consecutive_losses: number
-    observation_days: string
-    checks: Array<{
-      code: string
-      passed: boolean
-      current: string
-      requirement: string
-      message: string
-    }>
-  }>
-  evaluated_at: string
-}
-
 export type RiskControlState = {
   halted: boolean
   reason: string
@@ -525,7 +393,6 @@ export type StrategyMarketFit = {
   summary: string
   direction_matches: boolean
   family_matches: boolean
-  signal: StrategySignal
   assessment: {
     selected_kind: StrategyKind
     confidence: string
@@ -968,6 +835,24 @@ export type StrategyCandidate = {
   dataset_id?: string
   backtest?: BacktestResult
   decision_reasons: string[]
+  research_context?: {
+    generation_contract_version: string
+    exchange: string
+    market_type: string
+    symbol: string
+    timeframe: string
+    entry_profile: string
+    market_as_of?: string | null
+    summary_fingerprint: string
+    fee_bps: string
+    slippage_bps: string
+    risk_fraction: string
+    max_gross_exposure: string
+    max_leverage: string
+    required_features: string[]
+    trial_group: string
+    trial_count: number
+  } | null
 }
 
 export type PromotionDecision = {
@@ -1036,7 +921,6 @@ export type DashboardData = {
       margin_used?: string
     }>
   }
-  plan: Plan | null
   risk: { approved: boolean; checks: RiskCheck[] }
   orders: Array<{
     id: string
@@ -1065,12 +949,9 @@ export type DashboardData = {
     severity: string
     message: string
   }>
-  backtest: BacktestResult
   system: {
     mode: string
-    live_locked: boolean
     data_latency_ms: number
-    strategy_workers: number
     market_data_real: boolean
     exchange: string
     market_quality?: {
@@ -1169,6 +1050,7 @@ export type AIUsageReport = {
     since: string
     until: string
     request_count: number
+    failed_request_count: number
     input_tokens: number
     output_tokens: number
     total_tokens: number
@@ -1190,6 +1072,11 @@ export type AIUsageReport = {
     reasoning_effort?: 'high' | 'max' | null
     prompt_version: string
     schema_version: string
+    succeeded: boolean
+    error_code?: string | null
+    error_detail?: string | null
+    finish_reason?: string | null
+    response_char_count: number
     usage: AIUsage
     latency_ms: number
     created_at: string
@@ -1233,7 +1120,7 @@ export type AIProviderTestResult = {
 }
 
 export type AIProposalResponse = {
-  mode: 'manual' | 'failover' | 'consensus'
+  mode: 'manual' | 'failover' | 'consensus' | 'single_efficient'
   proposals: Array<{
     provider: AIProvider
     model: string
@@ -1241,6 +1128,7 @@ export type AIProposalResponse = {
     usage: AIUsage
     latency_ms: number
     route: AIProvider[]
+    preflight: Record<string, string | number | boolean | string[] | null>
   }>
 }
 
@@ -1267,7 +1155,6 @@ export type UserConfiguration = {
   slippage_bps: string
   live_trading_enabled: boolean
   automatic_execution_enabled: boolean
-  strategy_poll_seconds: number
   risk: {
     risk_per_trade: string
     max_daily_drawdown: string
@@ -1310,6 +1197,9 @@ export type UserConfiguration = {
       stress_fee_multiplier: string
       stress_slippage_multiplier: string
       require_higher_timeframe_confirmation: boolean
+      maximum_estimated_round_trip_cost_r: string
+      cross_market_minimum_passes: number
+      review_contract_version: number
     }
   }
 }
@@ -1340,8 +1230,6 @@ export type ConfigurationView = {
     tested_at: string
   }
   execution_ready: boolean
-  promoted_agent_goal_id?: string | null
-  promoted_agent_policy_id?: string | null
   updated_at?: string
 }
 
@@ -1356,7 +1244,6 @@ export type ConfigurationUpdate = {
   configuration: UserConfiguration
   credentials?: CredentialDraft
   live_unlock_phrase?: string
-  promote_agent_goal_id?: string
 }
 
 export type ConnectionTestResult = {
@@ -1385,4 +1272,341 @@ export type StrategyGenerateRequest = {
   strategy_kind: StrategyKind
   strategy_spec?: StrategySpec
   revision_of?: string
+}
+
+export type FeatureHealth = 'healthy' | 'degraded' | 'unavailable'
+
+export type TradingIntelligenceFeatureGroup = {
+  health: FeatureHealth
+  values: Record<string, string | number | boolean | null>
+  reasons: string[]
+  observed_at?: string | null
+}
+
+export type MarketStateV2 = {
+  version: 2
+  state_id: string
+  state_hash: string
+  exchange: 'okx'
+  symbol: 'BTC/USDT:USDT' | 'ETH/USDT:USDT' | 'SOL/USDT:USDT'
+  data_as_of: string
+  created_at: string
+  regime: 'TREND_UP' | 'TREND_DOWN' | 'STRONG_TREND_UP' | 'STRONG_TREND_DOWN' | 'RANGE' | 'COMPRESSION' | 'VOLATILITY_EXPANSION' | 'PANIC' | 'REVERSAL' | 'TRANSITION'
+  healthy_for_new_risk: boolean
+  market: TradingIntelligenceFeatureGroup
+  structure: TradingIntelligenceFeatureGroup
+  trend: TradingIntelligenceFeatureGroup
+  momentum: TradingIntelligenceFeatureGroup
+  volatility: TradingIntelligenceFeatureGroup
+  volume: TradingIntelligenceFeatureGroup
+  microstructure: TradingIntelligenceFeatureGroup
+  derivatives: TradingIntelligenceFeatureGroup
+  cross_market: TradingIntelligenceFeatureGroup
+  events: TradingIntelligenceFeatureGroup
+  timeframe_features: Record<string, Record<string, string | number | boolean | null>>
+}
+
+export type ActiveThesisV2 = {
+  thesis_id: string
+  version: number
+  symbol: MarketStateV2['symbol']
+  direction: 'LONG' | 'SHORT' | 'NEUTRAL'
+  statement: string
+  invalidation_rules: string[]
+  state: 'CREATED' | 'ACTIVE' | 'COMPLETED' | 'INVALIDATED' | 'EXPIRED' | 'CANCELLED'
+  created_at: string
+  expires_at: string
+}
+
+export type WakeConditionV2 = {
+  condition_id: string
+  kind: string
+  action: 'RECALL_LLM' | 'EXECUTE_ENTRY' | 'CANCEL_PLAN' | 'EXIT_POSITION'
+  path?: string | null
+  value?: string | number | boolean | null
+  lower?: string | null
+  upper?: string | null
+  timeframe?: string | null
+  children: WakeConditionV2[]
+  expires_at?: string | null
+}
+
+export type TradePlanV2 = {
+  plan_id: string
+  thesis_id: string
+  version: number
+  symbol: MarketStateV2['symbol']
+  side: 'LONG' | 'SHORT'
+  order_type?: 'MARKET' | 'LIMIT' | null
+  limit_price?: string | null
+  reference_price?: string | null
+  valid_price_range?: { lower: string; upper: string } | null
+  position_id?: string | null
+  position_version?: number | null
+  entry_zone: { lower: string; upper: string }
+  entry_conditions: WakeConditionV2[]
+  management: {
+    hard_stop: string
+    take_profits: Array<{ price: string; close_fraction: string; rationale: string }>
+    break_even_after_target?: number | null
+    atr_trailing_multiple?: string | null
+    maximum_holding_minutes?: number | null
+  }
+  minimum_reward_risk: string
+  rationale: string[]
+  state: 'CREATED' | 'VALIDATED' | 'ACTIVE' | 'WAITING_TRIGGER' | 'ARMED' | 'TRIGGERED' | 'COMPLETED' | 'EXPIRED' | 'INVALIDATED' | 'CANCELLED'
+  created_at: string
+  expires_at: string
+}
+
+export type QuantPredictionV1 = {
+  prediction_id: string
+  model_fingerprint: string
+  symbol: MarketStateV2['symbol']
+  timeframe: '5m'
+  data_as_of: string
+  expires_at: string
+  probability_long_tp_first: string
+  probability_short_tp_first: string
+  probability_timeout: string
+  expected_return_after_cost: string
+  expected_mfe: string
+  expected_mae: string
+  calibrated: boolean
+}
+
+export type QuantModelStatusV1 = {
+  symbol: MarketStateV2['symbol']
+  timeframe: '5m'
+  health: 'healthy' | 'degraded' | 'unavailable'
+  entry_eligible?: boolean
+  reason?: string | null
+  model_fingerprint?: string | null
+  data_as_of?: string | null
+}
+
+export type DecisionEpisodeV2 = {
+  episode_id: string
+  symbol: MarketStateV2['symbol']
+  status: string
+  market_state_hash: string
+  analysis_id?: string | null
+  quant_prediction_id?: string | null
+  decision_id?: string | null
+  thesis_id?: string | null
+  plan_id?: string | null
+  trigger_event_id?: string | null
+  risk_allocation_id?: string | null
+  order_ids: string[]
+  position_id?: string | null
+  outcome?: Record<string, unknown> | null
+  prompt_versions: Record<string, string>
+  model_versions: Record<string, string>
+  token_usage: Record<string, number>
+  latency_ms: Record<string, number>
+  created_at: string
+  updated_at: string
+}
+
+export type WaitRuntimeV2 = {
+  wait_runtime_id: string
+  version: number
+  episode_id: string
+  symbol: MarketStateV2['symbol']
+  status: 'ACTIVE' | 'FIRED' | 'EXPIRED' | 'CANCELLED'
+  wait_plan: {
+    thesis_id?: string | null
+    reason: string
+    wake_conditions: WakeConditionV2[]
+    expires_at: string
+  }
+  created_at: string
+  updated_at: string
+}
+
+export type PositionRuntimeV2 = {
+  position_id: string
+  plan_id: string
+  plan_ids?: string[]
+  episode_ids?: string[]
+  entry_filled_quantities?: Record<string, string>
+  management_quantity?: string | null
+  management_started_at?: string | null
+  management_version?: number
+  version?: number
+  episode_id?: string | null
+  symbol: MarketStateV2['symbol']
+  side: 'LONG' | 'SHORT'
+  state: 'FLAT' | 'OPENING' | 'PARTIALLY_FILLED' | 'OPEN' | 'PARTIAL_EXIT' | 'CLOSING' | 'CLOSED'
+  original_quantity: string
+  remaining_quantity: string
+  average_entry: string
+  initial_stop: string
+  current_stop: string
+  targets_reached: number
+  entry_order_ids: string[]
+  exit_order_ids: string[]
+  opened_at: string
+  updated_at: string
+}
+
+export type EntryOrderRuntime = {
+  entry_id: string
+  plan_id: string
+  episode_id: string
+  mode?: string
+  version?: number
+  plan_version?: number
+  symbol: MarketStateV2['symbol']
+  side: 'LONG' | 'SHORT'
+  order_type: 'MARKET' | 'LIMIT'
+  requested_price?: string | null
+  submitted_price?: string | null
+  reference_price?: string | null
+  valid_price_range?: { lower: string; upper: string } | null
+  expires_at: string
+  order_ids: string[]
+  quantity: string
+  filled_quantity: string
+  average_fill_price?: string | null
+  status: 'SUBMITTING' | 'OPEN' | 'PARTIALLY_FILLED' | 'FILLED' | 'CANCEL_PENDING' | 'CANCELLED' | 'REJECTED' | 'UNCERTAIN' | 'SHADOW_RECORDED'
+  reason?: string | null
+  created_at: string
+  updated_at: string
+  position_id?: string | null
+}
+
+export type AutomationRuntimeV2 = {
+  runtime_id: 'trading-intelligence-v2'
+  enabled: boolean
+  requested_mode: 'SHADOW' | 'OKX_DEMO'
+  symbols: MarketStateV2['symbol'][]
+  status: 'STOPPED' | 'STARTING' | 'RUNNING' | 'DEGRADED' | 'HALTED'
+  consecutive_failures: number
+  last_cycle_at?: string | null
+  last_decision_at?: string | null
+  last_execution_at?: string | null
+  last_reconciliation_at?: string | null
+  last_error_code?: string | null
+  next_retry_at?: string | null
+  updated_at: string
+}
+
+export type HumanLiveGrantV2 = {
+  grant_id: string
+  exchange: 'okx'
+  symbols: MarketStateV2['symbol'][]
+  max_risk_per_trade: string
+  max_portfolio_risk: string
+  max_leverage: string
+  max_daily_drawdown: string
+  max_open_positions: number
+  configuration_fingerprint: string
+  issued_at: string
+  expires_at: string
+  revoked_at?: string | null
+}
+
+export type TradingIntelligenceOverview = {
+  version: 2
+  runtime_modes: Array<'SHADOW' | 'OKX_DEMO' | 'LIVE_AUTHORIZED'>
+  symbols: MarketStateV2['symbol'][]
+  market_states: MarketStateV2[]
+  active_theses: ActiveThesisV2[]
+  active_plans: TradePlanV2[]
+  active_waits: WaitRuntimeV2[]
+  // Optional while older servers do not yet expose entry runtimes.
+  entry_orders?: EntryOrderRuntime[]
+  positions: PositionRuntimeV2[]
+  quant_predictions: QuantPredictionV1[]
+  quant_models: QuantModelStatusV1[]
+  episodes: DecisionEpisodeV2[]
+  automation: AutomationRuntimeV2
+  live_grant?: HumanLiveGrantV2 | null
+  llm_health: Record<string, { status: string; last_error_message?: string }>
+  portfolio_policy?: {
+    risk_per_trade: string
+    max_portfolio_risk: string
+    max_open_positions: number
+    max_leverage: string
+    max_daily_drawdown: string
+  }
+  learning?: TradingLearningSnapshot
+}
+
+export type TradingLearningSnapshot = {
+  version: string
+  policy: string
+  sample_count: number
+  skipped_count: number
+  updated_at: string
+  groups: Array<{
+    mode: string; symbol: string; setup: string; regime: string; side: string
+    sample_count: number; wins: number; posterior_win_rate: string
+    expectancy_r: string; learned_expectancy_r: string; average_mfe_r: string; lessons: string[]
+  }>
+  recent: Array<{
+    episode_id: string; symbol: string; mode: string; side: string
+    return_on_risk: string; realized_pnl: string; fees: string
+  }>
+}
+
+export type TradeHistoryV2 = {
+  generated_at: string
+  symbol?: MarketStateV2['symbol'] | null
+  days: number
+  summary: {
+    trade_count: number
+    winning_trades: number
+    losing_trades: number
+    win_rate?: string | null
+    net_pnl: string
+    gross_profit: string
+    gross_loss: string
+    profit_factor?: string | null
+    average_pnl: string
+    total_fees: string
+    maximum_drawdown: string
+    average_return_on_risk: string
+  }
+  equity_curve: Array<{
+    closed_at: string
+    cumulative_pnl: string
+    position_id: string
+  }>
+  items: Array<{
+    position_id: string
+    episode_id: string
+    plan_id: string
+    symbol: MarketStateV2['symbol']
+    side: 'LONG' | 'SHORT'
+    opened_at: string
+    closed_at: string
+    duration_minutes: number
+    quantity: string
+    entry_price: string
+    exit_price?: string | null
+    stop_price: string
+    realized_pnl: string
+    gross_pnl: string
+    fees: string
+    return_after_cost: string
+    return_on_risk: string
+    mfe: string
+    mae: string
+    targets_reached: number
+    exit_reason?: string | null
+    entry_order_ids: string[]
+    exit_order_ids: string[]
+  }>
+}
+
+export type HumanLiveGrantPreviewV2 = {
+  eligible: boolean
+  blockers: string[]
+  configuration_fingerprint: string
+  exchange: 'okx'
+  symbols: MarketStateV2['symbol'][]
+  expires_at: string
+  requires_two_confirmations: true
 }

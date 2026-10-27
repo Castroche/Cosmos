@@ -15,6 +15,7 @@ from ..domain import (
     OrderIntent,
     PortfolioState,
     PositioningPoint,
+    PositionSide,
     StrategyPlan,
 )
 
@@ -25,6 +26,14 @@ class PositionProtectionError(RuntimeError):
     def __init__(self, message: str, order: Order | None = None):
         super().__init__(message)
         self.order = order
+
+
+class OrderSubmissionUncertain(PositionProtectionError):
+    """Submission may have landed. Reconcile this ID; never submit a replacement."""
+
+    def __init__(self, client_order_id: str, message: str, order: Order | None = None):
+        super().__init__(message, order)
+        self.client_order_id = client_order_id
 
 
 class ExchangeAdapter(ABC):
@@ -134,6 +143,22 @@ class ExchangeAdapter(ABC):
         del plan, entry_orders
         return False
 
+    async def rebalance_position_protection(
+        self, plan: StrategyPlan, entry_orders: list[Order], current_quantity: Decimal
+    ) -> bool:
+        """Apply latest TP/SL to ALL entries in one attributed, same-direction pool.
+
+        The caller serializes position updates and supplies actual remaining base
+        quantity, never requested entry size. Uncertainty must stop further entries.
+        """
+        raise PositionProtectionError("position protection rebalance is unsupported")
+
+    async def sync_position_protection(
+        self, plan: StrategyPlan, entry_orders: list[Order], current_quantity: Decimal
+    ) -> bool:
+        """Synchronize pooled fills and the latest management TP/SL levels."""
+        return await self.rebalance_position_protection(plan, entry_orders, current_quantity)
+
     @abstractmethod
     async def fetch_candles(
         self, symbol: str, timeframe: str = "1h", limit: int = 500
@@ -174,7 +199,9 @@ class ExchangeAdapter(ABC):
     async def verify_protection(self, order: Order) -> bool: ...
 
     @abstractmethod
-    async def protection_available(self, symbol: str) -> bool: ...
+    async def protection_available(
+        self, symbol: str, position_side: PositionSide | None = None
+    ) -> bool: ...
 
     @abstractmethod
     async def place_protected_order(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -19,8 +20,18 @@ class SqliteStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
-        self._backup_before_schema_upgrade(7)
+        self._backup_before_schema_upgrade(10)
+        self._enable_wal()
         self._initialize()
+
+    def _enable_wal(self) -> None:
+        """Set the persistent journal mode once, not on every read connection."""
+
+        connection = sqlite3.connect(self.path, timeout=30)
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+        finally:
+            connection.close()
 
     def _backup_before_schema_upgrade(self, target_version: int) -> Path | None:
         if not self.path.exists() or self.path.stat().st_size == 0:
@@ -43,6 +54,16 @@ class SqliteStore:
                 else 0
             )
             if current_version >= target_version:
+                return None
+            # The explicit v2 cleanup workflow creates and verifies this baseline
+            # before schema v10 is installed. Reusing it avoids another multi-GB
+            # startup copy while retaining a tested rollback point.
+            v2_baselines = list(
+                (self.path.parent / "backups").glob(f"{self.path.stem}-pre-v2-upgrade-*.db")
+            )
+            if target_version == 10 and any(
+                candidate.is_file() and candidate.stat().st_size > 0 for candidate in v2_baselines
+            ):
                 return None
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
             destination = (
@@ -68,22 +89,26 @@ class SqliteStore:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
         connection.execute("PRAGMA busy_timeout = 5000")
         return connection
 
     def integrity_check(self) -> str:
-        with self._lock, self.connect() as connection:
+        # WAL readers see a consistent snapshot without serializing application
+        # writes behind a multi-GB scan. Always close this long-lived reader.
+        with closing(self.connect()) as connection:
             row = connection.execute("PRAGMA quick_check").fetchone()
         return str(row[0]) if row else "no result"
 
     def backup_to(self, destination: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock, self.connect() as source:
+        # SQLite's online backup API coordinates its own read snapshot. Holding
+        # the application lock here stalls ticker writes, reconciliation and all
+        # HTTP handlers that synchronously read configuration or risk state.
+        with closing(self.connect()) as source:
             target = sqlite3.connect(destination)
             try:
-                source.backup(target)
+                source.backup(target, pages=256)
                 target.commit()
                 result = target.execute("PRAGMA quick_check").fetchone()
                 if not result or result[0] != "ok":
@@ -841,6 +866,19 @@ class SqliteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_agent_launch_profiles_updated
                     ON agent_launch_profiles(updated_at DESC);
+                CREATE TABLE IF NOT EXISTS strategy_review_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL,
+                    review_fingerprint TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_strategy_review_jobs_status
+                    ON strategy_review_jobs(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_strategy_review_jobs_candidate
+                    ON strategy_review_jobs(candidate_id, updated_at DESC);
                 CREATE TABLE IF NOT EXISTS agent_events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id TEXT NOT NULL UNIQUE,
@@ -944,6 +982,208 @@ class SqliteStore:
                     ON agent_shadow_trials(status, symbol, timeframe, updated_at DESC);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_shadow_trials_plan
                     ON agent_shadow_trials(plan_id);
+                CREATE TABLE IF NOT EXISTS alpha_model_artifacts_v1 (
+                    model_id TEXT PRIMARY KEY,
+                    profile TEXT NOT NULL,
+                    model_family TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_alpha_models_profile_created
+                    ON alpha_model_artifacts_v1(profile, created_at DESC);
+                CREATE TABLE IF NOT EXISTS sandbox_admission_handoffs_v1 (
+                    certificate_id TEXT PRIMARY KEY,
+                    exchange_id TEXT NOT NULL,
+                    trading_mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (certificate_id) REFERENCES research_certificates_v2(certificate_id)
+                        ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS sandbox_execution_evidence_v1 (
+                    evidence_id TEXT PRIMARY KEY,
+                    certificate_id TEXT NOT NULL,
+                    episode_id TEXT NOT NULL UNIQUE,
+                    aligned INTEGER NOT NULL CHECK (aligned IN (0, 1)),
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (certificate_id) REFERENCES research_certificates_v2(certificate_id)
+                        ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS idx_sandbox_execution_certificate
+                    ON sandbox_execution_evidence_v1(certificate_id, created_at);
+                CREATE TABLE IF NOT EXISTS live_strategy_selections_v2 (
+                    certificate_id TEXT PRIMARY KEY,
+                    selected INTEGER NOT NULL CHECK (selected IN (0, 1)),
+                    certificate_fingerprint TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (certificate_id) REFERENCES research_certificates_v2(certificate_id)
+                        ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS persistent_live_authorization_v1 (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    grant_id TEXT NOT NULL UNIQUE,
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                    scope_fingerprint TEXT NOT NULL,
+                    configuration_fingerprint TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS live_authorization_events_v1 (
+                    event_id TEXT PRIMARY KEY,
+                    grant_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_authorization_events_created
+                    ON live_authorization_events_v1(created_at DESC);
+                CREATE TABLE IF NOT EXISTS ti_market_states_v2 (
+                    state_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    state_hash TEXT NOT NULL UNIQUE,
+                    data_as_of TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ti_market_states_symbol_asof
+                    ON ti_market_states_v2(symbol, data_as_of DESC);
+                CREATE TABLE IF NOT EXISTS ti_theses_v2 (
+                    thesis_id TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ti_theses_symbol_state
+                    ON ti_theses_v2(symbol, state, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS ti_plans_v2 (
+                    plan_id TEXT PRIMARY KEY,
+                    thesis_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (thesis_id) REFERENCES ti_theses_v2(thesis_id)
+                        ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS idx_ti_plans_symbol_state
+                    ON ti_plans_v2(symbol, state, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS ti_quant_predictions_v1 (
+                    prediction_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    model_fingerprint TEXT NOT NULL,
+                    data_as_of TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ti_quant_symbol_asof
+                    ON ti_quant_predictions_v1(symbol, data_as_of DESC);
+                CREATE TABLE IF NOT EXISTS ti_decision_episodes_v2 (
+                    episode_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    market_state_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ti_episodes_symbol_updated
+                    ON ti_decision_episodes_v2(symbol, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS ti_artifacts_v2 (
+                    artifact_id TEXT PRIMARY KEY,
+                    artifact_type TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ti_artifacts_type_created
+                    ON ti_artifacts_v2(artifact_type, created_at DESC);
+                CREATE TABLE IF NOT EXISTS ti_events_v2 (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    event_type TEXT NOT NULL,
+                    aggregate_type TEXT NOT NULL,
+                    aggregate_id TEXT NOT NULL,
+                    aggregate_version INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ti_events_aggregate
+                    ON ti_events_v2(aggregate_type, aggregate_id, sequence);
+                CREATE INDEX IF NOT EXISTS idx_ti_events_queue
+                    ON ti_events_v2(event_type, aggregate_id, sequence);
+                CREATE TABLE IF NOT EXISTS ti_decision_queue_cursors_v2 (
+                    symbol TEXT PRIMARY KEY,
+                    sequence INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ti_wake_firings_v2 (
+                    condition_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    fired_at TEXT NOT NULL,
+                    PRIMARY KEY (condition_id, event_key),
+                    UNIQUE (condition_id),
+                    FOREIGN KEY (event_id) REFERENCES ti_events_v2(event_id)
+                        ON DELETE RESTRICT
+                );
+                CREATE TABLE IF NOT EXISTS ti_live_grants_v2 (
+                    grant_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    configuration_fingerprint TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ti_live_grants_status_expiry
+                    ON ti_live_grants_v2(status, expires_at DESC);
+                CREATE TABLE IF NOT EXISTS ti_entry_orders_v3 (
+                    entry_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL UNIQUE,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ti_entry_orders_scope
+                    ON ti_entry_orders_v3(mode, symbol, side, status);
+                CREATE INDEX IF NOT EXISTS idx_ti_entry_orders_recent
+                    ON ti_entry_orders_v3(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ti_entry_orders_status
+                    ON ti_entry_orders_v3(status, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ti_entry_orders_reconcile
+                    ON ti_entry_orders_v3(mode, updated_at DESC)
+                    WHERE status IN (
+                        'SUBMITTING', 'OPEN', 'PARTIALLY_FILLED', 'CANCEL_PENDING', 'UNCERTAIN'
+                    ) OR COALESCE(json_extract(payload, '$.terminal_notified'), 0) = 0;
+                CREATE TABLE IF NOT EXISTS ti_positions_v2 (
+                    position_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL UNIQUE,
+                    version INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (plan_id) REFERENCES ti_plans_v2(plan_id)
+                        ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS idx_ti_positions_symbol_state
+                    ON ti_positions_v2(symbol, state, updated_at DESC);
                 """
             )
             columns = {
@@ -1018,11 +1258,14 @@ class SqliteStore:
                     (5, "autonomous_research_persistent_budgets", now),
                     (6, "autonomous_research_novelty_index", now),
                     (7, "operator_workspace_and_personal_strategy_library", now),
+                    (8, "persistent_strategy_review_pipeline", now),
+                    (9, "crypto_5m_alpha_factory_and_persistent_live_authorization", now),
+                    (10, "event_driven_trading_intelligence_v2", now),
                 ],
             )
 
     def load_configuration(self) -> tuple[UserConfiguration, datetime | None]:
-        with self._lock, self.connect() as connection:
+        with closing(self.connect()) as connection:
             row = connection.execute(
                 "SELECT payload, updated_at FROM app_configuration WHERE id = 1"
             ).fetchone()
@@ -1494,7 +1737,7 @@ class SqliteStore:
             connection.commit()
 
     def load_research_dataset(self, dataset_id: str) -> dict | None:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             row = connection.execute(
                 "SELECT payload FROM research_datasets WHERE dataset_id = ?",
                 (dataset_id,),
@@ -1502,7 +1745,7 @@ class SqliteStore:
         return json.loads(row["payload"]) if row else None
 
     def load_research_dataset_candles(self, dataset_id: str) -> list[dict]:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT timestamp, event_time, available_time, source_time,
@@ -1515,7 +1758,7 @@ class SqliteStore:
         return [dict(row) for row in rows]
 
     def load_research_dataset_funding(self, dataset_id: str) -> list[dict]:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT timestamp, event_time, available_time, source_time,
@@ -1531,7 +1774,7 @@ class SqliteStore:
         self,
         dataset_id: str,
     ) -> list[dict]:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT timestamp, event_time, available_time, source_time,
@@ -1548,7 +1791,7 @@ class SqliteStore:
         self,
         dataset_id: str,
     ) -> list[dict]:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT timestamp, event_time, available_time, source_time,
@@ -1566,7 +1809,7 @@ class SqliteStore:
         self,
         dataset_id: str,
     ) -> list[dict]:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT timestamp, event_time, available_time, source_time,
@@ -1582,7 +1825,7 @@ class SqliteStore:
         self,
         dataset_id: str,
     ) -> list[dict]:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT timestamp, event_time, available_time, source_time,
@@ -1598,11 +1841,100 @@ class SqliteStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def load_alpha_runtime_feature_tail(
+        self,
+        dataset_id: str,
+        *,
+        limit: int = 5_000,
+    ) -> dict[str, list[dict]]:
+        """Load a bounded, ordered point-in-time feature window for 5m inference.
+
+        Runtime inference must never deserialize an entire two-year feature cube on
+        the decision path.  Every source table is append-only and keyed by
+        ``(dataset_id, sequence)``, so reading the newest bounded suffix preserves
+        causal ordering while keeping the 5m path predictable.
+        """
+
+        bounded = min(max(int(limit), 1), 20_000)
+        sources = {
+            "funding": (
+                "research_dataset_funding",
+                "timestamp, event_time, available_time, source_time, ingestion_time, "
+                "revision_policy, rate, mark_price",
+            ),
+            "open_interest": (
+                "research_dataset_open_interest",
+                "timestamp, event_time, available_time, source_time, ingestion_time, "
+                "revision_policy, open_interest_amount, open_interest_value",
+            ),
+            "positioning": (
+                "research_dataset_positioning",
+                "timestamp, event_time, available_time, source_time, ingestion_time, "
+                "revision_policy, long_short_ratio, long_account_fraction, "
+                "short_account_fraction, source_variant",
+            ),
+            "basis": (
+                "research_dataset_basis",
+                "timestamp, event_time, available_time, source_time, ingestion_time, "
+                "revision_policy, mark_price, index_price, basis_rate",
+            ),
+            "order_flow": (
+                "research_dataset_order_flow",
+                "timestamp, event_time, available_time, source_time, ingestion_time, "
+                "revision_policy, aggregate_count, underlying_trade_count, base_volume, "
+                "quote_volume, taker_buy_base_volume, taker_sell_base_volume, "
+                "delta_base_volume, maximum_trade_quote",
+            ),
+        }
+        result: dict[str, list[dict]] = {}
+        with self.connect() as connection:
+            for name, (table, columns) in sources.items():
+                rows = connection.execute(
+                    f"""
+                    SELECT {columns} FROM (
+                        SELECT sequence, {columns}
+                        FROM {table}
+                        WHERE dataset_id = ?
+                        ORDER BY sequence DESC LIMIT ?
+                    ) ORDER BY sequence
+                    """,
+                    (dataset_id, bounded),
+                ).fetchall()
+                result[name] = [dict(row) for row in rows]
+            liquidation_rows = connection.execute(
+                """
+                SELECT payload, event_time, available_time, source_time,
+                       ingestion_time, revision_policy FROM (
+                    SELECT sequence, payload, event_time, available_time, source_time,
+                           ingestion_time, revision_policy
+                    FROM research_dataset_liquidation_flow
+                    WHERE dataset_id = ?
+                    ORDER BY sequence DESC LIMIT ?
+                ) ORDER BY sequence
+                """,
+                (dataset_id, bounded),
+            ).fetchall()
+            liquidation: list[dict] = []
+            for row in liquidation_rows:
+                payload = json.loads(row["payload"])
+                for field in (
+                    "event_time",
+                    "available_time",
+                    "source_time",
+                    "ingestion_time",
+                    "revision_policy",
+                ):
+                    if row[field] is not None:
+                        payload[field] = row[field]
+                liquidation.append(payload)
+            result["liquidation_flow"] = liquidation
+        return result
+
     def load_research_dataset_liquidation_flow(
         self,
         dataset_id: str,
     ) -> list[dict]:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT payload, event_time, available_time, source_time,
@@ -2052,7 +2384,7 @@ class SqliteStore:
         return [json.loads(row["payload"]) for row in rows]
 
     def list_research_datasets(self, limit: int = 50) -> list[dict]:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT payload FROM research_datasets
@@ -2551,6 +2883,95 @@ class SqliteStore:
                 ),
             )
 
+    def save_strategy_review_job(self, job) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO strategy_review_jobs
+                    (job_id, candidate_id, review_fingerprint, status, payload,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    status = excluded.status,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    job.id,
+                    job.candidate_id,
+                    job.review_fingerprint,
+                    str(job.status),
+                    job.model_dump_json(),
+                    job.created_at.isoformat(),
+                    job.updated_at.isoformat(),
+                ),
+            )
+
+    def save_strategy_review_job_if_fingerprint_absent(
+        self,
+        job,
+    ) -> tuple[dict, bool]:
+        """Atomically enqueue one review for an immutable review fingerprint."""
+
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT payload FROM strategy_review_jobs WHERE review_fingerprint = ?",
+                (job.review_fingerprint,),
+            ).fetchone()
+            if existing:
+                connection.commit()
+                return json.loads(existing["payload"]), False
+            connection.execute(
+                """
+                INSERT INTO strategy_review_jobs
+                    (job_id, candidate_id, review_fingerprint, status, payload,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job.id,
+                    job.candidate_id,
+                    job.review_fingerprint,
+                    str(job.status),
+                    job.model_dump_json(),
+                    job.created_at.isoformat(),
+                    job.updated_at.isoformat(),
+                ),
+            )
+            connection.commit()
+        return job.model_dump(mode="json"), True
+
+    def load_strategy_review_job(self, job_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM strategy_review_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def load_strategy_review_job_by_fingerprint(
+        self,
+        review_fingerprint: str,
+    ) -> dict | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM strategy_review_jobs WHERE review_fingerprint = ?",
+                (review_fingerprint,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def list_strategy_review_jobs(self, limit: int = 500) -> list[dict]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM strategy_review_jobs
+                ORDER BY created_at ASC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
     def load_research_campaign_job(self, job_id: str) -> dict | None:
         with self._lock, self.connect() as connection:
             row = connection.execute(
@@ -2956,6 +3377,48 @@ class SqliteStore:
             )
             connection.commit()
 
+    def save_strategy_candidate_if_fingerprint_absent(
+        self,
+        candidate,
+    ) -> tuple[dict, bool]:
+        """Atomically persist one canonical candidate per strategy fingerprint."""
+
+        actual_fingerprint = validate_strategy_spec(candidate.spec).fingerprint
+        if actual_fingerprint != candidate.spec_fingerprint:
+            raise ValueError("strategy candidate fingerprint does not match payload")
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT payload FROM strategy_candidates
+                WHERE spec_fingerprint = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (candidate.spec_fingerprint,),
+            ).fetchone()
+            if existing:
+                connection.commit()
+                return repair_text_tree(json.loads(existing["payload"])), False
+            connection.execute(
+                """
+                INSERT INTO strategy_candidates
+                    (candidate_id, spec_fingerprint, family, status, source,
+                     payload, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate.id,
+                    candidate.spec_fingerprint,
+                    candidate.spec["family"],
+                    str(candidate.status),
+                    candidate.source,
+                    candidate.model_dump_json(),
+                    candidate.updated_at.isoformat(),
+                ),
+            )
+            connection.commit()
+        return candidate.model_dump(mode="json"), True
+
     def promote_strategy_candidate(
         self,
         candidate,
@@ -3020,15 +3483,32 @@ class SqliteStore:
             connection.commit()
 
     def load_strategy_candidate(self, candidate_id: str) -> dict | None:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             row = connection.execute(
                 "SELECT payload FROM strategy_candidates WHERE candidate_id = ?",
                 (candidate_id,),
             ).fetchone()
         return repair_text_tree(json.loads(row["payload"])) if row else None
 
+    def load_strategy_candidate_by_fingerprint(
+        self,
+        spec_fingerprint: str,
+    ) -> dict | None:
+        """Return the canonical newest candidate for an immutable strategy spec."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload FROM strategy_candidates
+                WHERE spec_fingerprint = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (spec_fingerprint,),
+            ).fetchone()
+        return repair_text_tree(json.loads(row["payload"])) if row else None
+
     def list_strategy_candidates(self, limit: int = 100) -> list[dict]:
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT payload FROM strategy_candidates
@@ -3037,6 +3517,49 @@ class SqliteStore:
                 (limit,),
             ).fetchall()
         return [repair_text_tree(json.loads(row["payload"])) for row in rows]
+
+    def list_strategy_review_candidate_payloads(self, limit: int = 1000) -> list[dict]:
+        """Keep legacy counting without decoding its full backtest evidence every poll."""
+
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT CASE
+                    WHEN json_type(payload, '$.research_context') = 'object' THEN payload
+                    ELSE json_object('id', candidate_id)
+                END AS payload
+                FROM strategy_candidates ORDER BY updated_at DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [repair_text_tree(json.loads(row["payload"])) for row in rows]
+
+    def list_strategy_candidate_summaries(self, limit: int = 500) -> list[dict]:
+        """Load only fields needed by operator overview screens.
+
+        Candidate payloads contain full research evidence and can be hundreds of
+        kilobytes each.  Parsing every payload just to render a name and status
+        made the review workspace take several seconds to open.
+        """
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    candidate_id,
+                    status,
+                    COALESCE(
+                        json_extract(payload, '$.spec.name'),
+                        json_extract(payload, '$.spec.label'),
+                        candidate_id
+                    ) AS display_name,
+                    updated_at
+                FROM strategy_candidates
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def save_personal_strategy_library_item(self, item) -> None:
         payload = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
@@ -3118,9 +3641,7 @@ class SqliteStore:
 
     def save_agent_launch_profile(self, profile) -> None:
         payload = (
-            profile.model_dump(mode="json")
-            if hasattr(profile, "model_dump")
-            else dict(profile)
+            profile.model_dump(mode="json") if hasattr(profile, "model_dump") else dict(profile)
         )
         with self._lock, self.connect() as connection:
             connection.execute(
@@ -3232,7 +3753,7 @@ class SqliteStore:
             )
 
     def load_risk_state(self) -> str | None:
-        with self._lock, self.connect() as connection:
+        with closing(self.connect()) as connection:
             row = connection.execute(
                 "SELECT payload FROM risk_control_state WHERE id = 1"
             ).fetchone()
@@ -4385,3 +4906,289 @@ class SqliteStore:
             "revoked": bool(revocations),
             "revocations": [json.loads(row["payload"]) for row in revocations],
         }
+
+    def save_alpha_model_artifact(self, artifact) -> dict:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT fingerprint FROM alpha_model_artifacts_v1 WHERE model_id = ?",
+                (artifact.id,),
+            ).fetchone()
+            if existing and existing["fingerprint"] != artifact.fingerprint:
+                raise RuntimeError("immutable alpha model id collision")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO alpha_model_artifacts_v1
+                    (model_id, profile, model_family, fingerprint, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact.id,
+                    artifact.profile,
+                    artifact.model_family,
+                    artifact.fingerprint,
+                    artifact.model_dump_json(),
+                    artifact.created_at.isoformat(),
+                ),
+            )
+            connection.commit()
+        return artifact.model_dump(mode="json")
+
+    def load_alpha_model_artifact(self, model_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM alpha_model_artifacts_v1 WHERE model_id = ?",
+                (model_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def list_research_certificates_by_type(self, certificate_type: str) -> list[dict]:
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.payload,
+                       CASE WHEN r.certificate_id IS NULL THEN 0 ELSE 1 END AS revoked
+                FROM research_certificates_v2 c
+                LEFT JOIN (
+                    SELECT DISTINCT certificate_id FROM certificate_revocations
+                ) r ON r.certificate_id = c.certificate_id
+                WHERE c.certificate_type = ?
+                ORDER BY c.created_at DESC
+                """,
+                (certificate_type,),
+            ).fetchall()
+        return [
+            {"certificate": json.loads(row["payload"]), "revoked": bool(row["revoked"])}
+            for row in rows
+        ]
+
+    def save_sandbox_admission_handoff(
+        self,
+        certificate,
+        *,
+        status: str,
+        details: dict | None = None,
+    ) -> dict:
+        now = datetime.now(UTC).isoformat()
+        payload = {
+            "certificate_id": certificate.id,
+            "exchange": certificate.exchange,
+            "trading_mode": certificate.trading_mode,
+            "status": status,
+            "maximum_risk_per_trade": str(certificate.maximum_risk_per_trade),
+            "maximum_active_instances": certificate.maximum_active_instances,
+            "allow_scale_in": certificate.allow_scale_in,
+            "allow_pyramiding": certificate.allow_pyramiding,
+            "allow_automatic_leverage_increase": (certificate.allow_automatic_leverage_increase),
+            **(details or {}),
+        }
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO sandbox_admission_handoffs_v1
+                    (certificate_id, exchange_id, trading_mode, status,
+                     payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(certificate_id) DO UPDATE SET
+                    status = excluded.status,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    certificate.id,
+                    certificate.exchange,
+                    certificate.trading_mode,
+                    status,
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return payload
+
+    def load_sandbox_admission_handoff(self, certificate_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM sandbox_admission_handoffs_v1 WHERE certificate_id = ?",
+                (certificate_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def list_sandbox_admission_handoffs(self, *, limit: int = 200) -> list[dict]:
+        bounded = min(max(int(limit), 1), 2_000)
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM sandbox_admission_handoffs_v1
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (bounded,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def save_sandbox_execution_evidence(self, evidence) -> dict:
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO sandbox_execution_evidence_v1
+                    (evidence_id, certificate_id, episode_id, aligned, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence.id,
+                    evidence.sandbox_certificate_id,
+                    evidence.episode_id,
+                    int(evidence.aligned),
+                    evidence.model_dump_json(),
+                    evidence.recorded_at.isoformat(),
+                ),
+            )
+        return evidence.model_dump(mode="json")
+
+    def list_sandbox_execution_evidence(self, certificate_id: str) -> list[dict]:
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM sandbox_execution_evidence_v1
+                WHERE certificate_id = ? ORDER BY created_at
+                """,
+                (certificate_id,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def find_completed_blind_consumption(self, strategy_fingerprint: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT blind_set_id, strategy_fingerprint, evaluation_id,
+                       status, campaign_id, passed, opened_at, completed_at
+                FROM blind_set_consumptions
+                WHERE strategy_fingerprint = ? AND status = 'completed'
+                ORDER BY completed_at DESC LIMIT 1
+                """,
+                (strategy_fingerprint,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_full_strategy_certificates_v2(self) -> list[dict]:
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.payload,
+                       CASE WHEN r.certificate_id IS NULL THEN 0 ELSE 1 END AS revoked,
+                       s.payload AS selection_payload
+                FROM research_certificates_v2 c
+                LEFT JOIN (
+                    SELECT DISTINCT certificate_id FROM certificate_revocations
+                ) r ON r.certificate_id = c.certificate_id
+                LEFT JOIN live_strategy_selections_v2 s
+                    ON s.certificate_id = c.certificate_id
+                WHERE c.certificate_type = 'full_strategy_v2'
+                ORDER BY c.created_at DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "certificate": json.loads(row["payload"]),
+                "revoked": bool(row["revoked"]),
+                "selection": (
+                    json.loads(row["selection_payload"]) if row["selection_payload"] else None
+                ),
+            }
+            for row in rows
+        ]
+
+    def save_live_strategy_selection(self, selection) -> dict:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            status = connection.execute(
+                """
+                SELECT c.certificate_type,
+                       EXISTS(
+                           SELECT 1 FROM certificate_revocations r
+                           WHERE r.certificate_id = c.certificate_id
+                       ) AS revoked
+                FROM research_certificates_v2 c WHERE c.certificate_id = ?
+                """,
+                (selection.certificate_id,),
+            ).fetchone()
+            if not status or status["certificate_type"] != "full_strategy_v2":
+                raise LookupError("valid FullStrategyCertificateV2 is required")
+            if status["revoked"]:
+                raise RuntimeError("revoked strategy certificate cannot be selected")
+            connection.execute(
+                """
+                INSERT INTO live_strategy_selections_v2
+                    (certificate_id, selected, certificate_fingerprint, payload, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(certificate_id) DO UPDATE SET
+                    selected = excluded.selected,
+                    certificate_fingerprint = excluded.certificate_fingerprint,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    selection.certificate_id,
+                    int(selection.selected),
+                    selection.certificate_fingerprint,
+                    selection.model_dump_json(),
+                    selection.updated_at.isoformat(),
+                ),
+            )
+            connection.commit()
+        return selection.model_dump(mode="json")
+
+    def load_live_strategy_selection(self, certificate_id: str) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM live_strategy_selections_v2 WHERE certificate_id = ?",
+                (certificate_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_persistent_live_authorization(self, grant, *, event_type: str) -> dict:
+        now = datetime.now(UTC)
+        event_id = f"live_auth_event_{now.strftime('%Y%m%d%H%M%S%f')}"
+        payload = grant.model_dump_json()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO persistent_live_authorization_v1
+                    (id, grant_id, enabled, scope_fingerprint,
+                     configuration_fingerprint, payload, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    grant_id = excluded.grant_id,
+                    enabled = excluded.enabled,
+                    scope_fingerprint = excluded.scope_fingerprint,
+                    configuration_fingerprint = excluded.configuration_fingerprint,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    grant.id,
+                    int(grant.enabled),
+                    grant.scope_fingerprint,
+                    grant.configuration_fingerprint,
+                    payload,
+                    now.isoformat(),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO live_authorization_events_v1
+                    (event_id, grant_id, event_type, payload, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (event_id, grant.id, event_type, payload, now.isoformat()),
+            )
+            connection.commit()
+        return grant.model_dump(mode="json")
+
+    def load_persistent_live_authorization(self) -> dict | None:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM persistent_live_authorization_v1 WHERE id = 1"
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None

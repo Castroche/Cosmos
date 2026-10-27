@@ -948,40 +948,42 @@ def test_execution_certificate_binds_plan_and_detects_campaign_tampering(
     assert certificate is not None
     assert certificate.research_aggregate_fingerprint
     assert certificate.blind_aggregate_fingerprint
-    fake_store = SimpleNamespace(
-        load_research_dataset=lambda dataset_id: dataset.model_copy(
-            update={"id": dataset_id}
-        ).model_dump(mode="json")
-    )
-    monkeypatch.setattr(api, "store", fake_store)
-    plan = SimpleNamespace(
-        strategy_spec_fingerprint="fp_stable",
-        research_campaign_id=report.id,
-        campaign_certificate_fingerprint=certificate.fingerprint,
-    )
-
-    assert (
-        api.matching_execution_campaign(
-            plan,
-            [report.model_dump(mode="json")],
-        )
-        is not None
+    del monkeypatch
+    validate_campaign_execution_certificate(
+        report,
+        certificate,
+        dataset_fingerprints=fingerprints,
     )
 
     tampered = report.model_dump(mode="json")
     tampered["candidates"][0]["median_win_rate_percent"] = "99"
-    assert api.matching_execution_campaign(plan, [tampered]) is None
+    with pytest.raises(ValueError):
+        validate_campaign_execution_certificate(
+            ResearchCampaignReport.model_validate(tampered),
+            certificate,
+            dataset_fingerprints=fingerprints,
+        )
 
     tampered_blind = report.model_dump(mode="json")
     tampered_blind["blind_candidate"]["worst_drawdown_percent"] = "99"
-    assert api.matching_execution_campaign(plan, [tampered_blind]) is None
+    with pytest.raises(ValueError):
+        validate_campaign_execution_certificate(
+            ResearchCampaignReport.model_validate(tampered_blind),
+            certificate,
+            dataset_fingerprints=fingerprints,
+        )
 
     tampered_ledger = report.model_dump(mode="json")
     tampered_ledger["effective_trial_count"] += 1
-    assert api.matching_execution_campaign(plan, [tampered_ledger]) is None
+    with pytest.raises(ValueError):
+        validate_campaign_execution_certificate(
+            ResearchCampaignReport.model_validate(tampered_ledger),
+            certificate,
+            dataset_fingerprints=fingerprints,
+        )
 
 
-def test_execution_certificate_binds_full_causal_policy_definition(monkeypatch):
+def test_execution_certificate_binds_full_causal_policy_definition():
     entry_ids = [
         "builtin_ema_12_26_trend_v2",
         "builtin_sma_20_100_trend_v2",
@@ -1072,68 +1074,6 @@ def test_execution_certificate_binds_full_causal_policy_definition(monkeypatch):
             dataset_fingerprints=fingerprints,
         )
 
-    assessment = api.score_market_state(demo_candles(300))
-    policy_priors = stable.priors
-    selected_prior = api.rank_causal_strategy_priors(
-        list(policy_priors),
-        assessment,
-        {"ohlcv"},
-    )[0][0]
-    decision_time = demo_candles(300)[-1].timestamp
-    plan = SimpleNamespace(
-        strategy_spec_fingerprint=selected_prior.spec_fingerprint,
-        signal_candle_at=decision_time,
-        data_as_of=decision_time,
-        side="long",
-        confidence=Decimal("0.8"),
-        causal_policy_fingerprint=stable.policy_fingerprint,
-        causal_policy_selected_library_entry_id=selected_prior.id,
-        causal_policy_selection_evidence=None,
-        research_campaign_id=report.id,
-        campaign_certificate_fingerprint=certificate.fingerprint,
-    )
-    report.execution_certificate = certificate
-    plan.causal_policy_selection_evidence = (
-        api.build_plan_causal_policy_selection_evidence(
-            plan,
-            report,
-            assessment=assessment,
-            available_data={"ohlcv"},
-            selected_library_entry_id=selected_prior.id,
-        )
-    )
-    assert api.validate_plan_causal_policy_selection(plan, report) is True
-    dataset_template = build_research_dataset(
-        demo_candles(300),
-        exchange="test",
-        market_type="swap",
-        symbol="BTC/USDT",
-        timeframe="1h",
-    )
-    monkeypatch.setattr(
-        api,
-        "store",
-        SimpleNamespace(
-            load_research_dataset=lambda dataset_id: dataset_template.model_copy(
-                update={
-                    "id": dataset_id,
-                    "data_fingerprint": fingerprints[dataset_id],
-                }
-            ).model_dump(mode="json")
-        ),
-    )
-    assert api.matching_execution_campaign(
-        plan,
-        [report.model_dump(mode="json")],
-    ) is not None
-    plan.strategy_spec_fingerprint = "tampered_concrete_strategy"
-    assert api.validate_plan_causal_policy_selection(plan, report) is False
-    assert api.matching_execution_campaign(
-        plan,
-        [report.model_dump(mode="json")],
-    ) is None
-
-
 def test_campaign_rejects_research_winner_that_fails_blind_markets():
     research_ids = [f"research_{index}" for index in range(3)]
     blind_ids = [f"blind_{index}" for index in range(3)]
@@ -1164,7 +1104,7 @@ def test_campaign_rejects_research_winner_that_fails_blind_markets():
     assert any("盲测" in reason for reason in report.selection_reasons)
 
 
-def test_legacy_campaign_without_blind_evidence_cannot_authorize_execution():
+def test_campaign_without_blind_evidence_remains_offline_only():
     cells = [
         _cell("stable", f"market_{index}", robust=True, fold_returns=["1"] * 4)
         for index in range(3)
@@ -1174,16 +1114,8 @@ def test_legacy_campaign_without_blind_evidence_cannot_authorize_execution():
         library_entry_ids=["stable"],
         cells=cells,
     )
-    legacy_payload = report.model_dump(mode="json")
-    legacy_payload["autonomous_execution_eligible"] = True
-    legacy_payload["selected_library_entry_id"] = "stable"
-
-    matched = api.matching_execution_campaign(
-        SimpleNamespace(strategy_spec_fingerprint="fp_stable"),
-        [legacy_payload],
-    )
-
-    assert matched is None
+    assert report.autonomous_execution_eligible is False
+    assert report.execution_certificate is None
 
 
 def test_campaign_rejects_unsealed_or_mismatched_blind_datasets(monkeypatch, tmp_path):

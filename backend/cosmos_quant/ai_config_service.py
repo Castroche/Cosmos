@@ -17,6 +17,11 @@ from .storage import SqliteStore
 
 
 class AIConfigurationService:
+    AGENT_DECISION_QUALITY_SAMPLE_SIZE = 20
+    AGENT_DECISION_QUALITY_MINIMUM_SAMPLES = 5
+    AGENT_DECISION_MINIMUM_SUCCESS_RATE = 0.80
+    AGENT_DECISION_GATE_COOLDOWN = timedelta(minutes=15)
+
     def __init__(self, store: SqliteStore, secrets: SecretStore):
         self.store = store
         self.secrets = secrets
@@ -94,6 +99,7 @@ class AIConfigurationService:
             since=since,
             until=until,
             request_count=len(events),
+            failed_request_count=sum(not item.succeeded for item in events),
             input_tokens=sum(item.usage.input_tokens for item in events),
             output_tokens=sum(item.usage.output_tokens for item in events),
             total_tokens=sum(item.usage.total_tokens for item in events),
@@ -120,6 +126,100 @@ class AIConfigurationService:
             ),
         )
         return AIUsageReport(summary=summary, recent=events[:recent_limit])
+
+    def operation_quality(
+        self,
+        *,
+        provider: AIProvider,
+        operation: str,
+        days: int = 7,
+        sample_size: int = AGENT_DECISION_QUALITY_SAMPLE_SIZE,
+    ) -> dict:
+        """Summarize recent structured-output reliability for automatic routing.
+
+        A low rolling success rate is diagnostic by itself.  It becomes a routing
+        block only when the newest request also failed and is still inside a short
+        cooldown.  That permits an automatic half-open probe after the cooldown and
+        lets one successful probe restore routing without deleting audit history.
+        """
+
+        until = datetime.now(UTC)
+        since = until - timedelta(days=days)
+        events = [
+            AIUsageEvent.model_validate(item)
+            for item in self.store.load_ai_usage_events(
+                since=since,
+                until=until,
+                provider=provider,
+            )
+            if item.get("operation") == operation
+        ][: max(sample_size, 1)]
+        request_count = len(events)
+        succeeded = sum(item.succeeded for item in events)
+        failed = request_count - succeeded
+        success_rate = succeeded / request_count if request_count else None
+        invalid_responses = sum(
+            not item.succeeded and item.error_code == "invalid_response"
+            for item in events
+        )
+        latencies = sorted(item.latency_ms for item in events)
+        median_latency_ms = (
+            latencies[len(latencies) // 2] if latencies else None
+        )
+        p95_latency_ms = (
+            latencies[max(int(len(latencies) * 0.95) - 1, 0)]
+            if latencies
+            else None
+        )
+        latest = events[0] if events else None
+        cooldown_until = (
+            latest.created_at + self.AGENT_DECISION_GATE_COOLDOWN
+            if latest and not latest.succeeded
+            else None
+        )
+        statistically_degraded = bool(
+            request_count >= self.AGENT_DECISION_QUALITY_MINIMUM_SAMPLES
+            and success_rate is not None
+            and success_rate < self.AGENT_DECISION_MINIMUM_SUCCESS_RATE
+        )
+        automatic_allowed = not (
+            statistically_degraded
+            and latest is not None
+            and not latest.succeeded
+            and cooldown_until is not None
+            and cooldown_until > until
+        )
+        if not request_count:
+            status = "warming_up"
+            reason = "尚无自动结构化决策样本"
+        elif automatic_allowed and not statistically_degraded:
+            status = "healthy"
+            reason = "最近结构化输出成功率达到自动路由门槛"
+        elif automatic_allowed:
+            status = "probe_allowed"
+            reason = "历史成功率偏低，但允许一次自动恢复探测"
+        else:
+            status = "quality_blocked"
+            reason = "最近结构化输出成功率过低，自动调用已暂停并使用确定性降级"
+        return {
+            "operation": operation,
+            "window_days": days,
+            "sample_size": sample_size,
+            "request_count": request_count,
+            "succeeded_request_count": succeeded,
+            "failed_request_count": failed,
+            "invalid_response_count": invalid_responses,
+            "success_rate": success_rate,
+            "minimum_success_rate": self.AGENT_DECISION_MINIMUM_SUCCESS_RATE,
+            "median_latency_ms": median_latency_ms,
+            "p95_latency_ms": p95_latency_ms,
+            "latest_succeeded": latest.succeeded if latest else None,
+            "latest_at": latest.created_at if latest else None,
+            "cooldown_until": cooldown_until if not automatic_allowed else None,
+            "automatic_allowed": automatic_allowed,
+            "status": status,
+            "reason": reason,
+        }
 
     def _view(self, configuration: AIConfiguration, updated_at):
         return AIConfigurationView(

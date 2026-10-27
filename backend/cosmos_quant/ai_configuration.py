@@ -33,7 +33,7 @@ PROVIDER_DEFAULTS: dict[AIProvider, tuple[str, str]] = {
         "gemini-3.5-flash",
     ),
     AIProvider.XAI: ("https://api.x.ai/v1", "grok-4.5"),
-    AIProvider.DEEPSEEK: ("https://api.deepseek.com", "deepseek-v4-flash"),
+    AIProvider.DEEPSEEK: ("https://api.deepseek.com", "deepseek-flash"),
     AIProvider.MISTRAL: ("https://api.mistral.ai/v1", "mistral-large-latest"),
     AIProvider.QWEN: (
         "https://dashscope.aliyuncs.com/compatible-mode/v1",

@@ -24,6 +24,8 @@ from .ai_usage import AICompletionResult, AIUsage, AIUsageEvent, estimate_deepse
 
 logger = logging.getLogger(__name__)
 
+MAX_STRUCTURED_OUTPUT_TOKENS = 10_000
+
 
 class AIErrorCode(StrEnum):
     NOT_CONFIGURED = "not_configured"
@@ -33,6 +35,7 @@ class AIErrorCode(StrEnum):
     UNAVAILABLE = "unavailable"
     INVALID_RESPONSE = "invalid_response"
     CIRCUIT_OPEN = "circuit_open"
+    QUALITY_GATED = "quality_gated"
     CONFIGURATION = "configuration"
 
 
@@ -58,6 +61,7 @@ class AIProviderError(RuntimeError):
         *,
         retryable: bool = False,
         status_code: int | None = None,
+        diagnostic_message: str = "",
     ):
         super().__init__(message)
         self.provider = provider
@@ -65,6 +69,19 @@ class AIProviderError(RuntimeError):
         self.public_message = message
         self.retryable = retryable
         self.status_code = status_code
+        self.diagnostic_message = diagnostic_message[:500]
+        self.usage = AIUsage()
+        self.provider_request_id: str | None = None
+        self.model = ""
+        self.latency_ms = 0
+        self.finish_reason: str | None = None
+        self.response_char_count = 0
+        self.operation = "structured_generation"
+        self.thinking_enabled: bool | None = None
+        self.reasoning_effort: AIReasoningEffort | None = None
+        self.prompt_version = "v1"
+        self.schema_version = "v1"
+        self.created_at = datetime.now(UTC)
 
 
 def _endpoint(base_url: str, resource: str) -> str:
@@ -142,19 +159,47 @@ def _parse_json_text(text: str, provider: AIProvider) -> dict[str, Any]:
         normalized = normalized.removesuffix("```").strip()
     try:
         parsed = json.loads(normalized)
-    except (json.JSONDecodeError, TypeError) as exc:
+    except json.JSONDecodeError as exc:
         raise AIProviderError(
             provider,
             AIErrorCode.INVALID_RESPONSE,
             "模型没有返回可校验的 JSON 结果",
+            retryable=True,
+            diagnostic_message=(
+                f"JSONDecodeError line={exc.lineno} column={exc.colno} "
+                f"position={exc.pos} chars={len(normalized)}"
+            ),
+        ) from exc
+    except TypeError as exc:
+        raise AIProviderError(
+            provider,
+            AIErrorCode.INVALID_RESPONSE,
+            "模型没有返回可校验的 JSON 结果",
+            retryable=True,
+            diagnostic_message=f"TypeError chars={len(normalized)}",
         ) from exc
     if not isinstance(parsed, dict):
         raise AIProviderError(
             provider,
             AIErrorCode.INVALID_RESPONSE,
             "模型返回的结构必须是 JSON 对象",
+            retryable=True,
+            diagnostic_message=f"top_level_type={type(parsed).__name__}",
         )
     return parsed
+
+
+def _finish_reason(payload: dict[str, Any]) -> str | None:
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        value = choices[0].get("finish_reason")
+        if value is not None:
+            return str(value)[:100]
+    for key in ("stop_reason", "status"):
+        value = payload.get(key)
+        if value is not None:
+            return str(value)[:100]
+    return None
 
 
 class BaseProviderAdapter:
@@ -304,18 +349,40 @@ class BaseProviderAdapter:
     ) -> AICompletionResult:
         created_at = datetime.now(UTC)
         model = str(payload.get("model") or self.configuration.model)
+        usage = _usage(
+            payload,
+            provider=self.provider,
+            model=model,
+            created_at=created_at,
+        )
+        latency_ms = round((perf_counter() - started) * 1000)
+        provider_request_id = str(payload["id"]) if payload.get("id") else None
+        finish_reason = _finish_reason(payload)
+        try:
+            data = _parse_json_text(text, self.provider)
+        except AIProviderError as exc:
+            exc.usage = usage
+            exc.provider_request_id = provider_request_id
+            exc.model = model
+            exc.latency_ms = latency_ms
+            exc.finish_reason = finish_reason
+            exc.response_char_count = len(text)
+            exc.operation = operation
+            exc.thinking_enabled = thinking_enabled
+            exc.reasoning_effort = reasoning_effort
+            exc.prompt_version = prompt_version
+            exc.schema_version = schema_version
+            exc.created_at = created_at
+            raise
         return AICompletionResult(
             provider=self.provider,
             model=model,
-            data=_parse_json_text(text, self.provider),
-            usage=_usage(
-                payload,
-                provider=self.provider,
-                model=model,
-                created_at=created_at,
-            ),
-            latency_ms=round((perf_counter() - started) * 1000),
-            provider_request_id=str(payload["id"]) if payload.get("id") else None,
+            data=data,
+            usage=usage,
+            latency_ms=latency_ms,
+            provider_request_id=provider_request_id,
+            finish_reason=finish_reason,
+            response_char_count=len(text),
             operation=operation,
             thinking_enabled=thinking_enabled,
             reasoning_effort=reasoning_effort,
@@ -615,6 +682,12 @@ def create_adapter(
 class CircuitState:
     failures: int = 0
     opened_at: datetime | None = None
+    last_failure_at: datetime | None = None
+    last_success_at: datetime | None = None
+    last_error_code: AIErrorCode | None = None
+    last_error_message: str = ""
+    half_open_attempts: int = 0
+    half_open_in_flight: bool = False
 
 
 class AIGateway:
@@ -630,25 +703,83 @@ class AIGateway:
 
     def _ensure_circuit(self, provider: AIProvider) -> None:
         circuit = self.circuits.setdefault(provider, CircuitState())
-        if circuit.opened_at and datetime.now(UTC) - circuit.opened_at < timedelta(seconds=60):
-            raise AIProviderError(
-                provider,
-                AIErrorCode.CIRCUIT_OPEN,
-                "该 AI 厂商连续失败，熔断器正在冷却",
-                retryable=True,
-            )
         if circuit.opened_at:
-            circuit.opened_at = None
+            cooldown_active = datetime.now(UTC) - circuit.opened_at < timedelta(seconds=60)
+            if cooldown_active or circuit.half_open_in_flight:
+                raise AIProviderError(
+                    provider,
+                    AIErrorCode.CIRCUIT_OPEN,
+                    "该 AI 厂商连续失败，熔断器正在冷却",
+                    retryable=True,
+                )
+            circuit.half_open_in_flight = True
+            circuit.half_open_attempts += 1
 
-    def _record(self, provider: AIProvider, *, success: bool) -> None:
+    def _record(
+        self,
+        provider: AIProvider,
+        *,
+        success: bool,
+        error: AIProviderError | None = None,
+    ) -> None:
         circuit = self.circuits.setdefault(provider, CircuitState())
+        if error is not None and error.code == AIErrorCode.CIRCUIT_OPEN:
+            return
         if success:
             circuit.failures = 0
             circuit.opened_at = None
+            circuit.half_open_in_flight = False
+            circuit.last_success_at = datetime.now(UTC)
+            circuit.last_error_code = None
+            circuit.last_error_message = ""
             return
         circuit.failures += 1
+        circuit.half_open_in_flight = False
+        circuit.last_failure_at = datetime.now(UTC)
+        if error is not None:
+            circuit.last_error_code = error.code
+            circuit.last_error_message = error.public_message[:500]
         if circuit.failures >= 3:
             circuit.opened_at = datetime.now(UTC)
+
+    def health_snapshot(self) -> dict[str, dict]:
+        now = datetime.now(UTC)
+        snapshot: dict[str, dict] = {}
+        for provider in self.routing_order():
+            circuit = self.circuits.setdefault(provider, CircuitState())
+            decision_quality = self.service.operation_quality(
+                provider=provider,
+                operation="agent_decision",
+            )
+            cooldown_until = (
+                circuit.opened_at + timedelta(seconds=60) if circuit.opened_at else None
+            )
+            snapshot[str(provider)] = {
+                "status": (
+                    "circuit_open"
+                    if cooldown_until and cooldown_until > now
+                    else "degraded"
+                    if circuit.failures
+                    else "ready"
+                ),
+                "consecutive_failures": circuit.failures,
+                "opened_at": circuit.opened_at,
+                "cooldown_until": cooldown_until,
+                "last_failure_at": circuit.last_failure_at,
+                "last_success_at": circuit.last_success_at,
+                "last_error_code": (
+                    str(circuit.last_error_code) if circuit.last_error_code else None
+                ),
+                "last_error_message": circuit.last_error_message,
+                "half_open_attempts": circuit.half_open_attempts,
+                "half_open_in_flight": circuit.half_open_in_flight,
+                "deterministic_fallback_available": True,
+                "agent_decision_quality": decision_quality,
+                "automatic_agent_decisions_allowed": decision_quality[
+                    "automatic_allowed"
+                ],
+            }
+        return snapshot
 
     async def _record_usage(self, result: AICompletionResult) -> None:
         event = AIUsageEvent(
@@ -660,6 +791,9 @@ class AIGateway:
             reasoning_effort=result.reasoning_effort,
             prompt_version=result.prompt_version,
             schema_version=result.schema_version,
+            succeeded=True,
+            finish_reason=result.finish_reason,
+            response_char_count=result.response_char_count,
             usage=result.usage,
             latency_ms=result.latency_ms,
             created_at=result.created_at,
@@ -668,6 +802,32 @@ class AIGateway:
             await asyncio.to_thread(self.service.record_usage, event)
         except Exception:
             logger.exception("failed to persist AI usage event %s", event.id)
+
+    async def _record_failure_usage(self, error: AIProviderError) -> None:
+        if not error.provider_request_id and error.usage.total_tokens <= 0:
+            return
+        event = AIUsageEvent(
+            provider_request_id=error.provider_request_id,
+            provider=error.provider,
+            model=error.model or self.service.provider_configuration(error.provider).model,
+            operation=error.operation,
+            thinking_enabled=error.thinking_enabled,
+            reasoning_effort=error.reasoning_effort,
+            prompt_version=error.prompt_version,
+            schema_version=error.schema_version,
+            succeeded=False,
+            error_code=str(error.code),
+            error_detail=error.diagnostic_message or error.public_message,
+            finish_reason=error.finish_reason,
+            response_char_count=error.response_char_count,
+            usage=error.usage,
+            latency_ms=error.latency_ms,
+            created_at=error.created_at,
+        )
+        try:
+            await asyncio.to_thread(self.service.record_usage, event)
+        except Exception:
+            logger.exception("failed to persist failed AI usage event %s", event.id)
 
     async def test_provider(self, provider: AIProvider) -> AIProviderTestResult:
         adapter = self._adapter(provider)
@@ -711,7 +871,8 @@ class AIGateway:
             )
             self._record(provider, success=True)
         except AIProviderError as exc:
-            self._record(provider, success=False)
+            self._record(provider, success=False, error=exc)
+            await self._record_failure_usage(exc)
             result = AIProviderTestResult(
                 ok=False,
                 provider=provider,
@@ -789,6 +950,10 @@ class AIGateway:
         prompt_version: str = "v1",
         schema_version: str = "v1",
     ) -> tuple[AICompletionResult, list[AIProvider]]:
+        if max_tokens < 1 or max_tokens > MAX_STRUCTURED_OUTPUT_TOKENS:
+            raise ValueError(
+                f"max_tokens must be between 1 and {MAX_STRUCTURED_OUTPUT_TOKENS}"
+            )
         route = self.routing_order(requested_provider)
         if not route:
             raise AIProviderError(
@@ -801,6 +966,24 @@ class AIGateway:
         for provider in route:
             attempted.append(provider)
             try:
+                if operation == "agent_decision":
+                    quality = self.service.operation_quality(
+                        provider=provider,
+                        operation=operation,
+                    )
+                    if not quality["automatic_allowed"]:
+                        last_error = AIProviderError(
+                            provider,
+                            AIErrorCode.QUALITY_GATED,
+                            "该模型最近结构化决策成功率过低，自动调用已暂停",
+                            retryable=True,
+                            diagnostic_message=(
+                                f"success_rate={quality['success_rate']} "
+                                f"samples={quality['request_count']} "
+                                f"cooldown_until={quality['cooldown_until']}"
+                            ),
+                        )
+                        continue
                 self._ensure_circuit(provider)
                 adapter = self._adapter(provider)
                 try:
@@ -823,7 +1006,9 @@ class AIGateway:
                 return result, attempted
             except AIProviderError as exc:
                 last_error = exc
-                self._record(provider, success=False)
+                if exc.code != AIErrorCode.CIRCUIT_OPEN:
+                    self._record(provider, success=False, error=exc)
+                    await self._record_failure_usage(exc)
                 if requested_provider is not None or not exc.retryable:
                     break
         if last_error:

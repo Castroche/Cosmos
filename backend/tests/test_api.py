@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime, timedelta
+import threading
 from decimal import Decimal
 
 import pytest
@@ -10,18 +10,32 @@ from cosmos_quant.configuration import (
     UserConfiguration,
 )
 from cosmos_quant.demo import demo_candles, snapshot_from_candles
-from cosmos_quant.domain import PlanStatus, PriceZone
-from cosmos_quant.risk_state import RiskStateService
 from cosmos_quant.runtime import NetworkFreeRuntime
-from cosmos_quant.storage import SqliteStore
 from cosmos_quant.strategy import ExplainableTrendStrategy
 from httpx import ASGITransport, AsyncClient
 
 
+@pytest.fixture(autouse=True)
+def network_free_api_runtime(monkeypatch):
+    candles = demo_candles()
+    monkeypatch.setattr(
+        api,
+        "runtime",
+        NetworkFreeRuntime(
+            api.configuration_service,
+            candles,
+            snapshot_from_candles(candles),
+        ),
+    )
+
+
 def request(method: str, path: str, json=None):
     async def run():
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        transport = ASGITransport(app=api.app)
+        headers = {}
+        async with AsyncClient(
+            transport=transport, base_url="http://test", headers=headers
+        ) as client:
             return await client.request(method, path, json=json)
 
     return asyncio.run(run())
@@ -75,16 +89,53 @@ def test_startup_runtime_initialization_is_fail_closed_and_retryable(
     assert "temporary private API timeout" in audits[0][1]["error"]
 
 
+def test_readiness_offloads_full_database_integrity_check(monkeypatch):
+    request_thread_id = threading.get_ident()
+    integrity_thread_ids = []
+
+    def integrity_check():
+        integrity_thread_ids.append(threading.get_ident())
+        return "ok"
+
+    async def initialize():
+        return None
+
+    monkeypatch.setattr(api.store, "integrity_check", integrity_check)
+    monkeypatch.setattr(api.runtime, "initialize", initialize)
+
+    class RunningWorker:
+        def done(self):
+            return False
+
+    monkeypatch.setattr(api, "critical_workers", {"fixture": RunningWorker()})
+
+    response = request("GET", "/api/ready")
+
+    assert response.status_code == 200
+    assert response.json()["ready"] is True
+    assert integrity_thread_ids
+    assert integrity_thread_ids[0] != request_thread_id
+
+
 def test_dashboard_contract(monkeypatch):
     candles = demo_candles(350)
-    monkeypatch.setattr(api.runtime, "_candles", candles)
-    monkeypatch.setattr(api.runtime, "_snapshot", snapshot_from_candles(candles))
+    monkeypatch.setattr(
+        api,
+        "runtime",
+        NetworkFreeRuntime(
+            api.configuration_service,
+            candles,
+            snapshot_from_candles(candles),
+        ),
+    )
     response = request("GET", "/api/dashboard")
     assert response.status_code == 200
     data = response.json()
-    assert data["system"]["live_locked"] is True
-    assert data["plan"]["human_summary"]
-    assert data["risk"]["checks"]
+    assert "live_locked" not in data["system"]
+    assert "plan" not in data
+    assert "signal" not in data
+    assert "backtest" not in data
+    assert data["risk"]["checks"][0]["code"] == "trading_intelligence_v2_boundary"
     assert len(data["candles"]) == 300
 
 
@@ -100,6 +151,37 @@ def test_non_paper_strategy_sizing_uses_exchange_equity():
     assert api.strategy_sizing_equity(configuration, portfolio, Decimal("100000")) == Decimal(
         "12500"
     )
+
+
+def test_v2_llm_portfolio_context_withholds_affordability_and_sizing_fields():
+    portfolio = api.PortfolioState(
+        equity="12500",
+        cash="10000",
+        available_margin="9000",
+        used_margin="1000",
+        daily_start_equity="13000",
+        gross_exposure="2500",
+    )
+    context = api.v2_llm_portfolio_context(
+        portfolio,
+        symbol="ETH/USDT:USDT",
+        max_daily_drawdown=Decimal("0.02"),
+        risk_halted=False,
+        unresolved_reconciliation=False,
+    )
+
+    assert context["position_state"] == "FLAT"
+    assert context["daily_drawdown_limit_reached"] is True
+    for forbidden in (
+        "equity",
+        "cash",
+        "available_margin",
+        "used_margin",
+        "gross_exposure",
+        "quantity",
+        "leverage",
+    ):
+        assert forbidden not in context
 
 
 def test_default_configuration_is_contract_first():
@@ -163,130 +245,17 @@ def test_contract_plan_is_shrunk_to_available_margin_before_review():
     assert "可用保证金约束" in constrained.reasons[-1]
 
 
-def test_existing_operator_draft_is_resized_but_agent_plan_is_not_reused(
-    monkeypatch,
-):
-    candles = demo_candles()
-    market = snapshot_from_candles(candles)
-    configuration = api.configuration_service.get().configuration
-    selected_kind = api.configured_strategy_kind(
-        configuration,
-        api.closed_candles(
-            candles,
-            configuration.default_timeframe,
-            market.timestamp,
-        ),
-    )
-
-    def matching_plan():
-        plan = ExplainableTrendStrategy().generate(
-            candles,
-            market,
-            Decimal("100000"),
-        )
-        plan.algorithm = selected_kind.value
-        plan.exchange = configuration.exchange_id
-        plan.trading_mode = configuration.trading_mode
-        plan.market_type = configuration.market_type
-        plan.margin_mode = str(configuration.margin_mode)
-        plan.leverage = configuration.contract_leverage
-        plan.symbol = configuration.default_symbol
-        plan.timeframe = configuration.default_timeframe
-        plan.entry.expires_at = datetime.now(UTC) + timedelta(hours=1)
-        return plan
-
-    operator_plan = matching_plan()
-    operator_plan.status = PlanStatus.DRAFT
-    agent_plan = matching_plan()
-    agent_plan.status = PlanStatus.ACTIVE
-    agent_plan.decision_origin = "agent"
-    agent_plan.agent_goal_id = "goal-owned-by-agent"
+def test_market_window_supports_configured_timeframe_switching(monkeypatch):
+    candles = demo_candles(350)
     monkeypatch.setattr(
         api,
-        "plans",
-        {
-            operator_plan.id: operator_plan,
-            agent_plan.id: agent_plan,
-        },
-    )
-    saved = []
-    monkeypatch.setattr(api.store, "save_strategy", saved.append)
-    monkeypatch.setattr(api, "add_audit", lambda *args, **kwargs: None)
-    portfolio = api.PortfolioState(
-        equity="1000",
-        cash="100",
-        available_margin="100",
-        daily_start_equity="1000",
-        gross_exposure="0",
-    )
-
-    selected = api.ensure_plan(candles, market, portfolio)
-
-    assert selected is operator_plan
-    assert selected.sizing.notional <= Decimal("294")
-    assert saved == [operator_plan]
-    assert agent_plan.sizing.notional > selected.sizing.notional
-
-
-def test_expired_uncommitted_operator_plan_is_archived_before_reuse(
-    monkeypatch,
-):
-    candles = demo_candles()
-    market = snapshot_from_candles(candles)
-    configuration = api.configuration_service.get().configuration
-    selected_kind = api.configured_strategy_kind(
-        configuration,
-        api.closed_candles(
+        "runtime",
+        NetworkFreeRuntime(
+            api.configuration_service,
             candles,
-            configuration.default_timeframe,
-            market.timestamp,
+            snapshot_from_candles(candles),
         ),
     )
-
-    def matching_plan(expires_at):
-        plan = ExplainableTrendStrategy().generate(
-            candles,
-            market,
-            Decimal("100000"),
-        )
-        plan.algorithm = selected_kind.value
-        plan.exchange = configuration.exchange_id
-        plan.trading_mode = configuration.trading_mode
-        plan.market_type = configuration.market_type
-        plan.margin_mode = str(configuration.margin_mode)
-        plan.leverage = configuration.contract_leverage
-        plan.symbol = configuration.default_symbol
-        plan.timeframe = configuration.default_timeframe
-        plan.status = PlanStatus.DRAFT
-        plan.entry.expires_at = expires_at
-        return plan
-
-    expired = matching_plan(datetime.now(UTC) - timedelta(seconds=1))
-    current = matching_plan(datetime.now(UTC) + timedelta(hours=1))
-    monkeypatch.setattr(
-        api,
-        "plans",
-        {expired.id: expired, current.id: current},
-    )
-    saved = []
-    monkeypatch.setattr(api.store, "save_strategy", saved.append)
-    monkeypatch.setattr(api, "add_audit", lambda *args, **kwargs: None)
-    portfolio = api.PortfolioState(
-        equity="100000",
-        cash="100000",
-        available_margin="100000",
-        daily_start_equity="100000",
-        gross_exposure="0",
-    )
-
-    selected = api.ensure_plan(candles, market, portfolio)
-
-    assert expired.status == PlanStatus.ARCHIVED
-    assert selected is current
-    assert saved == [expired]
-
-
-def test_market_window_supports_configured_timeframe_switching():
     response = request("GET", "/api/market?symbol=BTC/USDT&timeframe=4h&limit=120")
     assert response.status_code == 200
     data = response.json()
@@ -295,107 +264,6 @@ def test_market_window_supports_configured_timeframe_switching():
 
     unsupported = request("GET", "/api/market?symbol=DOGE/USDT&timeframe=4h")
     assert unsupported.status_code == 400
-
-
-def test_agent_state_labels_forming_candle_and_excludes_it_from_signal_evidence():
-    candles = [
-        api.Candle(
-            timestamp=datetime(2026, 7, 28, hour, tzinfo=UTC),
-            open="100",
-            high="102",
-            low="99",
-            close=str(100 + hour),
-            volume="10",
-        )
-        for hour in (8, 9, 10)
-    ]
-    market = snapshot_from_candles(candles).model_copy(
-        update={"timestamp": datetime(2026, 7, 28, 10, 2, tzinfo=UTC)}
-    )
-    trigger = api.AgentEvent(
-        event_type=api.AgentEventType.SCHEDULE_TRIGGERED,
-        source="test",
-        goal_id="goal",
-        dedupe_key="test:forming-candle",
-        payload={"symbol": "BTC/USDT", "timeframe": "1h"},
-    )
-
-    state = api.build_agent_market_state(
-        market,
-        candles,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        trigger=trigger,
-    )
-
-    assert [
-        datetime.fromisoformat(item["timestamp"]).hour for item in state["recent_closed_candles"]
-    ] == [8, 9]
-    assert state["closed_candle_count"] == 2
-    assert datetime.fromisoformat(state["signal_data_end"]).hour == 9
-    assert datetime.fromisoformat(state["forming_candle"]["timestamp"]).hour == 10
-    assert state["forming_candle"]["is_closed"] is False
-    assert state["forming_candle"]["role"] == "live_context_only_not_signal_evidence"
-
-
-def test_agent_memory_requires_every_declared_market_dimension_to_match():
-    episodic = api.AgentMemory(
-        memory_type=api.MemoryType.EPISODIC,
-        content="ETH/USDT 1h mean-reversion outcome",
-        tags=["ETH/USDT", "1h", "long", "mean_reversion"],
-        confidence="1",
-    )
-    operational = api.AgentMemory(
-        memory_type=api.MemoryType.OPERATIONAL,
-        content="Reconciliation transport lesson",
-        tags=["reconciliation"],
-        confidence="1",
-    )
-
-    assert api.memory_relevant_to_market(
-        episodic,
-        symbol="ETH/USDT",
-        timeframe="1h",
-    )
-    assert not api.memory_relevant_to_market(
-        episodic,
-        symbol="BTC/USDT",
-        timeframe="1h",
-    )
-    assert not api.memory_relevant_to_market(
-        episodic,
-        symbol="ETH/USDT",
-        timeframe="4h",
-    )
-    assert api.memory_relevant_to_market(
-        operational,
-        symbol="BTC/USDT",
-        timeframe="4h",
-    )
-
-
-def test_signal_gate_reports_the_actual_lifecycle_failure():
-    candles = demo_candles()
-    market = snapshot_from_candles(candles)
-    plan = ExplainableTrendStrategy().generate(
-        candles,
-        market,
-        Decimal("100000"),
-    )
-    plan.entry.expires_at = datetime.now(UTC) - timedelta(seconds=1)
-    signal = api.evaluate_current_plan_signal(plan, candles, market)
-
-    decision = api.add_signal_gate(
-        api.RiskDecision(approved=True, checks=[]),
-        plan,
-        signal,
-    )
-
-    check = decision.checks[-1]
-    assert check.code == "signal_lifecycle"
-    assert check.passed is False
-    assert "过期" in check.message
-    assert "禁止执行" not in check.message
 
 
 def test_strategy_market_fit_explains_latest_closed_data_alignment():
@@ -425,10 +293,9 @@ def test_strategy_market_fit_explains_latest_closed_data_alignment():
     assert payload["summary"]
 
 
-def test_execution_requires_activation():
-    plan = request("POST", "/api/strategies/generate", json={}).json()
-    response = request("POST", f"/api/strategies/{plan['id']}/execute")
-    assert response.status_code == 409
+def test_legacy_strategy_execute_route_is_absent():
+    response = request("POST", "/api/strategies/legacy/execute")
+    assert response.status_code == 404
 
 
 def test_strategy_spec_contract_and_validation_are_exposed():
@@ -506,18 +373,8 @@ def test_cancel_order_confirms_exchange_state_and_updates_ledger():
 
 
 def test_execution_rejects_strategy_from_another_environment():
-    candles = demo_candles()
-    market = snapshot_from_candles(candles)
-    plan = ExplainableTrendStrategy().generate(candles, market, Decimal("100000"))
-    plan.status = PlanStatus.ACTIVE
-    plan.exchange = "binance"
-    api.plans[plan.id] = plan
-
-    response = request("POST", f"/api/strategies/{plan.id}/execute")
-
-    assert response.status_code == 409
-    assert "执行环境不一致" in response.json()["detail"]
-    api.plans.pop(plan.id, None)
+    response = request("POST", "/api/strategies/legacy-environment/execute")
+    assert response.status_code == 404
 
 
 def test_environment_switch_is_rejected_while_old_gateway_has_open_orders(monkeypatch):
@@ -596,233 +453,21 @@ def test_strategy_requires_version_bound_backtest_before_activation(
     tmp_path,
     monkeypatch,
 ):
-    candles = demo_candles()
-    monkeypatch.setattr(api, "plans", {})
-    monkeypatch.setattr(
-        api,
-        "risk_state_service",
-        RiskStateService(SqliteStore(tmp_path / "strategy-activation.db")),
-    )
-    monkeypatch.setattr(
-        api,
-        "runtime",
-        NetworkFreeRuntime(
-            api.configuration_service,
-            candles,
-            snapshot_from_candles(candles),
-        ),
-    )
-
-    draft = request(
-        "POST",
-        "/api/strategies/generate",
-        json={"strategy_kind": "trend", "prompt": "仅在趋势确认后执行。"},
-    ).json()
-
-    activate_draft = request(
-        "POST",
-        f"/api/strategies/{draft['id']}/activate",
-        json={"confirmation": f"ACTIVATE {draft['symbol']}"},
-    )
-    assert activate_draft.status_code == 409
-
-    approve_without_test = request(
-        "POST",
-        f"/api/strategies/{draft['id']}/approve",
-        json={"confirmation": f"APPROVE {draft['fingerprint']}"},
-    )
-    assert approve_without_test.status_code == 409
-
-    backtest = request("POST", f"/api/strategies/{draft['id']}/backtest")
-    assert backtest.status_code == 200
-    artifact = backtest.json()
-    assert artifact["dataset_id"].startswith("ds_")
-    dataset = request("GET", f"/api/research/datasets/{artifact['dataset_id']}")
-    assert dataset.status_code == 200
-    assert dataset.json()["data_fingerprint"] == artifact["data_fingerprint"]
-    assert artifact["strategy_fingerprint"] == draft["fingerprint"]
-    assert artifact["data_fingerprint"]
-    assert artifact["cost_model"]["direction_filter"] == draft["side"]
-    assert all(trade["side"] == draft["side"] for trade in artifact["trades"])
-
-    latest = request("GET", f"/api/strategies/{draft['id']}/backtest")
-    assert latest.status_code == 200
-    assert latest.json()["data_fingerprint"] == artifact["data_fingerprint"]
-
-    approval = request(
-        "POST",
-        f"/api/strategies/{draft['id']}/approve",
-        json={"confirmation": f"APPROVE {draft['fingerprint']}"},
-    )
-    assert approval.status_code == 409
-    assert "稳健性验收未通过" in approval.json()["detail"]
-
-    mark_latest_backtest_robust(draft["id"])
-    approval = request(
-        "POST",
-        f"/api/strategies/{draft['id']}/approve",
-        json={"confirmation": f"APPROVE {draft['fingerprint']}"},
-    )
-    assert approval.status_code == 200
-    approved = approval.json()
-    assert approved["status"] == "approved"
-    assert approved["approved_fingerprint"] == approved["fingerprint"]
-
-    activation = request(
-        "POST",
-        f"/api/strategies/{draft['id']}/activate",
-        json={"confirmation": f"ACTIVATE {draft['symbol']}"},
-    )
-    assert activation.status_code == 200, activation.json()
-    assert activation.json()["status"] == "active"
-
-    revision = request(
-        "POST",
-        "/api/strategies/generate",
-        json={
-            "strategy_kind": "trend",
-            "prompt": "提高突破确认要求后生成新版本。",
-            "revision_of": draft["id"],
-        },
-    )
-    assert revision.status_code == 200
-    revised = revision.json()
-    assert revised["version"] == draft["version"] + 1
-    assert revised["lineage_id"] == draft["lineage_id"]
-    assert revised["supersedes_plan_id"] == draft["id"]
-    assert revised["status"] == "draft"
+    del tmp_path, monkeypatch
+    response = request("POST", "/api/strategies/legacy/activate", json={})
+    assert response.status_code == 404
 
 
 def test_activation_rechecks_current_contract_risk():
-    draft = request(
-        "POST",
-        "/api/strategies/generate",
-        json={
-            "equity": "10000000",
-            "risk_fraction": "0.03",
-            "prompt": "使用超大纸面权益生成计划以验证激活阶段会重新执行组合风控。",
-        },
-    ).json()
-    request("POST", f"/api/strategies/{draft['id']}/backtest")
-    mark_latest_backtest_robust(draft["id"])
-    approved = request(
-        "POST",
-        f"/api/strategies/{draft['id']}/approve",
-        json={"confirmation": f"APPROVE {draft['fingerprint']}"},
-    )
-    assert approved.status_code == 200
-
-    activation = request(
-        "POST",
-        f"/api/strategies/{draft['id']}/activate",
-        json={"confirmation": f"ACTIVATE {draft['symbol']}"},
-    )
-    assert activation.status_code == 409
-    assert "策略未通过激活风控" in activation.json()["detail"]
+    response = request("POST", "/api/strategies/legacy/approve", json={})
+    assert response.status_code == 404
 
 
 def test_automatic_strategy_scan_submits_once_and_pauses_signal(tmp_path, monkeypatch):
-    candles = demo_candles()
-    monkeypatch.setattr(api, "plans", {})
-    monkeypatch.setattr(
-        api,
-        "risk_state_service",
-        RiskStateService(SqliteStore(tmp_path / "automatic-scan.db")),
-    )
-    monkeypatch.setattr(
-        api,
-        "runtime",
-        NetworkFreeRuntime(
-            api.configuration_service,
-            candles,
-            snapshot_from_candles(candles),
-        ),
-    )
-
-    async def scenario():
-        market = snapshot_from_candles(candles)
-        plan = ExplainableTrendStrategy().generate(
-            candles,
-            market,
-            Decimal("100000"),
-            risk_fraction=Decimal("0.005"),
-            minimum_reward_risk=Decimal("1.8"),
-        )
-        plan.status = PlanStatus.ACTIVE
-        configuration = api.configuration_service.get().configuration
-        plan.exchange = configuration.exchange_id
-        plan.trading_mode = configuration.trading_mode
-        plan.market_type = configuration.market_type
-        plan.margin_mode = str(configuration.margin_mode)
-        plan.leverage = configuration.contract_leverage
-        plan.entry.zone = PriceZone(lower=market.bid, upper=market.ask)
-        plan.entry.expires_at = datetime.now(UTC) + timedelta(hours=1)
-        api.plans[plan.id] = plan
-        await api.runtime.initialize()
-        before = sum(order.plan_id == plan.id for order in api.runtime.execution.orders.values())
-
-        await api.run_strategy_scan_once(True)
-
-        assert plan.status == "paused"
-        assert api.runtime.execution is not None
-        after = sum(order.plan_id == plan.id for order in api.runtime.execution.orders.values())
-        assert after == before + 1
-        api.plans.pop(plan.id, None)
-
-    asyncio.run(scenario())
+    del tmp_path, monkeypatch
+    assert not hasattr(api, "run_strategy_scan_once")
 
 
 def test_automatic_strategy_scan_does_not_submit_agent_owned_plan(tmp_path, monkeypatch):
-    candles = demo_candles()
-    monkeypatch.setattr(api, "plans", {})
-    monkeypatch.setattr(
-        api,
-        "risk_state_service",
-        RiskStateService(SqliteStore(tmp_path / "agent-scan-isolation.db")),
-    )
-    monkeypatch.setattr(
-        api,
-        "runtime",
-        NetworkFreeRuntime(
-            api.configuration_service,
-            candles,
-            snapshot_from_candles(candles),
-        ),
-    )
-
-    async def scenario():
-        market = snapshot_from_candles(candles)
-        plan = ExplainableTrendStrategy().generate(
-            candles,
-            market,
-            Decimal("100000"),
-            risk_fraction=Decimal("0.005"),
-            minimum_reward_risk=Decimal("1.8"),
-        )
-        plan.status = PlanStatus.ACTIVE
-        plan.decision_origin = "agent"
-        plan.agent_goal_id = "goal-owned-by-agent"
-        configuration = api.configuration_service.get().configuration
-        plan.exchange = configuration.exchange_id
-        plan.trading_mode = configuration.trading_mode
-        plan.market_type = configuration.market_type
-        plan.margin_mode = str(configuration.margin_mode)
-        plan.leverage = configuration.contract_leverage
-        plan.entry.zone = PriceZone(lower=market.bid, upper=market.ask)
-        plan.entry.expires_at = datetime.now(UTC) + timedelta(hours=1)
-        api.plans[plan.id] = plan
-        await api.runtime.initialize()
-        assert api.runtime.execution is not None
-        before = len(api.runtime.execution.orders)
-
-        await api.run_strategy_scan_once(True)
-
-        assert plan.status == PlanStatus.ACTIVE
-        assert len(api.runtime.execution.orders) == before
-
-    asyncio.run(scenario())
-
-
-history = demo_candles()
-api.runtime = NetworkFreeRuntime(api.configuration_service, history, snapshot_from_candles(history))
-app = api.app
+    del tmp_path, monkeypatch
+    assert not hasattr(api, "run_strategy_scan_once")

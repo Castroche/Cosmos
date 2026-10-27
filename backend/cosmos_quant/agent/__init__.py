@@ -1,37 +1,5 @@
-"""Durable observe-reason-act primitives for the COSMOS trading agent."""
+"""Read-only pre-v2 evidence and offline Shadow research helpers."""
 
-from .schemas import (
-    AgentAction,
-    AgentAutonomyMode,
-    AgentDecision,
-    AgentEvent,
-    AgentEventType,
-    AgentGoal,
-    AgentMemory,
-    AgentObservation,
-    AgentRun,
-    AgentRunStatus,
-    AgentState,
-    AgentToolCall,
-    ToolRiskClass,
-    TradeEpisode,
-    TradeEpisodeStatus,
-)
+from .schemas import AgentAutonomyMode, TradeEpisode, TradeEpisodeStatus
 
-__all__ = [
-    "AgentAction",
-    "AgentAutonomyMode",
-    "AgentDecision",
-    "AgentEvent",
-    "AgentEventType",
-    "AgentGoal",
-    "AgentMemory",
-    "AgentObservation",
-    "AgentRun",
-    "AgentRunStatus",
-    "AgentState",
-    "AgentToolCall",
-    "ToolRiskClass",
-    "TradeEpisode",
-    "TradeEpisodeStatus",
-]
+__all__ = ["AgentAutonomyMode", "TradeEpisode", "TradeEpisodeStatus"]

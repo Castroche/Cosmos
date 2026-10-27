@@ -58,6 +58,41 @@ def test_resampling_excludes_incomplete_higher_timeframe_bar():
     assert all(candle.volume > 0 for candle in result)
 
 
+def test_crypto_5m_context_resampling_is_closed_bar_and_future_append_invariant():
+    start = datetime(2026, 8, 1, tzinfo=UTC)
+    frozen = [
+        Candle(
+            timestamp=start + timedelta(minutes=5 * index),
+            open=Decimal(100 + index),
+            high=Decimal(101 + index),
+            low=Decimal(99 + index),
+            close=Decimal("100.5") + index,
+            volume=Decimal("10"),
+        )
+        for index in range(288)
+    ]
+    future = [
+        Candle(
+            timestamp=start + timedelta(minutes=5 * index),
+            open=Decimal("9999"),
+            high=Decimal("10001"),
+            low=Decimal("9998"),
+            close=Decimal("10000"),
+            volume=Decimal("1"),
+        )
+        for index in range(288, 299)
+    ]
+
+    for target in ("15m", "1h", "4h"):
+        before = resample_closed_candles(frozen, "5m", target)
+        after = resample_closed_candles([*frozen, *future], "5m", target)
+        assert before == after[: len(before)]
+
+    assert len(resample_closed_candles(frozen, "5m", "15m")) == 96
+    assert len(resample_closed_candles(frozen, "5m", "1h")) == 24
+    assert len(resample_closed_candles(frozen, "5m", "4h")) == 6
+
+
 def test_market_quality_detects_gaps_duplicates_and_invalid_ohlc():
     candles = demo_candles(60)
     duplicate = candles[-1]
@@ -151,6 +186,40 @@ def test_websocket_tick_updates_forming_candle_and_publishes(tmp_path):
     assert len(candles) == 2
     assert candles[-1].timestamp == datetime(2026, 7, 13, 9, tzinfo=UTC)
     assert candles[-1].close == Decimal("104")
+
+
+def test_websocket_snapshots_and_stream_events_are_isolated_by_symbol(tmp_path):
+    service = MarketDataService(SqliteStore(tmp_path / "multi-symbol-market.db"))
+    observed_at = datetime(2026, 7, 13, 8, 30, tzinfo=UTC)
+    for symbol, close in (("BTC/USDT", "100"), ("ETH/USDT", "200")):
+        service._live_candles[(symbol, "5m")] = [
+            Candle(
+                timestamp=datetime(2026, 7, 13, 8, 30, tzinfo=UTC),
+                open=Decimal(close),
+                high=Decimal(close),
+                low=Decimal(close),
+                close=Decimal(close),
+                volume=Decimal("1"),
+            )
+        ]
+        service.update_websocket(
+            MarketSnapshot(
+                symbol=symbol,
+                timestamp=observed_at,
+                bid=Decimal(close) - Decimal("0.1"),
+                ask=Decimal(close) + Decimal("0.1"),
+                last=Decimal(close),
+                source="okx:websocket",
+            )
+        )
+
+    btc = service.stream_event("BTC/USDT", "5m")
+    eth = service.stream_event("ETH/USDT", "5m")
+
+    assert btc is not None and btc["market"]["symbol"] == "BTC/USDT"
+    assert eth is not None and eth["market"]["symbol"] == "ETH/USDT"
+    assert btc["candles"]["5m"]["close"] == "100"
+    assert eth["candles"]["5m"]["close"] == "200"
 
 
 def test_okx_native_candle_parser_maps_ohlcv_and_confirmation():

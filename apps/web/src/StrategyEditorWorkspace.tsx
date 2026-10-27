@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
-import { BookMarked, CheckCircle2, RefreshCw, Settings2, Sparkles } from 'lucide-react'
+import { BookMarked, RefreshCw, Settings2, Sparkles } from 'lucide-react'
 import {
-  approveStrategy,
   backtestStrategy,
   createPersonalStrategy,
   generateStrategy,
@@ -67,14 +66,6 @@ export default function StrategyEditorWorkspace({
     } finally { setBusy(false) }
   }
 
-  const approve = async () => {
-    if (!plan) return
-    setBusy(true)
-    try { const next = await approveStrategy(plan); setPlan(next); onGenerated(next); setMessage('策略版本已审核') }
-    catch (cause) { setMessage(cause instanceof Error ? cause.message : '审核失败') }
-    finally { setBusy(false) }
-  }
-
   const saveToLibrary = async () => {
     if (!plan?.strategy_spec) return
     setBusy(true)
@@ -86,7 +77,7 @@ export default function StrategyEditorWorkspace({
   }
 
   return <section className="ops-page strategy-editor-workspace">
-    <header className="ops-page-header"><div><span className="ops-kicker">人工策略编译器</span><h1>策略编辑器</h1><p>记录研究意图并生成确定性交易计划；自动研究候选已移至研究 Agent。</p></div><button className="button ghost" onClick={onOpenSettings}><Settings2 />修改默认风险</button></header>
+    <header className="ops-page-header"><div><span className="ops-kicker">离线研究编译器</span><h1>策略编辑器</h1><p>记录研究意图、生成候选并回测；这里不会激活计划或提交订单。</p></div><button className="button ghost" onClick={onOpenSettings}><Settings2 />修改默认风险</button></header>
     <div className="strategy-editor-layout">
       <main className="strategy-editor-form">
         <section><div className="editor-step"><b>01</b><div><strong>研究意图</strong><span>用于版本审计，不直接控制订单。</span></div></div><textarea rows={6} value={request.prompt} onChange={event => update('prompt', event.target.value)} /><div className="prompt-presets"><button onClick={() => update('prompt', '顺应主要趋势，等待回踩确认后入场，避免追涨杀跌。')}>趋势回踩</button><button onClick={() => update('prompt', '仅在明确区间内寻找均值回归，价格重回均值后退出。')}>均值回归</button><button onClick={() => update('prompt', '等待区间突破和成交确认，假突破时立即退出。')}>区间突破</button></div></section>
@@ -100,7 +91,7 @@ export default function StrategyEditorWorkspace({
           <div className="plan-price-levels"><article className="entry"><span>开仓区间</span><strong>{money.format(Number(plan.entry.zone.lower))} — {money.format(Number(plan.entry.zone.upper))}</strong><small>{plan.entry.trigger}</small></article><article className="stop"><span>硬止损</span><strong>{money.format(Number(plan.exit.stop_loss))}</strong><small>{plan.exit.invalidation}</small></article>{plan.exit.take_profits.map((target, index) => <article key={target.price}><span>止盈 {index + 1}</span><strong>{money.format(Number(target.price))}</strong><small>平仓 {Number(target.close_fraction) * 100}%</small></article>)}</div>
           <dl className="plan-sizing"><div><dt>建议数量</dt><dd>{plan.sizing.suggested_quantity}</dd></div><div><dt>名义价值</dt><dd>{money.format(Number(plan.sizing.notional))}</dd></div><div><dt>计划亏损</dt><dd>{money.format(Number(plan.sizing.risk_amount))}</dd></div><div><dt>杠杆</dt><dd>{plan.leverage}x</dd></div></dl>
           <div className={`backtest-verdict ${backtest?.robustness_passed ? 'passed' : status}`}><div><span>稳健性验证</span><strong>{backtest?.robustness_passed ? 'PASS' : status === 'running' || status === 'queued' ? '正在计算' : 'HOLD'}</strong></div>{backtest && <dl><div><dt>收益</dt><dd>{backtest.return_percent}%</dd></div><div><dt>PF</dt><dd>{backtest.profit_factor}</dd></div><div><dt>最大回撤</dt><dd>{backtest.max_drawdown_percent}%</dd></div><div><dt>交易数</dt><dd>{backtest.total_trades}</dd></div></dl>}{backtest && <p>{backtest.validation_reasons.join(' · ')}</p>}</div>
-          <div className="plan-inspector-actions"><button className="button ghost" disabled={busy || !plan.strategy_spec} onClick={() => void saveToLibrary()}><BookMarked />保存到个人策略库</button>{plan.status === 'draft' && <button className="button primary" disabled={busy || !backtest?.robustness_passed} onClick={() => void approve()}><CheckCircle2 />审核此版本</button>}<button className="button ghost" disabled={busy} onClick={() => void generate()}><RefreshCw />重新生成</button></div>
+          <div className="plan-inspector-actions"><button className="button ghost" disabled={busy || !plan.strategy_spec} onClick={() => void saveToLibrary()}><BookMarked />保存到个人策略库</button><button className="button ghost" disabled={busy} onClick={() => void generate()}><RefreshCw />重新生成</button></div>
         </>}
       </aside>
     </div>

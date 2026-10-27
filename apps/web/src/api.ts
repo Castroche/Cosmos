@@ -26,24 +26,41 @@ import type {
   PairStrategySpec,
   StrategyCandidate,
   StrategyMarketFit,
-  AgentControlState,
-  AgentForwardPerformance,
-  AgentReadiness,
-  AgentGoal,
-  AgentRunTrace,
-  AgentPolicy,
   RiskControlState,
-  AgentRuntimeOverview,
-  AgentLaunchRequest,
-  AgentLaunchPreview,
-  AgentLaunchResult,
   StrategyLibraryPage,
   StrategyLibraryItem,
   AuditEventPage,
+  ReviewOverview,
+  ReviewEvidenceItem,
+  ReviewJobView,
+  Crypto5mDataContract,
+  SandboxAdmissionView,
+  DevelopmentAuditView,
+  AIHealth,
+  HumanLiveGrantPreviewV2,
+  HumanLiveGrantV2,
+  MarketStateV2,
+  TradingIntelligenceOverview,
+  TradeHistoryV2,
+  EntryOrderRuntime,
+  PositionRuntimeV2,
+  WakeConditionV2,
 } from './types'
 
+export class ApiError extends Error {
+  status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 async function api<T>(path: string, init?: RequestInit, timeout = 15_000): Promise<T> {
-  const response = await fetch(path, { ...init, signal: AbortSignal.timeout(timeout) })
+  const signal = init?.signal
+    ? AbortSignal.any([init.signal, AbortSignal.timeout(timeout)])
+    : AbortSignal.timeout(timeout)
+  const response = await fetch(path, { ...init, signal, credentials: 'same-origin' })
   if (!response.ok) {
     let message = `请求失败 (${response.status})`
     try {
@@ -53,7 +70,7 @@ async function api<T>(path: string, init?: RequestInit, timeout = 15_000): Promi
     } catch {
       // The HTTP status remains the authoritative fallback.
     }
-    throw new Error(message)
+    throw new ApiError(message, response.status)
   }
   return response.json() as Promise<T>
 }
@@ -89,6 +106,10 @@ export function getAIUsage(days = 30, provider?: AIProvider): Promise<AIUsageRep
   const query = new URLSearchParams({ days: String(days) })
   if (provider) query.set('provider', provider)
   return api<AIUsageReport>(`/api/ai/usage?${query}`)
+}
+
+export function getAIHealth(): Promise<AIHealth> {
+  return api<AIHealth>('/api/ai/health')
 }
 
 export function saveAISettings(update: AIConfigurationUpdate): Promise<AIConfigurationView> {
@@ -372,26 +393,6 @@ export function openMarketStream(
   return socket
 }
 
-export function approveStrategy(plan: Plan): Promise<Plan> {
-  return api<Plan>(`/api/strategies/${plan.id}/approve`, {
-    method: 'POST',
-    headers: jsonHeaders,
-    body: JSON.stringify({ confirmation: `APPROVE ${plan.fingerprint}` }),
-  })
-}
-
-export function activateStrategy(plan: Plan): Promise<Plan> {
-  return api<Plan>(`/api/strategies/${plan.id}/activate`, {
-    method: 'POST',
-    headers: jsonHeaders,
-    body: JSON.stringify({ confirmation: `ACTIVATE ${plan.symbol}` }),
-  })
-}
-
-export async function executeStrategy(plan: Plan): Promise<void> {
-  await api(`/api/strategies/${plan.id}/execute`, { method: 'POST' })
-}
-
 export async function cancelOrder(orderId: string): Promise<void> {
   await api(`/api/orders/${encodeURIComponent(orderId)}/cancel`, { method: 'POST' })
 }
@@ -410,55 +411,47 @@ export async function resumeTrading(): Promise<void> {
   })
 }
 
-export function getAgentState(): Promise<AgentControlState> {
-  return api<AgentControlState>('/api/agent/state')
+export function getReviewOverview(): Promise<ReviewOverview> {
+  return api<ReviewOverview>('/api/review/overview', undefined, 30_000)
 }
 
-export function getAgentOverview(): Promise<AgentRuntimeOverview> {
-  return api<AgentRuntimeOverview>('/api/agent/overview')
+export function getReviewEvidence(): Promise<ReviewEvidenceItem[]> {
+  return api<ReviewEvidenceItem[]>('/api/review/evidence?limit=500', undefined, 30_000)
 }
 
-export function previewAgentLaunch(request: AgentLaunchRequest): Promise<AgentLaunchPreview> {
-  return api<AgentLaunchPreview>('/api/agent/launch/preview', {
-    method: 'POST', headers: jsonHeaders, body: JSON.stringify(request),
-  })
+export function getReviewJobs(): Promise<ReviewJobView[]> {
+  return api<ReviewJobView[]>('/api/review/jobs', undefined, 30_000)
 }
 
-export function launchAgent(request: AgentLaunchRequest): Promise<AgentLaunchResult> {
-  return api<AgentLaunchResult>('/api/agent/launch', {
-    method: 'POST', headers: jsonHeaders, body: JSON.stringify(request),
-  })
-}
-
-export function archiveAgentGoal(goalId: string): Promise<AgentGoal> {
-  return api<AgentGoal>(`/api/agent/goals/${encodeURIComponent(goalId)}/archive`, {
+export function retryReviewJob(jobId: string): Promise<ReviewJobView> {
+  return api<ReviewJobView>(`/api/review/jobs/${encodeURIComponent(jobId)}/retry`, {
     method: 'POST',
-  })
+  }, 30_000)
 }
 
-export function restoreAgentGoal(goalId: string): Promise<AgentGoal> {
-  return api<AgentGoal>(`/api/agent/goals/${encodeURIComponent(goalId)}/restore`, {
-    method: 'POST',
-  })
+export function reconcileReviewBacklog(): Promise<{
+  queued: number
+  migrated: number
+  contract_rejected: number
+  existing: number
+  total_candidates: number
+  legacy: number
+  worker_status: string
+  worker_activity: string
+}> {
+  return api('/api/review/backlog/reconcile', { method: 'POST' }, 60_000)
 }
 
-export function openAgentStream(
-  onOverview: (overview: AgentRuntimeOverview) => void,
-  onState: (state: 'connected' | 'disconnected' | 'error') => void,
-): WebSocket {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const socket = new WebSocket(`${protocol}//${window.location.host}/ws/agent`)
-  socket.addEventListener('open', () => onState('connected'))
-  socket.addEventListener('message', message => {
-    const event = JSON.parse(String(message.data)) as {
-      type: string
-      data?: AgentRuntimeOverview
-    }
-    if (event.type === 'agent_overview' && event.data) onOverview(event.data)
-  })
-  socket.addEventListener('error', () => onState('error'))
-  socket.addEventListener('close', () => onState('disconnected'))
-  return socket
+export function getCrypto5mDataContract(): Promise<Crypto5mDataContract> {
+  return api<Crypto5mDataContract>('/api/research/data-contracts/crypto-5m-v1', undefined, 30_000)
+}
+
+export function getSandboxAdmissions(): Promise<SandboxAdmissionView[]> {
+  return api<SandboxAdmissionView[]>('/api/research/sandbox-admissions', undefined, 30_000)
+}
+
+export function getDevelopmentAudits(): Promise<DevelopmentAuditView[]> {
+  return api<DevelopmentAuditView[]>('/api/research/development-audits', undefined, 30_000)
 }
 
 export function getStrategyLibrary(params: {
@@ -529,54 +522,162 @@ export function getAuditEvents(params: {
   return api<AuditEventPage>(`/api/audit/events?${query}`)
 }
 
-export function getAgentReadiness(): Promise<AgentReadiness> {
-  return api<AgentReadiness>('/api/agent/readiness')
+export function latestEntryOrders(entries: EntryOrderRuntime[] = []): EntryOrderRuntime[] {
+  const latest = new Map<string, EntryOrderRuntime>()
+  for (const entry of entries) {
+    const previous = latest.get(entry.entry_id)
+    const newer = previous && entry.version != null && previous.version != null && entry.version !== previous.version
+      ? entry.version > previous.version
+      : !previous || Date.parse(entry.updated_at) >= Date.parse(previous.updated_at)
+    if (newer) {
+      latest.set(entry.entry_id, entry)
+    }
+  }
+  return [...latest.values()].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))
 }
 
-export function getAgentForwardPerformance(): Promise<AgentForwardPerformance> {
-  return api<AgentForwardPerformance>('/api/agent/performance?autonomy_mode=sandbox')
+export function isPendingEntry(entry: EntryOrderRuntime): boolean {
+  return ['SUBMITTING', 'OPEN', 'PARTIALLY_FILLED', 'CANCEL_PENDING', 'UNCERTAIN'].includes(entry.status)
 }
 
-export function getAgentRunTrace(runId: string): Promise<AgentRunTrace> {
-  return api<AgentRunTrace>(`/api/agent/runs/${encodeURIComponent(runId)}`)
+export function isActualPosition(position: PositionRuntimeV2): boolean {
+  return !['FLAT', 'CLOSED', 'OPENING'].includes(position.state) && Number(position.remaining_quantity) > 0
 }
 
-export function saveAgentPolicy(policy: AgentPolicy, confirmation: string): Promise<AgentPolicy> {
-  return api<AgentPolicy>(`/api/agent/policies/${encodeURIComponent(policy.id)}`, {
-    method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ policy, confirmation }),
+export function entryStatusLabel(status: EntryOrderRuntime['status']): string {
+  const labels: Record<EntryOrderRuntime['status'], string> = {
+    SUBMITTING: '提交中', OPEN: '待成交', PARTIALLY_FILLED: '部分成交', FILLED: '已成交',
+    CANCEL_PENDING: '撤单确认中', CANCELLED: '已撤单', REJECTED: '已拒绝',
+    UNCERTAIN: '状态待核对', SHADOW_RECORDED: '影子记录（未下单）',
+  }
+  return labels[status] ?? status
+}
+
+export function describeWakeCondition(condition: WakeConditionV2): string {
+  const value = String(condition.value ?? '—')
+  const range = `${condition.lower ?? '—'} – ${condition.upper ?? '—'}`
+  const metric = condition.path ?? '指标'
+  const descriptions: Record<string, string> = {
+    PRICE_CROSSES_ABOVE: `价格向上突破 ${value}`,
+    PRICE_CROSSES_BELOW: `价格向下跌破 ${value}`,
+    PRICE_IN_ZONE: `价格进入 ${range}`,
+    CANDLE_CLOSE_ABOVE: `${condition.timeframe ?? ''} K 线收盘价高于 ${value}`,
+    CANDLE_CLOSE_BELOW: `${condition.timeframe ?? ''} K 线收盘价低于 ${value}`,
+    METRIC_GT: `${metric} > ${value}`, METRIC_LT: `${metric} < ${value}`,
+    METRIC_CROSSES_ABOVE: `${metric} 向上突破 ${value}`,
+    METRIC_CROSSES_BELOW: `${metric} 向下跌破 ${value}`,
+    METRIC_IN_RANGE: `${metric} 进入 ${range}`,
+    STRUCTURE_CHANGED: `市场结构变化${condition.value == null ? '' : `：${value}`}`,
+    REGIME_CHANGED: `行情状态变化${condition.value == null ? '' : `：${value}`}`,
+    EXPIRES_AT: `到期 ${condition.expires_at ?? value}`,
+    ORDER_EVENT: `订单事件：${value}`, POSITION_EVENT: `持仓事件：${value}`,
+    EXTERNAL_EVENT: `外部事件：${value}`,
+  }
+  if (condition.kind === 'ALL' || condition.kind === 'ANY') {
+    return `${condition.kind === 'ALL' ? '全部满足' : '任一满足'}（${condition.children.map(describeWakeCondition).join('；')}）`
+  }
+  return descriptions[condition.kind] ?? `${condition.kind} ${metric} ${value}`
+}
+
+export function wakeActionLabel(action: WakeConditionV2['action']): string {
+  return { RECALL_LLM: '重新评估策略', EXECUTE_ENTRY: '执行入场', CANCEL_PLAN: '取消计划', EXIT_POSITION: '退出持仓' }[action]
+}
+
+export async function getTradingIntelligenceOverview(): Promise<TradingIntelligenceOverview> {
+  const overview = await api<TradingIntelligenceOverview>('/api/trading-intelligence/overview')
+  // Each response replaces the snapshot, including cleared reasons and removed orders.
+  return { ...overview, entry_orders: overview.entry_orders == null ? undefined : latestEntryOrders(overview.entry_orders) }
+}
+
+export function getTradingIntelligenceTradeHistory(
+  symbol: MarketStateV2['symbol'] | null,
+  days: number,
+): Promise<TradeHistoryV2> {
+  const query = new URLSearchParams({ days: String(days), limit: '1000' })
+  if (symbol) query.set('symbol', symbol)
+  return api<TradeHistoryV2>(`/api/trading-intelligence/trade-history?${query}`)
+}
+
+export function ingestTradingIntelligenceMarketState(state: MarketStateV2): Promise<MarketStateV2> {
+  return api<MarketStateV2>('/api/trading-intelligence/market-state', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify(state),
   })
 }
 
-export function createAgentGoal(goal: Omit<AgentGoal, 'id' | 'status' | 'created_at' | 'updated_at'>): Promise<AgentGoal> {
-  return api<AgentGoal>('/api/agent/goals', {
-    method: 'POST', headers: jsonHeaders, body: JSON.stringify(goal),
+export function refreshTradingIntelligenceMarketState(
+  symbol: MarketStateV2['symbol'],
+): Promise<MarketStateV2> {
+  return api<MarketStateV2>(`/api/trading-intelligence/market-state/${encodeURIComponent(symbol)}/refresh`, {
+    method: 'POST',
+  }, 120_000)
+}
+
+export type AutomationCommissioningV2 = {
+  eligible: boolean
+  blockers: string[]
+  mode?: 'SHADOW' | 'OKX_DEMO'
+  equity?: string
+  open_position_count?: number
+  open_order_count?: number
+  unknown_position_count?: number
+  unknown_order_count?: number
+  protection?: Record<string, boolean>
+}
+
+export function commissionTradingIntelligenceDemo(
+  symbols: MarketStateV2['symbol'][],
+): Promise<AutomationCommissioningV2> {
+  return api<AutomationCommissioningV2>('/api/trading-intelligence/automation/commission', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ mode: 'OKX_DEMO', symbols }),
+  }, 120_000)
+}
+
+export function startTradingIntelligenceDemo(
+  symbols: MarketStateV2['symbol'][],
+): Promise<TradingIntelligenceOverview['automation']> {
+  return api<TradingIntelligenceOverview['automation']>('/api/trading-intelligence/automation/start', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ mode: 'OKX_DEMO', symbols }),
+  }, 180_000)
+}
+
+export function stopTradingIntelligenceAutomation(): Promise<TradingIntelligenceOverview['automation']> {
+  return api<TradingIntelligenceOverview['automation']>('/api/trading-intelligence/automation/stop', {
+    method: 'POST',
   })
 }
 
-export function updateAgentGoalScope(
-  goal: AgentGoal,
-  update: Pick<AgentGoal, 'objective' | 'symbols' | 'timeframes' | 'poll_seconds'>,
-): Promise<AgentGoal> {
-  return api<AgentGoal>(`/api/agent/goals/${encodeURIComponent(goal.id)}`, {
-    method: 'PUT', headers: jsonHeaders,
-    body: JSON.stringify({ ...update, confirmation: `UPDATE AGENT GOAL ${goal.id}` }),
+export type LiveGrantDraftV2 = {
+  symbols: MarketStateV2['symbol'][]
+  max_risk_per_trade: string
+  max_portfolio_risk: string
+  max_leverage: string
+  max_daily_drawdown: string
+  max_open_positions: number
+  valid_hours: number
+}
+
+export function previewHumanLiveGrantV2(
+  request: LiveGrantDraftV2,
+): Promise<HumanLiveGrantPreviewV2> {
+  return api<HumanLiveGrantPreviewV2>('/api/trading-intelligence/live-grants/preview', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify(request),
   })
 }
 
-export function setAgentGoalStatus(goal: AgentGoal, status: 'active' | 'paused'): Promise<AgentGoal> {
-  const verb = status === 'active' ? 'RESUME' : 'PAUSE'
-  return api<AgentGoal>(`/api/agent/goals/${goal.id}/status`, {
-    method: 'PUT', headers: jsonHeaders,
-    body: JSON.stringify({ status, confirmation: `${verb} AGENT ${goal.id}` }),
+export function issueHumanLiveGrantV2(
+  request: LiveGrantDraftV2 & {
+    configuration_fingerprint: string
+    risk_confirmation_one: boolean
+    risk_confirmation_two: boolean
+  },
+): Promise<HumanLiveGrantV2> {
+  return api<HumanLiveGrantV2>('/api/trading-intelligence/live-grants', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify(request),
   })
 }
 
-export async function triggerAgentGoal(goalId: string): Promise<void> {
-  await api(`/api/agent/goals/${goalId}/trigger`, {
-    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ event_type: 'manual_triggered', payload: {} }),
+export function revokeHumanLiveGrantV2(grantId: string): Promise<HumanLiveGrantV2> {
+  return api<HumanLiveGrantV2>(`/api/trading-intelligence/live-grants/${encodeURIComponent(grantId)}`, {
+    method: 'DELETE',
   })
-}
-
-export async function runAgentOnce(goalId: string): Promise<void> {
-  await api(`/api/agent/goals/${goalId}/run-once`, { method: 'POST' }, 180_000)
 }

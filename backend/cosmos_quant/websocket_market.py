@@ -6,8 +6,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
 
-import websockets
-
+from . import websocket_transport as websockets
 from .domain import Candle, MarketSnapshot
 
 

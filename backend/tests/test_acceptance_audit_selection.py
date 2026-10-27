@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from scripts.acceptance_audit import (  # noqa: E402
+    EXECUTION_FAULT_TESTS,
     _campaign_job_replay_key,
     _campaign_profitability_evidence,
     _canonical_campaign_key,
@@ -13,6 +14,13 @@ from scripts.acceptance_audit import (  # noqa: E402
     _qualified_materialization_group,
     _select_campaign_replay_job,
 )
+
+
+def test_execution_fault_matrix_references_existing_current_runtime_tests():
+    root = Path(__file__).resolve().parents[2]
+    assert all((root / test_file).is_file() for test_file in EXECUTION_FAULT_TESTS)
+    assert "backend/tests/test_v2_execution.py" in EXECUTION_FAULT_TESTS
+    assert "backend/tests/test_v2_automation_runtime.py" in EXECUTION_FAULT_TESTS
 
 
 def test_causal_campaign_replay_reconstructs_frozen_policy_hypotheses():

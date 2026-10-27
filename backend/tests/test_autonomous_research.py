@@ -164,6 +164,58 @@ def test_free_dsl_is_shadow_only_and_public_result_has_no_performance_metrics(tm
     assert len(store.list_research_trials()) == 1
 
 
+def test_crypto_5m_cost_turnover_gate_rejects_before_empirical_return_trial(tmp_path):
+    store = SqliteStore(tmp_path / "research.db")
+    gate_names = (
+        "trend",
+        "volatility",
+        "liquidity",
+        "funding",
+        "open_interest",
+        "basis",
+        "order_flow",
+    )
+    dsl = _dsl().model_copy(
+        update={
+            "regime_gates": {name: "long" for name in gate_names},
+            "risk": _dsl().risk.model_copy(update={"maximum_holding_bars": 6}),
+        }
+    )
+    snapshot = _snapshot().model_copy(
+        update={
+            "timeframe_seconds": 300,
+            "market_scope": (
+                "binance:BTC/USDT",
+                "binance:ETH/USDT",
+                "binance:SOL/USDT",
+                "okx:BTC/USDT",
+                "okx:ETH/USDT",
+                "okx:SOL/USDT",
+            ),
+        }
+    )
+    request = _request(CandidateOrigin.FREE_DSL).model_copy(
+        update={
+            "idempotency_key": "crypto-cost-gate-00000001",
+            "research_profile": "crypto_5m_v1",
+            "dsl": dsl,
+            "snapshot": snapshot,
+            "model_artifact_ids": ("linear", "gbdt", "ensemble"),
+            "transaction_cost_bps": Decimal("8"),
+        }
+    )
+
+    result = FastGateEngine(store, _identity()).run(request)
+
+    assert result.disposition == ResearchDisposition.REJECTED
+    assert {
+        "round_trip_cost_above_0_25r",
+        "portfolio_turnover_above_six_per_day",
+    }.intersection(result.reason_codes)
+    assert store.list_research_trials() == []
+    assert any("return_data_accessed\":\"false" in item for item in result.evidence_references)
+
+
 def test_certified_generator_can_receive_one_bar_low_risk_grant(tmp_path):
     store = SqliteStore(tmp_path / "research.db")
     identity = _identity()

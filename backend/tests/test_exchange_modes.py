@@ -35,22 +35,35 @@ def service(tmp_path: Path):
     return ConfigurationService(SqliteStore(tmp_path / "cosmos.db"), MemorySecrets())
 
 
-def test_live_mode_requires_explicit_enable_flag(tmp_path):
-    config = UserConfiguration(trading_mode="live", live_trading_enabled=False)
-    with pytest.raises(ValueError, match="显式启用"):
-        service(tmp_path).save(
-            ConfigurationUpdate(
-                configuration=config,
-                live_unlock_phrase="I ACCEPT LIVE TRADING RISK",
-            )
+def test_live_mode_credentials_do_not_enable_legacy_live_switch(tmp_path):
+    view = service(tmp_path).save(
+        ConfigurationUpdate(
+            configuration=UserConfiguration(trading_mode="live", live_trading_enabled=True),
+            credentials=CredentialInput(
+                api_key="live-key",
+                secret="live-secret",
+                passphrase="live-passphrase",
+            ),
+            live_unlock_phrase="I ACCEPT LIVE TRADING RISK",
         )
+    )
+    assert view.configuration.live_trading_enabled is False
+    assert view.configuration.automatic_execution_enabled is False
 
 
 def test_live_mode_requires_exact_unlock_phrase(tmp_path):
     config = UserConfiguration(trading_mode="live", live_trading_enabled=True)
     with pytest.raises(ValueError, match="确认短语"):
         service(tmp_path).save(
-            ConfigurationUpdate(configuration=config, live_unlock_phrase="close enough")
+            ConfigurationUpdate(
+                configuration=config,
+                credentials=CredentialInput(
+                    api_key="live-key",
+                    secret="live-secret",
+                    passphrase="live-passphrase",
+                ),
+                live_unlock_phrase="close enough",
+            )
         )
 
 
@@ -89,20 +102,20 @@ def test_proxy_url_rejects_unsafe_or_unsupported_values(proxy_url):
         UserConfiguration(network_proxy_url=proxy_url)
 
 
-def test_automatic_exchange_execution_requires_commissioning(tmp_path):
+def test_legacy_automatic_exchange_execution_is_forced_off(tmp_path):
     configuration_service = service(tmp_path)
     configuration = UserConfiguration(trading_mode="sandbox", automatic_execution_enabled=True)
-    with pytest.raises(ValueError, match="关闭自动执行"):
-        configuration_service.save(
-            ConfigurationUpdate(
-                configuration=configuration,
-                credentials=CredentialInput(
-                    api_key="sandbox-key",
-                    secret="sandbox-secret",
-                    passphrase="sandbox-passphrase",
-                ),
-            )
+    view = configuration_service.save(
+        ConfigurationUpdate(
+            configuration=configuration,
+            credentials=CredentialInput(
+                api_key="sandbox-key",
+                secret="sandbox-secret",
+                passphrase="sandbox-passphrase",
+            ),
         )
+    )
+    assert view.configuration.automatic_execution_enabled is False
 
 
 def test_matching_sandbox_commissioning_unlocks_execution(tmp_path):

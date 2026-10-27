@@ -296,6 +296,9 @@ class BacktestTrade(BaseModel):
     entry_price: Decimal
     exit_price: Decimal
     quantity: Decimal
+    intended_quantity: Decimal | None = None
+    actual_entry_quantity: Decimal | None = None
+    position_limit_reason: str = "stop_risk"
     pnl: Decimal
     exit_reason: str
     gross_pnl: Decimal = Decimal("0")
@@ -1285,6 +1288,8 @@ def run_walk_forward_backtest(
     research_trial_count: int = 1,
     maximum_volume_participation: Decimal = Decimal("0.02"),
     market_impact_bps: Decimal = Decimal("5"),
+    maximum_gross_exposure: Decimal = Decimal("2"),
+    maximum_leverage: Decimal = Decimal("3"),
     compute_stress: bool = True,
 ) -> BacktestResult:
     """Walk-forward test with no same-bar signal execution.
@@ -1437,6 +1442,10 @@ def run_walk_forward_backtest(
     terminal_position_closed = False
     causal_policy_selection_counts: dict[str, int] = {}
     causal_policy_abstentions = 0
+    notional_cap_count = 0
+    gross_exposure_cap_count = 0
+    leverage_cap_count = 0
+    volume_cap_count = 0
 
     for index in range(warmup_bars, len(candles)):
         candle = candles[index]
@@ -1528,6 +1537,9 @@ def run_walk_forward_backtest(
                         entry_price=position["entry"].quantize(Decimal("0.01")),
                         exit_price=exit_price.quantize(Decimal("0.01")),
                         quantity=close_quantity,
+                        intended_quantity=position["intended_quantity"],
+                        actual_entry_quantity=position["original_quantity"],
+                        position_limit_reason=position["position_limit_reason"],
                         pnl=pnl,
                         exit_reason=exit_reason,
                         gross_pnl=gross.quantize(Decimal("0.01")),
@@ -1549,13 +1561,42 @@ def run_walk_forward_backtest(
             plan, expires_index = pending
             entry_mid = (plan.entry.zone.lower + plan.entry.zone.upper) / Decimal("2")
             if candle.low <= entry_mid <= candle.high:
+                available_equity = max(equity, Decimal("0"))
+                gross_exposure_quantity = (
+                    available_equity * maximum_gross_exposure / entry_mid
+                    if entry_mid > 0
+                    else Decimal("0")
+                )
+                leverage_quantity = (
+                    available_equity * maximum_leverage / entry_mid
+                    if entry_mid > 0
+                    else Decimal("0")
+                )
+                volume_quantity = max(
+                    candle.volume * maximum_volume_participation,
+                    Decimal("0"),
+                )
                 fill_quantity = min(
                     plan.sizing.suggested_quantity,
-                    max(
-                        candle.volume * maximum_volume_participation,
-                        Decimal("0"),
-                    ),
+                    gross_exposure_quantity,
+                    leverage_quantity,
+                    volume_quantity,
                 )
+                position_limit_reasons: list[str] = []
+                if fill_quantity < plan.sizing.suggested_quantity:
+                    if gross_exposure_quantity == fill_quantity:
+                        position_limit_reasons.append("gross_exposure")
+                        gross_exposure_cap_count += 1
+                    if leverage_quantity == fill_quantity:
+                        position_limit_reasons.append("leverage")
+                        leverage_cap_count += 1
+                    if volume_quantity == fill_quantity:
+                        position_limit_reasons.append("volume_participation")
+                        volume_cap_count += 1
+                    if {"gross_exposure", "leverage"}.intersection(
+                        position_limit_reasons
+                    ):
+                        notional_cap_count += 1
                 entry_slip = _simulated_slippage_fraction(
                     base_slippage_bps=slippage_bps,
                     market_impact_bps=market_impact_bps,
@@ -1573,6 +1614,12 @@ def run_walk_forward_backtest(
                         "entry": fill,
                         "time": candle.timestamp,
                         "original_quantity": fill_quantity,
+                        "intended_quantity": plan.sizing.suggested_quantity,
+                        "position_limit_reason": (
+                            "+".join(position_limit_reasons)
+                            if position_limit_reasons
+                            else "stop_risk"
+                        ),
                         "remaining": fill_quantity,
                         "target_index": 0,
                         "current_stop": plan.exit.stop_loss,
@@ -1871,6 +1918,9 @@ def run_walk_forward_backtest(
                 entry_price=position["entry"].quantize(Decimal("0.01")),
                 exit_price=exit_price.quantize(Decimal("0.01")),
                 quantity=close_quantity,
+                intended_quantity=position["intended_quantity"],
+                actual_entry_quantity=position["original_quantity"],
+                position_limit_reason=position["position_limit_reason"],
                 pnl=pnl,
                 exit_reason="end_of_data",
                 gross_pnl=gross.quantize(Decimal("0.01")),
@@ -1947,7 +1997,25 @@ def run_walk_forward_backtest(
     result.cost_model["order_flow_availability"] = "bar-close-not-bar-open"
     result.cost_model["maximum_volume_participation"] = str(maximum_volume_participation)
     result.cost_model["market_impact_bps_at_full_participation"] = str(market_impact_bps)
+    result.cost_model["maximum_gross_exposure"] = str(maximum_gross_exposure)
+    result.cost_model["maximum_leverage"] = str(maximum_leverage)
+    result.cost_model["notional_cap_count"] = str(notional_cap_count)
+    result.cost_model["gross_exposure_cap_count"] = str(gross_exposure_cap_count)
+    result.cost_model["leverage_cap_count"] = str(leverage_cap_count)
+    result.cost_model["volume_cap_count"] = str(volume_cap_count)
+    total_initial_risk = sum(
+        (episode.initial_risk_amount for episode in result.trade_episodes),
+        Decimal("0"),
+    )
+    total_execution_cost = result.total_fees + result.total_slippage + result.total_funding
+    result.cost_model["round_trip_cost_r"] = str(
+        (total_execution_cost / total_initial_risk).quantize(Decimal("0.0001"))
+        if total_initial_risk > 0
+        else Decimal("0")
+    )
     result.integrity_checks["volume_participation_capped"] = True
+    result.integrity_checks["notional_exposure_capped"] = True
+    result.integrity_checks["leverage_capped"] = True
     result.integrity_checks["nonlinear_market_impact_included"] = True
     result.integrity_checks["historical_open_interest_not_backfilled_from_current"] = True
     result.integrity_checks["historical_positioning_join_is_causal"] = True
@@ -2023,6 +2091,8 @@ def run_walk_forward_backtest(
         research_trial_count=research_trial_count,
         maximum_volume_participation=maximum_volume_participation,
         market_impact_bps=market_impact_bps * policy.stress_slippage_multiplier,
+        maximum_gross_exposure=maximum_gross_exposure,
+        maximum_leverage=maximum_leverage,
         compute_stress=False,
     )
     return validate_research_result(

@@ -124,6 +124,10 @@ class FakeClient:
             "info": {},
         }
 
+    async def fetch_open_orders(self, symbol=None):
+        del symbol
+        return []
+
     async def fetch_my_trades(self, symbol, since, limit):
         self.trade_history_call = (symbol, since, limit)
         return [
@@ -163,6 +167,7 @@ class SafeReduceClient(FakeClient):
         }
         self.amendments: list[dict] = []
         self.cancellations: list[dict] = []
+        self.close_position_params: dict | None = None
 
     async def fetch_balance(self):
         return {
@@ -246,6 +251,31 @@ class SafeReduceClient(FakeClient):
         return {
             "code": "0",
             "data": [{"algoId": item["algoId"], "sCode": "0", "sMsg": ""} for item in payload],
+        }
+
+    async def close_position(self, symbol, side, params):
+        del side
+        self.close_position_params = dict(params)
+        amount = self.position_contracts
+        self.position_contracts = Decimal("0")
+        for algo_id, item in self.algos.items():
+            item["state"] = "canceled"
+            self.cancellations.append(
+                {"algoId": algo_id, "instId": self.markets[symbol]["id"]}
+            )
+        return {
+            "id": "atomic-close",
+            "clientOrderId": params["clientOrderId"],
+            "symbol": symbol,
+            "side": "sell",
+            "type": "market",
+            "status": "closed",
+            "amount": str(amount),
+            "filled": str(amount),
+            "price": None,
+            "average": "50000",
+            "fee": None,
+            "info": {"reduceOnly": "true"},
         }
 
 
@@ -338,6 +368,77 @@ class TriggeredProtectionClient(SafeReduceClient):
         }
 
 
+class ProtectionReservedReduceClient(SafeReduceClient):
+    def __init__(self):
+        super().__init__()
+        self.close_order: dict | None = None
+
+    async def create_order(self, symbol, order_type, side, amount, price, params):
+        if not params.get("reduceOnly"):
+            return await super().create_order(symbol, order_type, side, amount, price, params)
+        self.calls.append(params)
+        self.close_order = {
+            "id": "reserved-close",
+            "clientOrderId": params["clientOrderId"],
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "status": "open",
+            "amount": amount,
+            "filled": 0,
+            "price": price,
+            "average": None,
+            "fee": None,
+            "info": {"reduceOnly": "true"},
+        }
+        return dict(self.close_order)
+
+    async def fetch_open_orders(self, symbol=None):
+        del symbol
+        return [dict(self.close_order)] if self.close_order else []
+
+    async def fetch_order(self, order_id, symbol):
+        del order_id, symbol
+        assert self.close_order is not None
+        if all(item["state"] == "canceled" for item in self.algos.values()):
+            self.position_contracts = Decimal("0")
+            self.close_order.update(
+                status="closed",
+                filled=self.close_order["amount"],
+                average="50000",
+            )
+        return dict(self.close_order)
+
+
+class OpenOrdersProtectionFallbackClient(OkxHistoryFallbackClient):
+    async def private_get_trade_orders_algo_pending(self, params):
+        assert params["ordType"] in {"oco", "conditional"}
+        return {"code": "0", "data": []}
+
+    async def fetch_open_orders(self):
+        return [
+            {
+                "id": "algo-1",
+                "clientOrderId": "venue-generated-id",
+                "symbol": "BTC/USDT:USDT",
+                "side": "sell",
+                "type": "market",
+                "status": "open",
+                "amount": "6",
+                "filled": "0",
+                "price": None,
+                "average": None,
+                "fee": None,
+                "info": {
+                    "algoId": "algo-1",
+                    "algoClOrdId": "entry1p",
+                    "state": "effective",
+                    "sz": "6",
+                },
+            }
+        ]
+
+
 def adapter(exchange_id: str, market_type: str) -> CcxtExchangeAdapter:
     instance = CcxtExchangeAdapter.__new__(CcxtExchangeAdapter)
     instance.exchange_id = exchange_id
@@ -367,6 +468,18 @@ def history_fallback_adapter() -> CcxtExchangeAdapter:
 def triggered_protection_adapter() -> CcxtExchangeAdapter:
     instance = adapter("okx", "swap")
     instance.client = TriggeredProtectionClient()
+    return instance
+
+
+def open_orders_protection_fallback_adapter() -> CcxtExchangeAdapter:
+    instance = adapter("okx", "swap")
+    instance.client = OpenOrdersProtectionFallbackClient()
+    return instance
+
+
+def protection_reserved_reduce_adapter() -> CcxtExchangeAdapter:
+    instance = adapter("okx", "swap")
+    instance.client = ProtectionReservedReduceClient()
     return instance
 
 
@@ -416,6 +529,30 @@ def test_okx_protected_entries_attach_native_tp_and_sl_atomically():
     asyncio.run(scenario())
 
 
+def test_okx_generic_order_normalizes_client_id_to_venue_contract():
+    async def scenario():
+        exchange = adapter("okx", "swap")
+        order = await exchange.place_order(
+            OrderIntent(
+                idempotency_key=(
+                    "ti-close-position_0a627c9ee0d045d6ab69f4394176339e-18-CLOSE"
+                ),
+                plan_id="plan-close",
+                plan_fingerprint="fingerprint",
+                symbol="BTC/USDT",
+                side=OrderSide.SELL,
+                order_type=OrderType.MARKET,
+                quantity="0.06",
+                reduce_only=True,
+            )
+        )
+
+        assert order.client_order_id.isalnum()
+        assert len(order.client_order_id) <= 32
+
+    asyncio.run(scenario())
+
+
 def test_okx_filled_order_and_algo_terminal_state_fall_back_after_51603():
     async def scenario():
         exchange = history_fallback_adapter()
@@ -440,6 +577,29 @@ def test_okx_filled_order_and_algo_terminal_state_fall_back_after_51603():
         exchange.client.algos["algo-1"]["state"] = "canceled"
         assert await exchange.verify_position_protection(plan, [entry], Decimal("0"))
         assert exchange.client.history_calls >= 3
+
+    asyncio.run(scenario())
+
+
+def test_okx_active_protection_falls_back_to_open_orders_after_51603():
+    async def scenario():
+        exchange = open_orders_protection_fallback_adapter()
+        entry = Order(
+            id="entry-1",
+            client_order_id="entry1",
+            plan_id="plan-history",
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            status=OrderStatus.FILLED,
+            quantity=Decimal("0.06"),
+            filled_quantity=Decimal("0.06"),
+        )
+        plan, _ = plan_and_intent()
+
+        assert await exchange.verify_position_protection(plan, [entry], Decimal("0.06"))
+        child = (await exchange.open_orders())[0]
+        assert child.client_order_id == "entry1p"
 
     asyncio.run(scenario())
 
@@ -840,6 +1000,53 @@ def test_okx_full_exit_cancels_every_remaining_attached_protection():
             "algo-2",
         }
         assert all(item["state"] == "canceled" for item in exchange.client.algos.values())
+        assert exchange.client.close_position_params["autoCxl"] is True
+
+    asyncio.run(scenario())
+
+
+def test_okx_live_reduce_order_releases_reserved_native_protection_then_fills():
+    async def scenario():
+        exchange = protection_reserved_reduce_adapter()
+        plan, _ = plan_and_intent()
+        entries = [
+            Order(
+                id=f"entry-{index}",
+                client_order_id=f"entry{index}",
+                plan_id=plan.id,
+                symbol=plan.symbol,
+                side=OrderSide.BUY,
+                order_type=OrderType.LIMIT,
+                status=OrderStatus.FILLED,
+                quantity=quantity,
+                filled_quantity=quantity,
+            )
+            for index, quantity in ((1, Decimal("0.06")), (2, Decimal("0.04")))
+        ]
+        intent = OrderIntent(
+            idempotency_key="ticreservedclose",
+            plan_id=plan.id,
+            plan_fingerprint=plan.fingerprint,
+            symbol=plan.symbol,
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("0.10"),
+            reduce_only=True,
+        )
+
+        order = await exchange.reduce_position_safely(
+            plan,
+            entries,
+            intent,
+            Decimal("0.10"),
+        )
+
+        assert order.status == OrderStatus.FILLED
+        assert exchange.client.position_contracts == 0
+        assert {item["algoId"] for item in exchange.client.cancellations} == {
+            "algo-1",
+            "algo-2",
+        }
 
     asyncio.run(scenario())
 

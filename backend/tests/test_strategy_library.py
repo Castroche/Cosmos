@@ -109,7 +109,7 @@ def test_confirmed_statistical_reversal_priors_are_structural_and_predeclared():
     )
 
 
-def test_agent_campaign_preflight_uses_only_development_data_availability():
+def test_offline_campaign_preflight_uses_only_development_data_availability():
     candles = demo_candles(300)
     datasets = [
         build_research_dataset(
@@ -124,11 +124,32 @@ def test_agent_campaign_preflight_uses_only_development_data_availability():
     ]
     features = {dataset.id: ([], [], [], [], [], []) for dataset in datasets}
 
-    selected, excluded = api.causal_data_eligible_library_entries(
-        list_strategy_library(),
-        datasets,
-        features,
-    )
+    selected: list[str] = []
+    excluded: dict[str, str] = {}
+    for entry in list_strategy_library():
+        supported = []
+        for dataset in datasets:
+            funding, open_interest, positioning, basis, order_flow, liquidation_flow = (
+                features[dataset.id]
+            )
+            reasons = api.historical_feature_eligibility(
+                dataset=dataset,
+                required_data=entry.required_data,
+                funding=funding,
+                open_interest=open_interest,
+                positioning=positioning,
+                basis=basis,
+                order_flow=order_flow,
+                liquidation_flow=liquidation_flow,
+            )
+            if not reasons:
+                supported.append(dataset)
+        if len({item.exchange for item in supported}) >= 2 and len(
+            {item.symbol for item in supported}
+        ) >= 3:
+            selected.append(entry.id)
+        else:
+            excluded[entry.id] = "missing_required_historical_features"
 
     entries = {entry.id: entry for entry in list_strategy_library()}
     assert selected
@@ -138,7 +159,7 @@ def test_agent_campaign_preflight_uses_only_development_data_availability():
     assert "builtin_ema_12_26_trend_v2" in selected
 
 
-def test_unified_agent_library_exposes_single_pair_and_carry_priors():
+def test_unified_research_library_exposes_offline_single_pair_and_carry_priors():
     payload = api.unified_research_strategy_library()
 
     assert payload["counts"] == {
@@ -149,7 +170,7 @@ def test_unified_agent_library_exposes_single_pair_and_carry_priors():
     assert payload["entry_count"] == sum(payload["counts"].values())
     assert payload["profitability_claim"] is False
     assert {
-        "single_leg_executable_after_certification",
+        "single_leg_research_only",
         "pair_research_only",
         "spot_perpetual_research_only",
     } <= {entry["scope"] for entry in payload["entries"]}

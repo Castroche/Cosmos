@@ -69,6 +69,29 @@ def test_higher_priority_manual_halt_replaces_auto_recoverable_source(tmp_path):
     assert state.recover_maintenance() == manual
 
 
+def test_only_legacy_missing_champion_halt_is_migrated(tmp_path):
+    state = RiskStateService(SqliteStore(tmp_path / "cosmos.db"))
+    state.halt(
+        "No cross-market robust Champion; block all new risk until strategy "
+        "certification is enforced",
+        source="manual",
+    )
+
+    recovered = state.recover_legacy_strategy_governance_halt()
+
+    assert recovered.halted is False
+
+    operator_halt = state.halt("operator emergency stop", source="manual")
+    assert state.recover_legacy_strategy_governance_halt() == operator_halt
+
+    state.resume("RESUME TRADING")
+    uncertain = state.halt(
+        "exchange order outcome is uncertain",
+        source="execution_uncertain",
+    )
+    assert state.recover_legacy_strategy_governance_halt() == uncertain
+
+
 def test_daily_drawdown_failure_latches_risk_halt(tmp_path):
     async def scenario():
         candles = demo_candles()
@@ -112,6 +135,21 @@ def test_clean_reconciliation_recovers_only_transport_halts(tmp_path):
     still_halted = state.recover_reconciliation_transport()
     assert still_halted.halted is True
     assert still_halted.source == "reconciliation_integrity"
+
+
+def test_clean_demo_reconciliation_can_recover_integrity_latch(tmp_path):
+    state = RiskStateService(SqliteStore(tmp_path / "cosmos.db"))
+    state.halt(
+        "订单状态不确定、存在外部挂单或保护单缺失，需人工核对",
+        source="reconciliation_integrity",
+    )
+
+    recovered = state.recover_demo_reconciliation_integrity()
+
+    assert recovered.halted is False
+
+    manual = state.halt("operator emergency stop", source="manual")
+    assert state.recover_demo_reconciliation_integrity() == manual
 
 
 def test_clean_reconciliation_recovers_legacy_transport_halt(tmp_path):

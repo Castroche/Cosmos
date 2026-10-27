@@ -60,6 +60,13 @@ class ResearchValidationPreferences(BaseModel):
     stress_fee_multiplier: Decimal = Field(default=Decimal("1.5"), ge=1, le=5)
     stress_slippage_multiplier: Decimal = Field(default=Decimal("2"), ge=1, le=10)
     require_higher_timeframe_confirmation: bool = True
+    maximum_estimated_round_trip_cost_r: Decimal = Field(
+        default=Decimal("0.25"),
+        gt=0,
+        le=Decimal("2"),
+    )
+    cross_market_minimum_passes: int = Field(default=2, ge=1, le=3)
+    review_contract_version: int = Field(default=2, ge=1, le=100)
 
 
 class AgentForwardValidationPreferences(BaseModel):
@@ -131,7 +138,6 @@ class UserConfiguration(BaseModel):
     slippage_bps: Decimal = Field(default=Decimal("2"), ge=0, le=Decimal("100"))
     live_trading_enabled: bool = False
     automatic_execution_enabled: bool = False
-    strategy_poll_seconds: int = Field(default=5, ge=2, le=60)
     risk: RiskPreferences = Field(default_factory=RiskPreferences)
     strategy: StrategyPreferences = Field(default_factory=StrategyPreferences)
     agent_forward_validation: AgentForwardValidationPreferences = Field(
@@ -202,7 +208,6 @@ class ConfigurationUpdate(BaseModel):
     configuration: UserConfiguration
     credentials: CredentialInput | None = None
     live_unlock_phrase: str | None = None
-    promote_agent_goal_id: str | None = None
 
 
 class CredentialState(BaseModel):
@@ -245,8 +250,6 @@ class ConfigurationView(BaseModel):
     credential_scopes: dict[str, CredentialState] = Field(default_factory=dict)
     commissioning: CommissioningResult | None = None
     execution_ready: bool = False
-    promoted_agent_goal_id: str | None = None
-    promoted_agent_policy_id: str | None = None
     updated_at: datetime | None = None
 
 

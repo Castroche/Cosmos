@@ -67,6 +67,29 @@ def _next_month(month: date) -> date:
     )
 
 
+def build_archive_requests(
+    start: date,
+    end: date,
+    archive_period: str,
+    *,
+    current_date: date | None = None,
+) -> list[tuple[str, date]]:
+    """Use daily files for an unclosed tail month with no monthly archive yet."""
+
+    if archive_period == "daily":
+        return [("daily", day) for day in _days(start, end)]
+    current_month = (current_date or datetime.now(UTC).date()).replace(day=1)
+    requests: list[tuple[str, date]] = []
+    for month in _months(start, end):
+        if month < current_month:
+            requests.append(("monthly", month))
+            continue
+        first_day = max(start, month)
+        last_day = min(end, _next_month(month) - timedelta(days=1))
+        requests.extend(("daily", day) for day in _days(first_day, last_day))
+    return requests
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset_id")
@@ -97,10 +120,10 @@ def main() -> int:
     requested_days = list(_days(args.start, args.end))
     if not requested_days or len(requested_days) > args.max_days:
         raise SystemExit(f"requested {len(requested_days)} days; --max-days is {args.max_days}")
-    periods = (
-        requested_days
-        if args.archive_period == "daily"
-        else list(_months(args.start, args.end))
+    archive_requests = build_archive_requests(
+        args.start,
+        args.end,
+        args.archive_period,
     )
     payload = api.store.load_research_dataset(args.dataset_id)
     if not payload:
@@ -156,18 +179,18 @@ def main() -> int:
         datetime.min.time(),
         tzinfo=UTC,
     ) - timedelta(microseconds=1)
-    total_archives = len(periods)
-    for completed_archives, period in enumerate(periods, start=1):
+    total_archives = len(archive_requests)
+    for completed_archives, (period_kind, period) in enumerate(archive_requests, start=1):
         if args.source_type == "klines":
             url = (
                 binance_daily_kline_url(source.symbol, source.timeframe, period)
-                if args.archive_period == "daily"
+                if period_kind == "daily"
                 else binance_monthly_kline_url(source.symbol, source.timeframe, period)
             )
         else:
             url = (
                 binance_daily_aggtrade_url(source.symbol, period)
-                if args.archive_period == "daily"
+                if period_kind == "daily"
                 else binance_monthly_aggtrade_url(source.symbol, period)
             )
         archive, checksum = download_verified_archive(
@@ -179,7 +202,7 @@ def main() -> int:
         period_start = datetime.combine(period, datetime.min.time(), tzinfo=UTC)
         period_end = (
             period_start + timedelta(days=1)
-            if args.archive_period == "daily"
+            if period_kind == "daily"
             else datetime.combine(_next_month(period), datetime.min.time(), tzinfo=UTC)
         )
         bounded_start = max(period_start, source.data_start, requested_start)
@@ -219,7 +242,7 @@ def main() -> int:
                     "event": "order_flow_backfill_progress",
                     "dataset_id": source.id,
                     "symbol": source.symbol,
-                    "archive_period": args.archive_period,
+                    "archive_period": period_kind,
                     "source_type": args.source_type,
                     "period": period.isoformat(),
                     "completed_archives": completed_archives,
@@ -254,9 +277,7 @@ def main() -> int:
         liquidation_flow=liquidation_flow,
         research_role=source.research_role,
         source_dataset_id=(
-            source.source_dataset_id
-            if source.research_role != "general"
-            else source.id
+            source.source_dataset_id if source.research_role != "general" else source.id
         ),
         blind_set_id=source.blind_set_id,
         split_boundary=source.split_boundary,
@@ -291,6 +312,7 @@ def main() -> int:
         "requested_start": args.start.isoformat(),
         "requested_end": args.end.isoformat(),
         "archive_period": args.archive_period,
+        "archive_periods_used": sorted({kind for kind, _ in archive_requests}),
         "source_type": args.source_type,
         "archive_count": len(archives),
         "archives": archives,

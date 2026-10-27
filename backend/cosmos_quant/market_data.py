@@ -81,6 +81,7 @@ class MarketDataService:
         self.store = store
         self.quality: MarketQuality | None = None
         self.websocket_snapshot: MarketSnapshot | None = None
+        self._websocket_snapshots: dict[str, MarketSnapshot] = {}
         self._live_candles: dict[tuple[str, str], list[Candle]] = {}
         self._subscribers: set[asyncio.Queue] = set()
         self._fetch_inflight: dict[
@@ -90,6 +91,7 @@ class MarketDataService:
 
     def update_websocket(self, snapshot: MarketSnapshot) -> None:
         self.websocket_snapshot = snapshot
+        self._websocket_snapshots[snapshot.symbol] = snapshot
         changed: dict[str, Candle] = {}
         for (symbol, timeframe), candles in self._live_candles.items():
             if symbol != snapshot.symbol or not candles:
@@ -106,6 +108,14 @@ class MarketDataService:
                 },
                 "server_time": datetime.now(UTC).isoformat(),
             }
+        )
+
+    def websocket_snapshot_for(self, symbol: str) -> MarketSnapshot | None:
+        """Return the newest ticker without requiring a candle timeframe cache."""
+        return self._websocket_snapshots.get(symbol) or (
+            self.websocket_snapshot
+            if self.websocket_snapshot and self.websocket_snapshot.symbol == symbol
+            else None
         )
 
     def update_exchange_candle(
@@ -131,8 +141,14 @@ class MarketDataService:
             del candles[:-500]
         else:
             return
-        snapshot = self.websocket_snapshot
-        if not snapshot or snapshot.symbol != symbol:
+        snapshot = self._websocket_snapshots.get(symbol)
+        if (
+            snapshot is None
+            and self.websocket_snapshot
+            and self.websocket_snapshot.symbol == symbol
+        ):
+            snapshot = self.websocket_snapshot
+        if not snapshot:
             return
         self._publish(
             {
@@ -195,9 +211,15 @@ class MarketDataService:
         self._subscribers.discard(queue)
 
     def stream_event(self, symbol: str, timeframe: str) -> dict | None:
-        snapshot = self.websocket_snapshot
+        snapshot = self._websocket_snapshots.get(symbol)
+        if (
+            snapshot is None
+            and self.websocket_snapshot
+            and self.websocket_snapshot.symbol == symbol
+        ):
+            snapshot = self.websocket_snapshot
         candles = self._live_candles.get((symbol, timeframe))
-        if not snapshot or snapshot.symbol != symbol or not candles:
+        if not snapshot or not candles:
             return None
         return {
             "type": "market",
@@ -243,7 +265,9 @@ class MarketDataService:
         limit: int,
     ) -> tuple[MarketSnapshot, list[Candle], MarketQuality]:
         try:
-            cached_rows = self.store.load_candles(exchange_id, symbol, timeframe, limit)
+            cached_rows = await asyncio.to_thread(
+                self.store.load_candles, exchange_id, symbol, timeframe, limit
+            )
             rest_snapshot = await adapter.market_snapshot(symbol)
             remote_limit = min(limit, 300) if len(cached_rows) >= limit else limit
             raw_candles = await adapter.fetch_candles(symbol, timeframe, remote_limit)
@@ -263,11 +287,22 @@ class MarketDataService:
                 raw_candles = [merged[key] for key in sorted(merged)][-limit:]
             candles, quality = validate_candles(raw_candles, timeframe)
             self._live_candles[(symbol, timeframe)] = candles
-            websocket = self.websocket_snapshot
-            if websocket and websocket.symbol == symbol:
+            websocket = self._websocket_snapshots.get(symbol)
+            if (
+                websocket is None
+                and self.websocket_snapshot
+                and self.websocket_snapshot.symbol == symbol
+            ):
+                websocket = self.websocket_snapshot
+            if websocket:
                 self._apply_tick(candles, timeframe, websocket)
-            self.store.save_candles(exchange_id, symbol, timeframe, candles)
-            if websocket and websocket.symbol == symbol:
+            # Ticks replace/append live bars while durable I/O runs. Persist a
+            # stable list snapshot, then use the freshest ticker on return.
+            await asyncio.to_thread(
+                self.store.save_candles, exchange_id, symbol, timeframe, tuple(candles)
+            )
+            websocket = self.websocket_snapshot_for(symbol)
+            if websocket:
                 market_time = websocket.timestamp
                 if market_time.tzinfo is None:
                     market_time = market_time.replace(tzinfo=UTC)
@@ -281,7 +316,9 @@ class MarketDataService:
             self.quality = quality
             return rest_snapshot, candles, quality
         except Exception as exc:
-            cached_rows = self.store.load_candles(exchange_id, symbol, timeframe, limit)
+            cached_rows = await asyncio.to_thread(
+                self.store.load_candles, exchange_id, symbol, timeframe, limit
+            )
             if len(cached_rows) < 57:
                 raise MarketDataError(str(exc)) from exc
             candles = [

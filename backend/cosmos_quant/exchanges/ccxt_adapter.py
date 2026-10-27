@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
@@ -24,6 +26,7 @@ from ..domain import (
     PortfolioState,
     Position,
     PositioningPoint,
+    PositionSide,
     Side,
     StrategyPlan,
     TradingMode,
@@ -31,7 +34,7 @@ from ..domain import (
 from ..research_universe import MarketCatalogEntry
 from ..storage import SqliteStore
 from ..timeframes import TIMEFRAME_SECONDS
-from .base import ExchangeAdapter, PositionProtectionError
+from .base import ExchangeAdapter, OrderSubmissionUncertain, PositionProtectionError
 
 
 class ExchangeConfigurationError(RuntimeError):
@@ -50,6 +53,11 @@ class _OkxProtection:
     size: Decimal
     state: str
     exit_order_ids: tuple[str, ...] = ()
+    side: str = ""
+    position_side: str = ""
+    instrument_id: str = ""
+    stop_price: str = ""
+    target_price: str = ""
 
 
 class CcxtExchangeAdapter(ExchangeAdapter):
@@ -93,7 +101,9 @@ class CcxtExchangeAdapter(ExchangeAdapter):
         store: SqliteStore | None = None,
         account_id: str | None = None,
         proxy_url: str = "",
+        entry_submission_guard=None,
     ):
+        self.entry_submission_guard = entry_submission_guard
         try:
             import ccxt.async_support as ccxt
         except ImportError as exc:
@@ -111,12 +121,20 @@ class CcxtExchangeAdapter(ExchangeAdapter):
         self.contract_leverage = Decimal(str(contract_leverage))
         self.store = store
         self.account_id = account_id or f"{exchange_id}:{market_type}"
+        client_options: dict[str, Any] = {"defaultType": market_type}
+        # Writes must never inherit CCXT transport retries: an ACK can be lost.
+        client_options["maxRetriesOnFailure"] = 0
+        if exchange_id == "okx" and market_type == "swap":
+            # Scope discovery to the venue actually used by COSMOS. Loading OKX
+            # FUTURES/OPTION catalogs can otherwise make Demo swap reconciliation
+            # fail because of an unrelated public endpoint timeout.
+            client_options["fetchMarkets"] = {"types": ["swap"]}
         client_configuration = {
             "apiKey": credentials.get("api_key", ""),
             "secret": credentials.get("secret", ""),
             "password": credentials.get("passphrase", ""),
             "enableRateLimit": True,
-            "options": {"defaultType": market_type},
+            "options": client_options,
         }
         if proxy_url:
             client_configuration["httpsProxy"] = proxy_url
@@ -217,11 +235,7 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             asset_class = "crypto"
         else:
             asset_class = "unknown"
-        source = (
-            ",".join(f"market.info.{key}" for key in source_keys)
-            if source_keys
-            else None
-        )
+        source = ",".join(f"market.info.{key}" for key in source_keys) if source_keys else None
         return asset_class, source, underlying_type, underlying_subtypes
 
     async def research_market_catalog(
@@ -512,6 +526,7 @@ class CcxtExchangeAdapter(ExchangeAdapter):
         if isinstance(trades, list):
             buy_flow = Decimal("0")
             sell_flow = Decimal("0")
+            timestamps: list[int] = []
             for trade in trades:
                 price = Decimal(str(trade.get("price") or 0))
                 amount = Decimal(str(trade.get("amount") or 0))
@@ -520,11 +535,28 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                     buy_flow += notional
                 elif trade.get("side") == "sell":
                     sell_flow += notional
+                if trade.get("timestamp") is not None:
+                    timestamps.append(int(trade["timestamp"]))
             total_flow = buy_flow + sell_flow
             output["trade_flow_imbalance"] = (
                 (buy_flow - sell_flow) / total_flow if total_flow > 0 else Decimal("0")
             )
             output["trade_flow_quote"] = total_flow
+            output["active_buy_quote"] = buy_flow
+            output["active_sell_quote"] = sell_flow
+            if len(timestamps) >= 2:
+                elapsed_seconds = max((max(timestamps) - min(timestamps)) / 1000, 1)
+                output["trade_intensity"] = Decimal(len(timestamps)) / Decimal(str(elapsed_seconds))
+        bid_depth = output.get("bid_depth_quote")
+        ask_depth = output.get("ask_depth_quote")
+        if bid_depth is not None and ask_depth is not None:
+            liquidity = Decimal(str(bid_depth)) + Decimal(str(ask_depth))
+            output["liquidity_quote"] = liquidity
+            output["estimated_slippage_bps"] = (
+                min(Decimal("10000") / liquidity, Decimal("0.01")) * Decimal("10000")
+                if liquidity > 0
+                else Decimal("10000")
+            )
         open_interest = payloads.get("open_interest")
         current_open_interest: Decimal | None = None
         if isinstance(open_interest, dict):
@@ -1241,31 +1273,170 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             raise PermissionError("public market adapter cannot place orders")
         if not self.sandbox and not self.live_enabled:
             raise PermissionError("live trading is locked")
+        self._validate_intent(intent)
         if self.market_type == "swap":
-            await self.ensure_contract_configuration(intent.symbol)
+            await self.ensure_contract_configuration(intent.symbol, intent.position_side)
         client_symbol = await self._resolve_symbol(intent.symbol)
         amount = (
             self._venue_amount(client_symbol, intent.quantity)
             if self.market_type == "swap"
             else intent.quantity
         )
-        response = await self.client.create_order(
-            client_symbol,
-            intent.order_type.value,
-            intent.side.value,
-            float(amount),
-            float(intent.limit_price) if intent.limit_price is not None else None,
-            {
-                "clientOrderId": intent.idempotency_key,
-                "reduceOnly": intent.reduce_only,
-                **(
-                    {"tdMode": self.margin_mode}
-                    if self.exchange_id == "okx" and self.market_type == "swap"
-                    else {}
-                ),
-            },
+        client_id = self._venue_client_id(intent.idempotency_key, 32)
+        params = {"clientOrderId": client_id, **self._order_params(intent)}
+
+        async def submit():
+            response = await self.client.create_order(
+                client_symbol,
+                intent.order_type.value,
+                intent.side.value,
+                float(amount),
+                float(intent.limit_price) if intent.order_type == OrderType.LIMIT else None,
+                params,
+            )
+            return self._map_order(response, intent.plan_id).model_copy(
+                update={
+                    "position_side": intent.position_side,
+                    "reduce_only": intent.reduce_only,
+                }
+            )
+
+        return await self._submit_order_once(client_id, intent, submit)
+
+    @staticmethod
+    def _validate_intent(intent: OrderIntent) -> None:
+        if not intent.quantity.is_finite() or intent.quantity <= 0:
+            raise ValueError("order quantity must be positive and finite")
+        if intent.order_type == OrderType.LIMIT and (
+            intent.limit_price is None or intent.limit_price <= 0
+        ):
+            raise ValueError("limit orders require a positive limit_price")
+        if intent.order_type == OrderType.MARKET and intent.limit_price is not None:
+            raise ValueError("market orders must not carry limit_price")
+        if intent.position_side is not None:
+            opening_side = (
+                OrderSide.BUY if intent.position_side == PositionSide.LONG else OrderSide.SELL
+            )
+            if (intent.side == opening_side) == intent.reduce_only:
+                raise ValueError("side/position_side does not match opening or reducing intent")
+
+    def _order_params(self, intent: OrderIntent) -> dict:
+        params = {"reduceOnly": intent.reduce_only}
+        if self.exchange_id == "okx" and self.market_type == "swap":
+            params["tdMode"] = self.margin_mode
+            if getattr(self, "_position_mode", "net_mode") == "long_short_mode":
+                if intent.position_side is None:
+                    raise ValueError("OKX long_short_mode requires explicit position_side")
+                params["posSide"] = intent.position_side.value.lower()
+                # OKX hedge closes are encoded by side + posSide, not reduceOnly.
+                params.pop("reduceOnly")
+            else:
+                params["posSide"] = "net"
+        elif intent.position_side is not None:
+            raise ValueError("explicit position_side is supported only for OKX swaps")
+        return params
+
+    def _claim_submission(self, client_id: str, payload: dict) -> bool:
+        """Durably reserve before transport. An uncertain claim is never released."""
+        fingerprint = sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+        if not hasattr(self, "_submissions"):
+            self._submissions = {}
+        store = getattr(self, "store", None)
+        if store is not None:
+            scope = (
+                f"{self.exchange_id}:{self.market_type}:{self.sandbox}:"
+                f"{getattr(self, 'account_id', 'default')}"
+            )
+            with store.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS exchange_submission_attempts "
+                    "(scope TEXT, client_id TEXT, fingerprint TEXT NOT NULL, "
+                    "PRIMARY KEY (scope, client_id))"
+                )
+                previous = connection.execute(
+                    "SELECT fingerprint FROM exchange_submission_attempts "
+                    "WHERE scope=? AND client_id=?",
+                    (scope, client_id),
+                ).fetchone()
+                if previous is not None:
+                    if previous[0] != fingerprint:
+                        raise ValueError("idempotency key reused for a different submission")
+                    return False
+                connection.execute(
+                    "INSERT INTO exchange_submission_attempts VALUES (?, ?, ?)",
+                    (scope, client_id, fingerprint),
+                )
+                connection.commit()
+        elif client_id in self._submissions:
+            if self._submissions[client_id] != fingerprint:
+                raise ValueError("idempotency key reused for a different submission")
+            return False
+        self._submissions[client_id] = fingerprint
+        return True
+
+    async def _submit_order_once(self, client_id, intent, submit, *, protection=None) -> Order:
+        guard = getattr(self, "entry_submission_guard", None)
+        if guard is not None and not intent.reduce_only:
+            # Guard each child order, after all asynchronous venue preparation.
+            async with guard():
+                return await self._submit_order_once_guarded(
+                    client_id,
+                    intent,
+                    submit,
+                    protection=protection,
+                )
+        return await self._submit_order_once_guarded(
+            client_id,
+            intent,
+            submit,
+            protection=protection,
         )
-        return self._map_order(response, intent.plan_id)
+
+    async def _submit_order_once_guarded(
+        self,
+        client_id,
+        intent,
+        submit,
+        *,
+        protection=None,
+    ) -> Order:
+        payload = intent.model_dump(mode="json", exclude={"created_at"})
+        payload["protection"] = protection
+        claimed = self._claim_submission(client_id, payload)
+        if not claimed:
+            cached = getattr(self, "_submitted_orders", {}).get(client_id)
+            if cached is not None:
+                return cached.model_copy(deep=True)
+        error = None
+        if claimed:
+            try:
+                order = await submit()
+            except PositionProtectionError:
+                raise
+            except Exception as exc:
+                error = exc
+            else:
+                if not hasattr(self, "_submitted_orders"):
+                    self._submitted_orders = {}
+                self._submitted_orders[client_id] = order.model_copy(deep=True)
+                return order
+        try:
+            order = await self.find_order_by_client_id(client_id, intent.symbol)
+        except Exception as exc:
+            error = error or exc
+            order = None
+        if order is not None:
+            return order.model_copy(
+                update={
+                    "plan_id": intent.plan_id,
+                    "position_side": intent.position_side,
+                    "reduce_only": intent.reduce_only,
+                }
+            )
+        raise OrderSubmissionUncertain(
+            client_id, f"submission {client_id} is uncertain; reconcile without resubmitting"
+        ) from error
 
     async def cancel_order(self, order_id: str, symbol: str) -> Order:
         client_symbol = await self._resolve_symbol(symbol)
@@ -1306,6 +1477,15 @@ class CcxtExchangeAdapter(ExchangeAdapter):
         symbol: str,
     ) -> Order | None:
         client_symbol = await self._resolve_symbol(symbol)
+        if self.exchange_id == "okx" and hasattr(self.client, "parse_order"):
+            # A market order (and its TP/SL) can finish before open-orders is read.
+            market = self.client.market(client_symbol)
+            response = await self.client.private_get_trade_order(
+                {"instId": market["id"], "clOrdId": client_order_id}
+            )
+            data = response.get("data") or []
+            if data:
+                return self._map_order(self.client.parse_order(data[0], market), "unknown")
         responses = await self.client.fetch_open_orders(client_symbol)
         mapped = [self._map_order(item, "unknown") for item in responses]
         match = next(
@@ -1389,6 +1569,20 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             )
         if not intent.reduce_only or intent.order_type != OrderType.MARKET:
             raise PositionProtectionError("position reduction requires a reduce-only market order")
+        self._validate_intent(intent)
+        self._validate_position_entries(plan, entry_orders)
+        expected_side = OrderSide.SELL if plan.side == Side.LONG else OrderSide.BUY
+        if intent.symbol != plan.symbol or intent.side != expected_side:
+            raise PositionProtectionError("reduce intent does not close the managed position")
+        if intent.quantity > current_quantity or current_quantity <= 0:
+            raise PositionProtectionError("reduce quantity exceeds the attributed position")
+        legs = {order.position_side for order in entry_orders if order.position_side is not None}
+        if intent.position_side is None and legs:
+            intent = intent.model_copy(update={"position_side": next(iter(legs))})
+        if intent.position_side and intent.position_side.value.lower() != str(plan.side):
+            raise PositionProtectionError("reduce position_side differs from managed direction")
+        await self.validate_account_configuration(require_hedge=intent.position_side is not None)
+        self._order_params(intent)
         client_symbol = await self._resolve_symbol(plan.symbol)
         before = await self.portfolio()
         before_quantity = self._aligned_position_quantity(before, plan)
@@ -1403,10 +1597,21 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             raise PositionProtectionError(
                 "active OKX protection size does not match the Agent-attributed position"
             )
+        if intent.quantity == current_quantity and before_quantity == current_quantity:
+            return await self._close_okx_position_safely(
+                plan,
+                entry_orders,
+                intent,
+                client_symbol,
+                before_quantity,
+            )
 
         order: Order | None = None
         try:
-            order = await self.place_order(intent)
+            venue_client_id = self._venue_client_id(intent.idempotency_key, 32)
+            order = await self.find_order_by_client_id(venue_client_id, intent.symbol)
+            if order is None:
+                order = await self.place_order(intent)
             for attempt in range(3):
                 if order.status == OrderStatus.FILLED:
                     break
@@ -1415,6 +1620,29 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                 if attempt < 2:
                     await asyncio.sleep(0.25 * (attempt + 1))
                 order = await self.fetch_order(order.id, plan.symbol)
+            if order.status in {OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED}:
+                # OKX can leave a reduce-only market order live while attached
+                # TP/SL children reserve the full closeable quantity. The close
+                # order is already active at this point, so shrink protection to
+                # the intended post-fill remainder, then confirm the venue fill.
+                intended_remaining = max(
+                    current_quantity - intent.quantity,
+                    Decimal("0"),
+                )
+                await self._rebalance_okx_protections(
+                    client_symbol,
+                    protections,
+                    intended_remaining,
+                )
+                for _attempt in range(8):
+                    await asyncio.sleep(0.5)
+                    order = await self.fetch_order(order.id, plan.symbol)
+                    if order.status in {
+                        OrderStatus.FILLED,
+                        OrderStatus.CANCELED,
+                        OrderStatus.REJECTED,
+                    }:
+                        break
             filled = order.filled_quantity
             expected_remaining = max(current_quantity - filled, Decimal("0"))
             await self._rebalance_okx_protections(client_symbol, protections, expected_remaining)
@@ -1439,6 +1667,89 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                 f"OKX protection rebalance is uncertain: {exc}", order
             ) from exc
 
+    async def _close_okx_position_safely(
+        self,
+        plan: StrategyPlan,
+        entry_orders: list[Order],
+        intent: OrderIntent,
+        client_symbol: str,
+        before_quantity: Decimal,
+    ) -> Order:
+        client_order_id = self._venue_client_id(intent.idempotency_key, 32)
+        self._assert_private_write()
+        try:
+
+            async def submit_close():
+                response = await self.client.close_position(
+                    client_symbol,
+                    intent.position_side.value.lower() if intent.position_side else None,
+                    {
+                        "clientOrderId": client_order_id,
+                        "marginMode": self.margin_mode,
+                        "autoCxl": True,
+                        "posSide": intent.position_side.value.lower()
+                        if intent.position_side
+                        else "net",
+                    },
+                )
+                if response.get("id"):
+                    return self._map_order(response, plan.id).model_copy(
+                        update={
+                            "position_side": intent.position_side,
+                            "reduce_only": True,
+                        }
+                    )
+                raise RuntimeError("OKX close-position acknowledgement has no order ID")
+
+            order = await self._submit_order_once(client_order_id, intent, submit_close)
+            after_quantity = before_quantity
+            for _attempt in range(12):
+                after = await self.portfolio()
+                after_quantity = self._aligned_position_quantity(after, plan)
+                if after_quantity == 0:
+                    break
+                await asyncio.sleep(0.5)
+            if after_quantity != 0:
+                if not await self.verify_position_protection(
+                    plan,
+                    entry_orders,
+                    after_quantity,
+                ):
+                    raise PositionProtectionError(
+                        "pending OKX close-position no longer has exact native protection",
+                        order,
+                    )
+                return order.model_copy(
+                    update={
+                        "plan_id": plan.id,
+                        "status": OrderStatus.OPEN,
+                        "quantity": intent.quantity,
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+            if not await self.verify_position_protection(
+                plan,
+                entry_orders,
+                Decimal("0"),
+            ) and not await self.clear_position_protection(plan, entry_orders):
+                raise PositionProtectionError(
+                    "OKX close-position left active native protection",
+                    order,
+                )
+            return order.model_copy(
+                update={
+                    "plan_id": plan.id,
+                    "status": OrderStatus.FILLED,
+                    "quantity": intent.quantity,
+                    "filled_quantity": intent.quantity,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+        except PositionProtectionError:
+            raise
+        except Exception as exc:
+            raise PositionProtectionError(f"OKX atomic close-position is uncertain: {exc}") from exc
+
     async def verify_position_protection(
         self,
         plan: StrategyPlan,
@@ -1448,6 +1759,7 @@ class CcxtExchangeAdapter(ExchangeAdapter):
         if self.exchange_id != "okx" or self.market_type != "swap":
             return False
         try:
+            self._validate_position_entries(plan, entry_orders)
             all_protections = await self._okx_protections(entry_orders, plan.symbol)
             active = [item for item in all_protections if item.state == "live"]
             if current_quantity <= 0:
@@ -1465,6 +1777,8 @@ class CcxtExchangeAdapter(ExchangeAdapter):
         if self.exchange_id != "okx" or self.market_type != "swap":
             return False
         try:
+            self._assert_private_write()
+            self._validate_position_entries(plan, entry_orders)
             protections = await self._okx_protections(entry_orders, plan.symbol)
             active = [item for item in protections if item.state == "live"]
             if active:
@@ -1473,6 +1787,221 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             return await self.verify_position_protection(plan, entry_orders, Decimal("0"))
         except Exception:
             return False
+
+    def _assert_private_write(self) -> None:
+        if self.public_only:
+            raise PermissionError("public market adapter cannot place orders")
+        if not self.sandbox and not self.live_enabled:
+            raise PermissionError("live trading is locked")
+
+    @staticmethod
+    def _validate_position_entries(plan: StrategyPlan, entries: list[Order]) -> None:
+        side = OrderSide.BUY if plan.side == Side.LONG else OrderSide.SELL
+        legs = {order.position_side for order in entries}
+        if len(legs) > 1 or any(
+            order.symbol != plan.symbol
+            or order.side != side
+            or order.reduce_only
+            or (order.position_side and order.position_side.value.lower() != str(plan.side))
+            for order in entries
+        ):
+            raise PositionProtectionError("entry pool must contain one symbol and one position leg")
+
+    @staticmethod
+    def _partial_protection_id(order: Order) -> str:
+        return sha256(f"partial-protection:{order.client_order_id}".encode()).hexdigest()[:32]
+
+    async def _protect_okx_actual_fill(
+        self,
+        plan: StrategyPlan,
+        order: Order,
+        target_price: Decimal,
+        *,
+        exact_quantity: bool = True,
+    ) -> Order:
+        """Settle a partial entry before repairing it; full attachments may activate later."""
+        self._assert_private_write()
+        if order.status in {OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED}:
+            try:
+                latest = await self.cancel_order(order.id, order.symbol)
+            except Exception as exc:
+                raise PositionProtectionError(
+                    "partial entry cancellation is uncertain", order
+                ) from exc
+            order = latest.model_copy(
+                update={
+                    "plan_id": order.plan_id,
+                    "position_side": order.position_side,
+                    "client_order_id": order.client_order_id,
+                }
+            )
+            if order.status not in {OrderStatus.CANCELED, OrderStatus.FILLED}:
+                raise PositionProtectionError("partial entry remainder is still live", order)
+        if order.filled_quantity <= 0:
+            return order
+        symbol = await self._resolve_symbol(order.symbol)
+        expected = self._venue_amount(symbol, order.filled_quantity)
+        for attempt in range(3):
+            protections = await self._okx_protections([order], order.symbol)
+            live = [item for item in protections if item.state == "live"]
+            if live:
+                if exact_quantity and sum((item.size for item in live), Decimal("0")) != expected:
+                    raise PositionProtectionError(
+                        "entry protection coverage differs from actual fill", order
+                    )
+                return order
+            if any(item.state in {"effective", "partially_effective"} for item in protections):
+                # The entry's native exit may beat acknowledgement/recovery. Never
+                # recreate a TP/SL that has already triggered; reconcile its child fills.
+                return order
+            if order.filled_quantity < order.quantity:
+                break
+            if attempt < 2:
+                await asyncio.sleep(0.1)
+        if order.filled_quantity >= order.quantity:
+            raise PositionProtectionError(
+                "filled entry native protection is not yet proven active", order
+            )
+        if order.status != OrderStatus.CANCELED:
+            raise PositionProtectionError(
+                "partial entry must be terminal before protection repair", order
+            )
+        client_id = self._partial_protection_id(order)
+        stop = self.client.price_to_precision(symbol, float(plan.exit.stop_loss))
+        target = self.client.price_to_precision(symbol, float(target_price))
+        close_side = OrderSide.SELL if order.side == OrderSide.BUY else OrderSide.BUY
+        closing = OrderIntent(
+            idempotency_key=client_id,
+            plan_id=plan.id,
+            plan_fingerprint=plan.fingerprint,
+            symbol=plan.symbol,
+            side=close_side,
+            position_side=order.position_side,
+            order_type=OrderType.MARKET,
+            quantity=order.filled_quantity,
+            reduce_only=True,
+        )
+        params = {
+            **self._order_params(closing),
+            "instId": self.client.market(symbol)["id"],
+            "algoClOrdId": client_id,
+            "tdMode": "cash" if self.market_type == "spot" else self.margin_mode,
+            "ordType": "oco",
+            "side": close_side.value,
+            "sz": f"{expected:f}",
+            "slTriggerPx": stop,
+            "slOrdPx": "-1",
+            "tpTriggerPx": target,
+            "tpOrdPx": "-1",
+            "slTriggerPxType": "mark" if self.market_type == "swap" else "last",
+            "tpTriggerPxType": "mark" if self.market_type == "swap" else "last",
+        }
+        error = None
+        if self._claim_submission(client_id, params):
+            try:
+                response = await self.client.private_post_trade_order_algo(params)
+                self._require_okx_batch_success(response, "repair partial-fill protection")
+            except Exception as exc:
+                error = exc
+        try:
+            protections = await self._okx_protections([order], order.symbol)
+            active = [item for item in protections if item.state == "live"]
+            if sum((item.size for item in active), Decimal("0")) == expected:
+                return order
+        except Exception as exc:
+            error = error or exc
+        raise OrderSubmissionUncertain(
+            client_id, "partial-fill protection could not be independently confirmed", order
+        ) from error
+
+    async def rebalance_position_protection(
+        self, plan: StrategyPlan, entry_orders: list[Order], current_quantity: Decimal
+    ) -> bool:
+        self._assert_private_write()
+        if self.exchange_id != "okx" or self.market_type != "swap":
+            raise PositionProtectionError("pooled protection sync requires OKX swaps")
+        self._validate_position_entries(plan, entry_orders)
+        if current_quantity < 0:
+            raise ValueError("current_quantity cannot be negative")
+        leg = next((entry.position_side for entry in entry_orders if entry.position_side), None)
+        await self.validate_account_configuration(require_hedge=leg is not None)
+        if self._position_mode == "long_short_mode" and leg is None:
+            raise PositionProtectionError(
+                "hedge protection sync requires an explicit position_side"
+            )
+        if current_quantity == 0:
+            if not await self.clear_position_protection(plan, entry_orders):
+                raise PositionProtectionError("orphaned protection cleanup is uncertain")
+            return True
+        settled_entries = []
+        try:
+            for index, entry in enumerate(entry_orders):
+                if entry.filled_quantity <= 0:
+                    settled_entries.append(entry)
+                    continue
+                target = plan.exit.take_profits[index % len(plan.exit.take_profits)]
+                settled = await self._protect_okx_actual_fill(
+                    plan, entry, target.price, exact_quantity=False
+                )
+                if settled.filled_quantity != entry.filled_quantity:
+                    raise PositionProtectionError(
+                        "entry filled further during cancellation; "
+                        "merge its actual fill before syncing",
+                        settled,
+                    )
+                settled_entries.append(settled)
+            protections = await self._okx_active_protections(settled_entries, plan.symbol)
+            symbol = await self._resolve_symbol(plan.symbol)
+            expected = self._venue_amount(symbol, current_quantity)
+            if sum((item.size for item in protections), Decimal("0")) < expected:
+                raise PositionProtectionError("combined fills exceed verified native protection")
+            stop = self.client.price_to_precision(symbol, float(plan.exit.stop_loss))
+            for index, protection in enumerate(protections):
+                target = self.client.price_to_precision(
+                    symbol, float(plan.exit.take_profits[index % len(plan.exit.take_profits)].price)
+                )
+                params = {
+                    "instId": self.client.market(symbol)["id"],
+                    "algoId": protection.algo_id,
+                    "newSlTriggerPx": stop,
+                    "newSlOrdPx": "-1",
+                    "newTpTriggerPx": target,
+                    "newTpOrdPx": "-1",
+                    "reqId": self._venue_client_id(
+                        f"levels:{protection.client_id}:{stop}:{target}", 32
+                    ),
+                    # A failed amendment must leave the existing stop working.
+                    "cxlOnFail": False,
+                }
+                error = None
+                if protection.stop_price != stop or protection.target_price != target:
+                    try:
+                        response = await self.client.private_post_trade_amend_algos(params)
+                        self._require_okx_batch_success(response, "synchronize TP/SL levels")
+                    except Exception as exc:
+                        error = exc
+                detail = await self._okx_algo_detail(protection.algo_id, protection.client_id)
+                if (
+                    not detail
+                    or detail.get("state") != "live"
+                    or (
+                        Decimal(str(detail.get("slTriggerPx") or 0)) != Decimal(stop)
+                        or Decimal(str(detail.get("tpTriggerPx") or 0)) != Decimal(target)
+                    )
+                ):
+                    raise PositionProtectionError(
+                        "latest pooled TP/SL levels are unconfirmed"
+                    ) from error
+            await self._rebalance_okx_protections(symbol, protections, current_quantity)
+            if not await self.verify_position_protection(plan, settled_entries, current_quantity):
+                raise PositionProtectionError("pooled protection final coverage is unconfirmed")
+            return True
+        except PositionProtectionError:
+            raise
+        except Exception as exc:
+            raise PositionProtectionError(
+                f"pooled protection synchronization is uncertain: {exc}"
+            ) from exc
 
     @staticmethod
     def _aligned_position_quantity(portfolio: PortfolioState, plan: StrategyPlan) -> Decimal:
@@ -1501,7 +2030,17 @@ class CcxtExchangeAdapter(ExchangeAdapter):
     ) -> list[_OkxProtection]:
         client_symbol = await self._resolve_symbol(symbol)
         identifiers: dict[str, tuple[str, str]] = {}
+        expected_legs = {order.position_side for order in entry_orders}
+        if len(expected_legs) > 1:
+            raise PositionProtectionError("cannot mix hedge legs or legacy net orders")
+        expected_leg = next(iter(expected_legs), None)
+        expected_position_side = expected_leg.value.lower() if expected_leg else "net"
+        expected_sides = {
+            "sell" if order.side == OrderSide.BUY else "buy" for order in entry_orders
+        }
         for order in entry_orders:
+            if order.symbol != symbol:
+                raise PositionProtectionError("protection entries must belong to one symbol")
             record = await self._okx_order_record(order.id, client_symbol)
             attachments = record.get("attachAlgoOrds") or []
             if not attachments and order.client_order_id:
@@ -1513,11 +2052,32 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                 key = algo_id or client_id
                 if key:
                     identifiers[key] = (algo_id, client_id)
+            # Deterministic recovery OCO for a canceled partially filled parent.
+            if order.filled_quantity > 0 and order.filled_quantity < order.quantity:
+                recovery_id = self._partial_protection_id(order)
+                identifiers[recovery_id] = ("", recovery_id)
         protections: list[_OkxProtection] = []
+        seen: set[str] = set()
         for algo_id, client_id in identifiers.values():
             detail = await self._okx_algo_detail(algo_id, client_id)
             if not detail:
                 continue
+            if detail.get("instId") and detail["instId"] != self.client.market(client_symbol)["id"]:
+                continue
+            if detail.get("posSide", "net") != expected_position_side:
+                continue
+            if detail.get("side") and detail["side"] not in expected_sides:
+                continue
+            if expected_leg is not None and (
+                not detail.get("side")
+                or not detail.get("slTriggerPx")
+                or not detail.get("tpTriggerPx")
+            ):
+                continue
+            identity = str(detail.get("algoId") or detail.get("algoClOrdId") or client_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
             state = str(detail.get("state") or "").lower()
             size = Decimal(str(detail.get("sz") or 0))
             linked_order = detail.get("linkedOrd") or {}
@@ -1536,6 +2096,11 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                     size=size,
                     state=state,
                     exit_order_ids=exit_order_ids,
+                    side=str(detail.get("side") or ""),
+                    position_side=str(detail.get("posSide") or "net"),
+                    instrument_id=str(detail.get("instId") or ""),
+                    stop_price=str(detail.get("slTriggerPx") or ""),
+                    target_price=str(detail.get("tpTriggerPx") or ""),
                 )
             )
         return protections
@@ -1554,7 +2119,18 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                 response = await self.client.private_get_trade_order_algo(params)
                 data = response.get("data") or []
                 if data:
-                    return data[0]
+                    detail = data[0]
+                    if str(detail.get("state") or "").lower() in {
+                        "effective",
+                        "partially_effective",
+                    }:
+                        try:
+                            active = await self._okx_pending_algo(algo_id, client_id)
+                        except Exception:
+                            active = None
+                        if active:
+                            return active
+                    return detail
             except Exception as exc:
                 if not self._okx_order_missing(exc):
                     raise
@@ -1619,6 +2195,35 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                     and str(item.get("algoClOrdId") or "") == client_id
                 ):
                     return item
+        # OKX Demo can expose attached TP/SL children through the ordinary
+        # open-orders response while both Algo detail and pending Algo queries
+        # return no row. The stable algoClOrdId still links the child to its
+        # entry, so use that venue truth instead of declaring protection absent.
+        try:
+            open_orders = await self.client.fetch_open_orders()
+            successful_queries += 1
+        except Exception as exc:
+            errors.append(exc)
+        else:
+            for order in open_orders:
+                info = dict(order.get("info") or {})
+                order_algo_id = str(info.get("algoId") or order.get("id") or "")
+                order_client_id = str(info.get("algoClOrdId") or order.get("clientOrderId") or "")
+                if not (
+                    algo_id
+                    and order_algo_id == algo_id
+                    or client_id
+                    and order_client_id == client_id
+                ):
+                    continue
+                info.setdefault("algoId", order_algo_id)
+                info.setdefault("algoClOrdId", order_client_id)
+                if str(order.get("status") or "").lower() == "open":
+                    info["state"] = "live"
+                else:
+                    info.setdefault("state", "")
+                info.setdefault("sz", order.get("amount") or "0")
+                return info
         if successful_queries:
             return None
         if errors:
@@ -1636,6 +2241,7 @@ class CcxtExchangeAdapter(ExchangeAdapter):
         protections: list[_OkxProtection],
         remaining_base_quantity: Decimal,
     ) -> None:
+        self._assert_private_write()
         market = self.client.market(client_symbol)
         remaining_venue = (
             self._venue_amount(client_symbol, remaining_base_quantity)
@@ -1654,8 +2260,18 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             )
 
         cancel_payload = []
+        acknowledgement_errors: list[str] = []
         for protection, allocation in allocations:
             if allocation != 0:
+                continue
+            ordinary_child_canceled = False
+            for order_id in protection.exit_order_ids:
+                try:
+                    await self.client.cancel_order(order_id, client_symbol)
+                    ordinary_child_canceled = True
+                except Exception as exc:
+                    acknowledgement_errors.append(str(exc))
+            if ordinary_child_canceled:
                 continue
             item = {"instId": market["id"]}
             if protection.algo_id:
@@ -1663,7 +2279,6 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             else:
                 item["algoClOrdId"] = protection.client_id
             cancel_payload.append(item)
-        acknowledgement_errors: list[str] = []
         if cancel_payload:
             try:
                 response = await self.client.private_post_trade_cancel_algos(cancel_payload)
@@ -1676,7 +2291,7 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             params = {
                 "instId": market["id"],
                 "newSz": f"{allocation:f}",
-                "reqId": f"cxrb{uuid4().hex[:20]}",
+                "reqId": self._venue_client_id(f"resize:{protection.client_id}:{allocation}", 32),
             }
             if protection.algo_id:
                 params["algoId"] = protection.algo_id
@@ -1688,7 +2303,7 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             except Exception as exc:
                 acknowledgement_errors.append(str(exc))
 
-        for attempt in range(3):
+        for attempt in range(8):
             verified = True
             for protection, allocation in allocations:
                 detail = await self._okx_algo_detail(protection.algo_id, protection.client_id)
@@ -1700,8 +2315,8 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                     verified = verified and state == "live" and size == allocation
             if verified:
                 return
-            if attempt < 2:
-                await asyncio.sleep(0.25 * (attempt + 1))
+            if attempt < 7:
+                await asyncio.sleep(0.5)
         raise PositionProtectionError(
             "OKX did not confirm the amended protection quantities"
             + (f"; acknowledgement: {acknowledgement_errors[0]}" if acknowledgement_errors else "")
@@ -1733,6 +2348,15 @@ class CcxtExchangeAdapter(ExchangeAdapter):
 
     async def verify_protection(self, order: Order) -> bool:
         if self.exchange_id == "okx":
+            if order.filled_quantity > 0:
+                try:
+                    protections = await self._okx_protections([order], order.symbol)
+                    symbol = await self._resolve_symbol(order.symbol)
+                    return sum(
+                        (item.size for item in protections if item.state == "live"), Decimal("0")
+                    ) == self._venue_amount(symbol, order.filled_quantity)
+                except Exception:
+                    return False
             client_symbol = await self._resolve_symbol(order.symbol)
             record = await self._okx_order_record(order.id, client_symbol)
             attachments = record.get("attachAlgoOrds") or []
@@ -1755,19 +2379,34 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             }
         return False
 
-    async def protection_available(self, symbol: str) -> bool:
+    async def protection_available(
+        self, symbol: str, position_side: PositionSide | None = None
+    ) -> bool:
         if self.public_only:
             return False
         try:
             await self._resolve_symbol(symbol)
         except LookupError:
             return False
-        await self.validate_account_configuration()
+        await self.validate_account_configuration(require_hedge=position_side is not None)
+        if (
+            self.exchange_id == "okx"
+            and self.market_type == "swap"
+            and getattr(self, "_position_mode", "net_mode") == "long_short_mode"
+            and position_side is None
+        ):
+            raise ExchangeConfigurationError(
+                "okx_position_mode_not_net",
+                "OKX position mode must be net_mode when no hedge leg is specified",
+                "Pass an explicit LONG or SHORT position side for hedge-mode orders.",
+            )
         return self.exchange_id == "okx" or (
             self.exchange_id == "binance" and self.market_type == "spot"
         )
 
-    async def validate_account_configuration(self) -> dict[str, str]:
+    async def validate_account_configuration(
+        self, *, require_hedge: bool = False
+    ) -> dict[str, str]:
         """Fail closed when the exchange account mode cannot represent our orders."""
         if self.public_only:
             return {"status": "public_only"}
@@ -1782,15 +2421,16 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                 )
             configuration = data[0]
             position_mode = str(configuration.get("posMode") or "")
-            if position_mode != "net_mode":
+            if position_mode not in {"net_mode", "long_short_mode"} or (
+                require_hedge and position_mode != "long_short_mode"
+            ):
                 raise ExchangeConfigurationError(
-                    "okx_position_mode_not_net",
-                    "OKX 永续当前仅支持单向持仓模式；请先在 OKX 将持仓模式切换为 net_mode",
-                    (
-                        "先关闭 OKX 模拟盘中的全部合约仓位和挂单，"
-                        "再将持仓模式切换为单向持仓（net_mode）。"
-                    ),
+                    "okx_position_mode_not_hedge" if require_hedge else "okx_position_mode_unknown",
+                    "OKX position mode must be long_short_mode for explicit hedge legs",
+                    "Check OKX account position mode; "
+                    "this adapter never switches it automatically.",
                 )
+            self._position_mode = position_mode
             account_level = str(configuration.get("acctLv") or "")
             if account_level == "1":
                 raise ExchangeConfigurationError(
@@ -1810,13 +2450,22 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             }
         return {"status": "ok"}
 
-    async def ensure_contract_configuration(self, symbol: str) -> None:
+    async def ensure_contract_configuration(
+        self, symbol: str, position_side: PositionSide | None = None
+    ) -> None:
         if self.market_type != "swap":
             return
         if self.contract_leverage < 1:
             raise RuntimeError("合约杠杆必须大于或等于 1")
-        await self.validate_account_configuration()
+        await self.validate_account_configuration(require_hedge=position_side is not None)
+        if (
+            getattr(self, "_position_mode", "net_mode") == "long_short_mode"
+            and position_side is None
+        ):
+            raise ValueError("OKX long_short_mode requires explicit position_side")
         params = {"mgnMode": self.margin_mode} if self.exchange_id == "okx" else {}
+        if self.exchange_id == "okx" and self.margin_mode == "isolated" and position_side:
+            params["posSide"] = position_side.value.lower()
         client_symbol = await self._resolve_symbol(symbol)
         await self.client.set_leverage(int(self.contract_leverage), client_symbol, params)
 
@@ -1845,8 +2494,14 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             raise PermissionError("public market adapter cannot place orders")
         if not self.sandbox and not self.live_enabled:
             raise PermissionError("live trading is locked")
-        if intent.order_type.value != "limit" or intent.limit_price is None:
-            raise ValueError("protected exchange entries must use a limit order")
+        self._validate_intent(intent)
+        if intent.reduce_only or intent.symbol != plan.symbol:
+            raise ValueError("protected entry must open the plan symbol")
+        expected_side = OrderSide.BUY if plan.side == Side.LONG else OrderSide.SELL
+        if intent.side != expected_side:
+            raise ValueError("protected entry side differs from plan direction")
+        if intent.position_side and intent.position_side.value.lower() != str(plan.side):
+            raise ValueError("protected entry position_side differs from plan direction")
         await self.client.load_markets()
         if self.market_type == "swap":
             if plan.leverage != self.contract_leverage:
@@ -1857,10 +2512,12 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                 raise RuntimeError(
                     f"策略保证金模式 {plan.margin_mode} 与执行配置 {self.margin_mode} 不一致"
                 )
-            await self.ensure_contract_configuration(plan.symbol)
+            await self.ensure_contract_configuration(plan.symbol, intent.position_side)
         if self.exchange_id == "okx":
             return await self._place_okx_protected_orders(plan, intent)
         if self.exchange_id == "binance" and self.market_type == "spot":
+            if intent.order_type != OrderType.LIMIT:
+                raise ValueError("Binance spot OTOCO only supports protected LIMIT entries")
             return await self._place_binance_spot_otoco(plan, intent)
         raise RuntimeError(f"{self.exchange_id} {self.market_type} 尚未验证原子保护单，禁止开仓")
 
@@ -1868,8 +2525,11 @@ class CcxtExchangeAdapter(ExchangeAdapter):
         self, plan: StrategyPlan, intent: OrderIntent
     ) -> list[Order]:
         client_symbol = await self._resolve_symbol(plan.symbol)
-        market = self.client.market(client_symbol)
-        entry_price = self.client.price_to_precision(client_symbol, float(intent.limit_price))
+        entry_price = (
+            self.client.price_to_precision(client_symbol, float(intent.limit_price))
+            if intent.order_type == OrderType.LIMIT
+            else None
+        )
         stop_price = self.client.price_to_precision(client_symbol, float(plan.exit.stop_loss))
         trigger_type = "mark" if self.market_type == "swap" else "last"
         submitted: list[Order] = []
@@ -1880,6 +2540,7 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             target_price = self.client.price_to_precision(client_symbol, float(target.price))
             client_id = f"{self._venue_client_id(intent.idempotency_key, 28)}{index}"
             params = {
+                **self._order_params(intent),
                 "clOrdId": client_id,
                 "tdMode": "cash" if self.market_type == "spot" else self.margin_mode,
                 "attachAlgoOrds": [
@@ -1894,39 +2555,47 @@ class CcxtExchangeAdapter(ExchangeAdapter):
                     }
                 ],
             }
-            try:
+
+            async def submit(
+                venue_amount=venue_amount,
+                params=params,
+            ):
                 response = await self.client.create_order(
                     client_symbol,
-                    "limit",
+                    intent.order_type.value,
                     intent.side.value,
                     float(venue_amount),
-                    float(entry_price),
+                    float(entry_price) if entry_price is not None else None,
                     params,
                 )
-            except Exception:
-                existing = await self._find_okx_order(market, client_id, plan.id)
-                if existing:
-                    submitted.append(existing)
-                    continue
-                await self._cancel_submitted(submitted)
-                raise
-            failed_attachments = [
-                item
-                for item in (response.get("info", {}).get("attachAlgoOrds") or [])
-                if item.get("failCode") not in (None, "", "0")
-            ]
-            mapped = self._map_order(response, plan.id)
+                mapped = self._map_order(response, plan.id).model_copy(
+                    update={
+                        "position_side": intent.position_side,
+                    }
+                )
+                failures = [
+                    item
+                    for item in ((response.get("info") or {}).get("attachAlgoOrds") or [])
+                    if item.get("failCode") not in (None, "", "0")
+                ]
+                if failures:
+                    # Retain actual fills in the exception for reconciliation.
+                    if mapped.status in {OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED}:
+                        mapped = await self.cancel_order(mapped.id, mapped.symbol)
+                    raise PositionProtectionError("OKX rejected attached protection", mapped)
+                return mapped
+
+            mapped = await self._submit_order_once(
+                client_id,
+                intent,
+                submit,
+                protection=params["attachAlgoOrds"],
+            )
             if mapped.status == OrderStatus.REJECTED:
                 await self._cancel_submitted(submitted)
                 raise RuntimeError("OKX 拒绝入场订单")
-            if failed_attachments:
-                try:
-                    await self.cancel_order(mapped.id, mapped.symbol)
-                finally:
-                    await self._cancel_submitted(submitted)
-                failure = failed_attachments[0]
-                reason = failure.get("failReason") or failure.get("failCode")
-                raise RuntimeError(f"OKX 拒绝保护单：{reason}")
+            if mapped.filled_quantity > 0:
+                mapped = await self._protect_okx_actual_fill(plan, mapped, target.price)
             submitted.append(mapped)
         return submitted
 
@@ -1995,10 +2664,12 @@ class CcxtExchangeAdapter(ExchangeAdapter):
 
     @staticmethod
     def _venue_client_id(value: str, max_length: int) -> str:
-        normalized = re.sub(r"[^A-Za-z0-9]", "", value)[:max_length]
-        if not normalized:
-            raise ValueError("client order id must contain at least one alphanumeric character")
-        return normalized
+        if not value:
+            raise ValueError("client order id must not be empty")
+        if len(value) <= max_length and re.fullmatch(r"[A-Za-z0-9]+", value):
+            return value
+        # Truncating/sanitizing loses entropy precisely where versions/actions differ.
+        return sha256(value.encode()).hexdigest()[:max_length]
 
     def _venue_amount(self, symbol: str, base_quantity: Decimal) -> Decimal:
         market = self.client.market(symbol)
@@ -2106,6 +2777,10 @@ class CcxtExchangeAdapter(ExchangeAdapter):
             quantity *= contract_size
             filled_quantity *= contract_size
         info = item.get("info") or {}
+        status = status_map.get(item.get("status"), OrderStatus.PENDING)
+        if status == OrderStatus.OPEN and filled_quantity > 0:
+            status = OrderStatus.PARTIALLY_FILLED
+        raw_leg = str(info.get("posSide") or item.get("positionSide") or "").upper()
 
         def exchange_time(*values) -> datetime | None:
             for raw in values:
@@ -2144,12 +2819,18 @@ class CcxtExchangeAdapter(ExchangeAdapter):
         )
         return Order(
             id=str(item["id"]),
-            client_order_id=str(item.get("clientOrderId") or item["id"]),
+            client_order_id=str(info.get("algoClOrdId") or item.get("clientOrderId") or item["id"]),
             plan_id=plan_id,
             symbol=self._canonical_symbol(str(item["symbol"])),
             side=str(item["side"]),
+            position_side=PositionSide(raw_leg) if raw_leg in {"LONG", "SHORT"} else None,
+            reduce_only=(
+                str(info.get("reduceOnly") or item.get("reduceOnly") or "").lower() == "true"
+                or (raw_leg == "LONG" and item["side"] == "sell")
+                or (raw_leg == "SHORT" and item["side"] == "buy")
+            ),
             order_type=str(item["type"]),
-            status=status_map.get(item.get("status"), OrderStatus.PENDING),
+            status=status,
             quantity=self._money(quantity),
             filled_quantity=self._money(filled_quantity),
             limit_price=self._money(item["price"]) if item.get("price") else None,

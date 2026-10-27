@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import logging
 import math
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
@@ -12,6 +15,7 @@ from functools import partial
 from hashlib import sha256
 from itertools import combinations
 from pathlib import Path
+from threading import RLock
 from time import perf_counter
 from typing import Literal
 from uuid import uuid4
@@ -20,58 +24,17 @@ from anyio import CapacityLimiter, to_process
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from .acceptance import ProductAcceptanceReport
-from .agent.coordinator import AgentCoordinator
-from .agent.parameter_validation import (
-    ParameterFoldEvidence,
-    build_rolling_parameter_report,
-)
-from .agent.performance import AgentForwardPerformance, build_forward_performance
-from .agent.policy import AgentPolicy
-from .agent.reasoner import GatewayAgentReasoner
-from .agent.runtime_tools import (
-    build_core_tool_registry,
-    scheduled_event_key,
-    timeframe_seconds,
-)
+from .agent.performance import build_forward_performance
 from .agent.schemas import (
     AgentAutonomyMode,
-    AgentEpisodeRuntime,
-    AgentEvent,
-    AgentEventStatus,
-    AgentEventType,
-    AgentGoal,
-    AgentGoalStatus,
-    AgentMemory,
-    AgentReadiness,
-    AgentReadinessCheck,
-    AgentRun,
-    AgentRunStatus,
-    AgentState,
-    MemoryType,
-    ToolRiskClass,
-    TradeEpisode,
     TradeEpisodeStatus,
 )
-from .agent.screening import (
-    candidate_selection_score,
-    evidence_rank_key,
-    evidence_summary,
-    stratified_actionable_candidates,
-)
-from .agent.shadow_validation import (
-    ShadowOutcomeStatus,
-    ShadowPlanOutcome,
-    ShadowValidationTrial,
-    evaluate_shadow_plan,
-    summarize_shadow_trials,
-)
 from .agent.store import AgentStore
-from .agent.tools import AgentTool, AgentToolExecutor
 from .ai_config_service import AIConfigurationService
 from .ai_configuration import (
     AIConfigurationUpdate,
@@ -79,12 +42,30 @@ from .ai_configuration import (
     AIProvider,
 )
 from .ai_gateway import (
+    AIErrorCode,
     AIGateway,
     AIProviderError,
     AIProviderTestResult,
     AIUsage,
 )
 from .ai_usage import AIUsageReport
+from .alpha_factory import (
+    ALPHA_MARKETS,
+    AlphaModelArtifactV1,
+    DevelopmentAuditCertificateV1,
+    DevelopmentAuditEvidenceV1,
+    FullStrategyCertificateV2,
+    SandboxAdmissionCertificateV1,
+    SandboxExecutionRoundEvidenceV1,
+    SandboxMaturityEvidenceV1,
+    alpha_transaction_cost_fingerprint,
+    assess_crypto_5m_contract,
+    dependency_versions,
+)
+from .alpha_runtime import (
+    estimate_alpha_round_trip_cost,
+    evaluate_certified_alpha_signal,
+)
 from .autonomous_research import (
     AutonomousResearchRunRequest,
     FastGateEngine,
@@ -95,7 +76,6 @@ from .backtest import (
     BacktestResult,
     CausalStrategyPrior,
     causal_library_policy_fingerprint,
-    rank_causal_strategy_priors,
     run_walk_forward_backtest,
 )
 from .backup import BackupResult, BackupService
@@ -128,17 +108,16 @@ from .configuration import (
     ConfigurationUpdate,
     ConfigurationView,
     ConnectionTestResult,
-    ResearchValidationPreferences,
     StrategyKind,
     UserConfiguration,
 )
+from .decision_attribution import DecisionOutcomeV2, build_decision_attribution
 from .domain import (
     AuditEvent,
     BasisPoint,
     Candle,
     EntryRule,
     ExitPlan,
-    Fill,
     FundingRatePoint,
     LiquidationEvent,
     LiquidationFlowPoint,
@@ -152,6 +131,7 @@ from .domain import (
     PlanStatus,
     PortfolioState,
     PositioningPoint,
+    PositionSide,
     PositionSizing,
     PriceZone,
     ProfitTarget,
@@ -159,10 +139,10 @@ from .domain import (
     StrategyPlan,
     TradingMode,
 )
-from .exchanges.base import PositionProtectionError
+from .entry_profiles import DEFAULT_ENTRY_PROFILE_ID, get_entry_profile
+from .entry_runtime import EntryOrderService
 from .exchanges.ccxt_adapter import CcxtExchangeAdapter
 from .exchanges.paper import PaperExchange
-from .execution import ExecutionEngine, ProtectionVerificationError
 from .historical_anchor_scan import (
     HistoricalAnchorScan,
     build_binance_historical_anchor_scan,
@@ -172,43 +152,39 @@ from .liquidation_stream import (
     BINANCE_LIQUIDATION_STREAM,
     BinanceLiquidationCollector,
 )
+from .local_access import LocalAccess
 from .market_data import TIMEFRAME_SECONDS, validate_candles
 from .market_data_capture import MarketDataCaptureSession, calculate_capture_coverage
-from .market_evidence import MarketEvidenceSnapshot
+from .market_state_v2 import build_cross_market_context, build_market_state_v2
 from .ml_challenger import MLChallengerReport, detect_return_drift, train_ml_challenger
 from .multi_leg_execution import (
     MultiLegCommissioningResult,
     MultiLegExecutionCoordinator,
     MultiLegExecutionRequest,
-    MultiLegExecutionRun,
     MultiLegExecutionStatus,
-    MultiLegExitMonitorState,
     MultiLegOrderSpec,
     build_multi_leg_commissioning_result,
     build_multi_leg_execution_certificate,
-    evaluate_carry_exit,
-    evaluate_pair_exit,
-    validate_multi_leg_commissioning_result,
-    validate_multi_leg_execution_certificate,
 )
 from .observability import Metrics
 from .official_archive_index import (
     OfficialArchiveIndex,
     download_official_archive_index,
 )
+from .official_events import (
+    ETF_FLOW_STATUS,
+    OfficialEvent,
+    OfficialEventClient,
+    active_risk_windows,
+)
 from .operator_workspace import (
-    AgentGoalOverview,
-    AgentLaunchPreview,
-    AgentLaunchProfile,
-    AgentLaunchRequest,
-    AgentLaunchResult,
-    AgentMarketSense,
-    AgentRuntimeOverview,
-    AgentStrategySummary,
     AuditEventPage,
     PersonalStrategyCreate,
     PersonalStrategyRecord,
     PersonalStrategyUpdate,
+    ReviewEvidenceItem,
+    ReviewJobView,
+    ReviewOverview,
     StrategyLibraryItem,
     StrategyLibraryPage,
     StrategyLibraryPreference,
@@ -216,12 +192,18 @@ from .operator_workspace import (
 )
 from .order_ledger import OrderLedger
 from .plan_lifecycle import EntrySignalState, assess_entry_signal
+from .position_decisions import resolve_position_decision
+from .quant_intelligence import (
+    LightGBMQuantIntelligenceV1,
+    QuantModelArtifactV1,
+    market_state_feature_vector,
+    quant_model_is_eligible,
+)
 from .relative_value import (
     PAIR_BACKTEST_ENGINE_VERSION,
     PAIR_STRATEGY_LIBRARY,
     PairBacktestReport,
     PairStrategySpec,
-    latest_causal_pair_signal,
     run_pair_backtest,
 )
 from .relative_value_campaign import (
@@ -256,15 +238,11 @@ from .research_campaign import (
     finalize_campaign,
     historical_feature_eligibility,
     ineligible_campaign_cell,
-    redact_campaign_for_research_agent,
     research_experiment_fingerprint,
     research_lineage_id,
     research_trial_family_id,
-    validate_campaign_execution_certificate,
-    validate_causal_policy_definition,
 )
-from .research_certificates import GeneratorEnvelopeCertificate
-from .research_evolution import EvolutionOperation
+from .research_certificates import CertificateRevocationEvent, GeneratorEnvelopeCertificate
 from .research_holdout import (
     SealedHoldoutReport,
     SealedHoldoutRequest,
@@ -283,10 +261,10 @@ from .research_integrity import (
     TrialType,
 )
 from .research_lifecycle import (
+    CandidateResearchContext,
     CandidateStatus,
     PromotionDecision,
     StrategyCandidate,
-    ValidatedStrategyArtifact,
     attach_backtest,
     backtest_artifact_fingerprint,
     compare_for_promotion,
@@ -302,35 +280,36 @@ from .research_universe import (
     build_point_in_time_universe_snapshot,
     validate_universe_snapshot,
 )
+from .review_pipeline import (
+    ReviewScopeResult,
+    StrategyReviewJob,
+    StrategyReviewJobStatus,
+    review_failure_detail,
+    should_retry_review_after_restart,
+    strategy_review_fingerprint,
+)
 from .risk import RiskCheck, RiskDecision, RiskEngine, RiskLimits
 from .risk_state import RiskControlState, RiskStateService
 from .runtime import RuntimeManager
 from .secret_store import SecretStore
 from .settings import Settings
 from .signals import (
-    MarketStateAssessment,
     NoTradeSignal,
     score_market_state,
     select_strategy_kind,
 )
 from .storage import SqliteStore
-from .strategy_adaptation import (
-    AdaptiveStrategyCandidate,
-    build_adaptive_strategy_candidates,
-)
-from .strategy_dsl import ResearchHypothesisV2, StrategyDSLV2, compile_strategy_dsl
+from .strategy_dsl import compile_strategy_dsl
 from .strategy_factory import StrategyFactory
 from .strategy_library import (
     StrategyLibraryEntry,
     infer_required_data,
     library_entry,
     list_strategy_library,
-    rank_strategy_library,
     seed_strategy_library_candidates,
 )
 from .strategy_portfolio import (
     StrategyHealthReport,
-    admit_strategy_risk,
     assess_strategy_health,
 )
 from .strategy_spec import (
@@ -339,21 +318,74 @@ from .strategy_spec import (
     validate_strategy_spec,
 )
 from .timeframes import (
-    candle_close_time,
     closed_candles,
     confirmation_timeframe,
     periods_per_year,
     resample_closed_candles,
-    timeframe_delta,
 )
+from .trade_history import TradeHistoryResponseV2, build_trade_history_v2
+from .trading_intelligence import (
+    V2_SYMBOLS,
+    AutomationRuntimeStatus,
+    AutomationRuntimeV2,
+    DecisionEpisode,
+    DeltaContext,
+    HumanLiveGrant,
+    MarketStateV2,
+    PositionRuntimeV2,
+    PositionStateV2,
+    RiskAllocation,
+    ThesisState,
+    TradingModeV2,
+    WaitRuntimeV2,
+    validate_market_state_time,
+)
+from .trading_intelligence import (
+    PlanState as TradingIntelligencePlanState,
+)
+from .trading_intelligence_automation import (
+    TradingIntelligenceAutomation,
+    is_expected_automated_entry_rejection,
+)
+from .trading_intelligence_engine import (
+    DeterministicRiskEngine,
+    DualLLMDecisionService,
+    EventDrivenTradingEngine,
+    ExistingPositionRisk,
+    resolve_trading_mode,
+)
+from .trading_intelligence_engine import (
+    RiskContext as TradingIntelligenceRiskContext,
+)
+from .trading_intelligence_engine import (
+    RiskLimits as TradingIntelligenceRiskLimits,
+)
+from .trading_intelligence_engine import (
+    configuration_fingerprint as v2_configuration_fingerprint,
+)
+from .trading_intelligence_store import TradingIntelligenceStore
+from .v2_execution import EntryRiskBlocked, V2ExecutionEngine, V2ExecutionResult
+from .v2_position_runtime import (
+    PositionReconciliationIntegrityError,
+    V2PositionReconciler,
+)
+
+logger = logging.getLogger(__name__)
 
 env_settings = Settings()
 store = SqliteStore(env_settings.cosmos_data_dir / "cosmos.db")
+trading_intelligence_store = TradingIntelligenceStore(store)
 runtime_build_identity = capture_runtime_build_identity()
 secret_store = SecretStore(env_settings.cosmos_data_dir / "cosmos.db")
 configuration_service = ConfigurationService(store, secret_store)
 ai_configuration_service = AIConfigurationService(store, secret_store)
 ai_gateway = AIGateway(ai_configuration_service)
+dual_llm_decision_service = DualLLMDecisionService(ai_gateway)
+trading_intelligence_engine = EventDrivenTradingEngine(trading_intelligence_store)
+trading_intelligence_automation: TradingIntelligenceAutomation | None = None
+official_event_client = OfficialEventClient()
+quant_model_cache: dict[str, LightGBMQuantIntelligenceV1] = {}
+quant_model_load_lock = RLock()
 risk_state_service = RiskStateService(store)
 runtime = RuntimeManager(configuration_service, risk_state_service)
 agent_store = AgentStore(store)
@@ -366,6 +398,19 @@ research_process_limiter = CapacityLimiter(RESEARCH_PROCESS_CONCURRENCY)
 backtest_job_tasks: set[asyncio.Task] = set()
 campaign_job_tasks: set[asyncio.Task] = set()
 universe_job_tasks: set[asyncio.Task] = set()
+review_worker_task: asyncio.Task | None = None
+v2_position_worker_task: asyncio.Task | None = None
+review_worker_wakeup = asyncio.Event()
+review_worker_health: dict[str, object] = {
+    "status": "stopped",
+    "activity": "idle",
+    "heartbeat_at": None,
+    "current_job_id": None,
+    "last_error": None,
+}
+agent_stream_snapshot_lock = asyncio.Lock()
+agent_stream_snapshot_cache: dict[str, object] = {}
+AGENT_STREAM_SNAPSHOT_TTL_SECONDS = 2.0
 agent_commissioning_lock = asyncio.Lock()
 multi_leg_commissioning_lock = asyncio.Lock()
 stale_candidate_audit_ids: set[str] = set()
@@ -385,6 +430,7 @@ CATALOG_JOURNAL_SOURCE_URLS = {
 PRODUCT_ACCEPTANCE_REPORT_PATH = (
     Path(__file__).resolve().parents[2] / "output" / "acceptance" / "latest.json"
 )
+QUANT_V1_MODEL_DIR = env_settings.cosmos_data_dir / "models" / "quant-intelligence-v1"
 
 
 def parse_strategy_candidate_payload(
@@ -516,147 +562,6 @@ def agent_trailing_state(
     return state
 
 
-def agent_time_exit_state(
-    plan: StrategyPlan,
-    history: list[Candle],
-    market_timestamp: datetime,
-    entry_time: datetime,
-) -> dict:
-    """Evaluate a declared holding limit from causally closed candles only."""
-
-    maximum_holding_bars = plan.exit.maximum_holding_bars
-    state = {
-        "configured": maximum_holding_bars is not None,
-        "maximum_holding_bars": maximum_holding_bars,
-        "history_complete": False,
-        "held_bars": 0,
-        "evaluated_through": None,
-        "due": False,
-    }
-    if maximum_holding_bars is None or not history:
-        return state
-    closed = closed_candles(history, plan.timeframe, market_timestamp)
-    state["history_complete"] = entry_time >= history[0].timestamp
-    if not state["history_complete"]:
-        return state
-    eligible = [
-        candle for candle in closed if candle_close_time(candle, plan.timeframe) > entry_time
-    ]
-    held_bars = len(eligible)
-    state.update(
-        {
-            "held_bars": held_bars,
-            "evaluated_through": (
-                candle_close_time(eligible[-1], plan.timeframe).isoformat() if eligible else None
-            ),
-            "due": plan.exit.time_exit_is_due(held_bars=held_bars),
-        }
-    )
-    return state
-
-
-def sandbox_probe_evidence(
-    result: BacktestResult,
-    validation: ResearchValidationPreferences,
-) -> dict:
-    """Return an explicit low-risk sandbox evidence tier.
-
-    This tier exists only to gather forward evidence. It is never sufficient
-    for live trading and never bypasses stop, protection, drawdown, or
-    position-limit checks.
-    """
-
-    recent = result.recent_window
-    temporal = result.temporal_stability
-    minimum_sample_bars = max(
-        1000,
-        int(Decimal(validation.minimum_sample_bars) * Decimal("0.95")),
-    )
-    checks = {
-        "sample_bars": result.sample_bars >= minimum_sample_bars,
-        "trade_sample": result.total_trades >= 30,
-        "positive_return": result.return_percent > 0,
-        "profit_factor": result.profit_factor >= Decimal("1"),
-        "stress_positive": (
-            result.stress_return_percent is not None and result.stress_return_percent > 0
-        ),
-        "drawdown_bounded": result.max_drawdown_percent
-        <= min(
-            validation.maximum_drawdown_percent,
-            Decimal("10"),
-        ),
-        "recent_evidence": bool(
-            recent
-            and recent.total_trades
-            >= min(
-                validation.minimum_recent_trades,
-                10,
-            )
-            and recent.return_percent > 0
-            and recent.profit_factor >= validation.minimum_profit_factor
-        ),
-        "temporal_evidence": bool(
-            temporal
-            and temporal.passed
-            and temporal.evaluable_folds >= 3
-            and temporal.positive_fold_ratio >= Decimal("0.75")
-            and temporal.worst_fold_return_percent is not None
-            and temporal.worst_fold_return_percent >= Decimal("-2")
-        ),
-    }
-    failed = [name for name, passed in checks.items() if not passed]
-    return {
-        "eligible": not failed,
-        "tier": "sandbox_probe" if not failed else "insufficient",
-        "checks": checks,
-        "failed_checks": failed,
-        "risk_multiplier": "0.20",
-        "live_eligible": False,
-        "purpose": "forward_evidence_collection",
-    }
-
-
-def sandbox_probe_risk_cap(policy: AgentPolicy) -> Decimal:
-    return (policy.max_risk_per_trade * Decimal("0.20")).quantize(
-        Decimal("0.00000001"),
-        rounding=ROUND_DOWN,
-    )
-
-
-def rescale_plan_risk(plan: StrategyPlan, risk_fraction: Decimal) -> StrategyPlan:
-    if risk_fraction <= 0 or risk_fraction >= plan.sizing.risk_fraction:
-        return plan
-    scale = risk_fraction / plan.sizing.risk_fraction
-    quantity = (plan.sizing.suggested_quantity * scale).quantize(
-        Decimal("0.00000001"),
-        rounding=ROUND_DOWN,
-    )
-    if quantity <= 0:
-        raise ValueError("sandbox probe risk scales the order quantity to zero")
-    entry_mid = (plan.entry.zone.lower + plan.entry.zone.upper) / Decimal("2")
-    sizing = PositionSizing(
-        risk_fraction=risk_fraction,
-        risk_amount=(plan.sizing.risk_amount * scale).quantize(Decimal("0.01")),
-        suggested_quantity=quantity,
-        notional=(quantity * entry_mid).quantize(Decimal("0.01")),
-    )
-    note = (
-        "测试网探测层：历史证据尚未达到实盘标准，"
-        f"风险降至权益 {risk_fraction * Decimal('100'):.3f}% 收集前向证据"
-    )
-    return plan.model_copy(
-        update={
-            "sizing": sizing,
-            "reasons": [
-                *[reason for reason in plan.reasons if not reason.startswith("测试网探测层：")],
-                note,
-            ],
-            "approved_at": None,
-            "approved_fingerprint": None,
-        }
-    )
-
-
 def effective_research_bars(configured_bars: int, timeframe: str) -> int:
     """Give 1h/4h research at least one year and permit multi-year generations."""
 
@@ -785,6 +690,29 @@ async def materialize_research_dataset(
         positioning=positioning,
         basis=basis,
     )
+    # Immutable datasets are content addressed. Reuse an identical stored copy
+    # instead of creating one row per scan, which previously inflated the
+    # research inventory with overlapping 5m datasets.
+    existing_payload = next(
+        (
+            item
+            for item in await asyncio.to_thread(store.list_research_datasets, 1000)
+            if item.get("data_fingerprint") == dataset.data_fingerprint
+            and item.get("exchange") == dataset.exchange
+            and item.get("market_type") == dataset.market_type
+            and item.get("symbol") == dataset.symbol
+            and item.get("timeframe") == dataset.timeframe
+        ),
+        None,
+    )
+    if existing_payload:
+        return (
+            ResearchDataset.model_validate(existing_payload),
+            funding_rates,
+            open_interest,
+            positioning,
+            basis,
+        )
     await asyncio.to_thread(
         store.save_research_dataset,
         dataset,
@@ -1290,15 +1218,20 @@ async def execute_research_backtest(
     result.data_fingerprint = dataset.data_fingerprint
     result.data_start = dataset.data_start
     result.data_end = dataset.data_end
-    dataset_verification = verify_research_dataset(
-        dataset,
-        candles,
-        kwargs.get("funding_rates"),
-        kwargs.get("open_interest"),
-        positioning,
-        basis,
-        order_flow,
-        liquidation_flow,
+    dataset_verification = await to_process.run_sync(
+        partial(
+            verify_research_dataset,
+            dataset,
+            candles,
+            kwargs.get("funding_rates"),
+            kwargs.get("open_interest"),
+            positioning,
+            basis,
+            order_flow,
+            liquidation_flow,
+        ),
+        cancellable=True,
+        limiter=research_process_limiter,
     )
     immutable_binding_ok = bool(
         result.sample_bars == dataset.candle_count
@@ -1403,7 +1336,9 @@ async def backtest_candidate_on_dataset(
         risk_fraction=configuration.risk.risk_per_trade,
         minimum_reward_risk=configuration.risk.minimum_reward_risk,
         allow_short=dataset.market_type == "swap",
-        require_confirmation=False,
+        require_confirmation=(
+            configuration.strategy.validation.require_higher_timeframe_confirmation
+        ),
         validation=configuration.strategy.validation,
         strategy_spec=candidate.spec,
         funding_rates=funding_rates,
@@ -1413,10 +1348,12 @@ async def backtest_candidate_on_dataset(
         order_flow=order_flow,
         liquidation_flow=liquidation_flow,
         research_trial_count=research_trial_count,
-        # Campaigns validate the strategy itself across every supplied market.
-        # Market-regime ranking happens before live selection; an additional
-        # family gate here would both hide losing regimes and over-protect entry.
-        require_regime_family_fit=False,
+        require_regime_family_fit=True,
+        maximum_gross_exposure=configuration.risk.max_gross_exposure,
+        maximum_leverage=min(
+            configuration.risk.max_leverage,
+            configuration.contract_leverage,
+        ),
     )
     result.strategy_fingerprint = candidate.spec_fingerprint
     return result
@@ -1442,9 +1379,163 @@ async def run_backtest_job(job: BacktestJob) -> None:
             await asyncio.to_thread(store.save_research_job, job)
 
 
+def _certified_alpha_model_trio(
+    admission: SandboxAdmissionCertificateV1,
+) -> tuple[AlphaModelArtifactV1, AlphaModelArtifactV1, AlphaModelArtifactV1]:
+    artifacts: list[AlphaModelArtifactV1] = []
+    for model_id in admission.model_artifact_ids:
+        payload = store.load_alpha_model_artifact(model_id)
+        if payload is None:
+            raise RuntimeError(f"certified alpha model artifact is missing: {model_id}")
+        artifacts.append(AlphaModelArtifactV1.model_validate(payload))
+    linear = next(
+        (
+            item
+            for item in artifacts
+            if item.model_family in {"elastic_net_regression", "logistic_classification"}
+        ),
+        None,
+    )
+    gbdt = next(
+        (
+            item
+            for item in artifacts
+            if item.model_family in {"lightgbm_regression", "lightgbm_classification"}
+        ),
+        None,
+    )
+    ensemble = next(
+        (item for item in artifacts if item.model_family == "ensemble_50_50"),
+        None,
+    )
+    if linear is None or gbdt is None or ensemble is None:
+        raise RuntimeError("certified alpha model trio is incomplete")
+    if ensemble.fingerprint != admission.artifact_fingerprint:
+        raise RuntimeError("certified alpha ensemble fingerprint drifted")
+    return linear, gbdt, ensemble
+
+
+def _development_audit_for_admission(
+    admission: SandboxAdmissionCertificateV1,
+) -> DevelopmentAuditCertificateV1:
+    if not admission.development_audit_certificate_id:
+        raise RuntimeError("sandbox admission predates server-bound development audit evidence")
+    status = store.load_research_certificate_status(admission.development_audit_certificate_id)
+    if not status or status["certificate_type"] != "development_audit_v1" or status["revoked"]:
+        raise RuntimeError("valid DevelopmentAuditCertificateV1 is unavailable")
+    audit = DevelopmentAuditCertificateV1.model_validate(status["certificate"])
+    if (
+        audit.strategy_ir_hash != admission.strategy_ir_hash
+        or audit.artifact_fingerprint != admission.artifact_fingerprint
+        or audit.data_contract_fingerprint != admission.data_contract_fingerprint
+        or set(audit.model_artifact_ids) != set(admission.model_artifact_ids)
+        or audit.evidence != admission.audit_evidence
+    ):
+        raise RuntimeError("sandbox admission development audit binding drifted")
+    return audit
+
+
+def _alpha_admission_for_plan(plan: StrategyPlan) -> SandboxAdmissionCertificateV1:
+    admission_id = plan.sandbox_admission_certificate_id
+    if not admission_id and plan.full_strategy_certificate_id:
+        full_status = store.load_research_certificate_status(plan.full_strategy_certificate_id)
+        if (
+            not full_status
+            or full_status["certificate_type"] != "full_strategy_v2"
+            or full_status["revoked"]
+        ):
+            raise RuntimeError("valid FullStrategyCertificateV2 is unavailable")
+        full = FullStrategyCertificateV2.model_validate(full_status["certificate"])
+        admission_id = full.sandbox_admission_certificate_id
+    status = store.load_research_certificate_status(admission_id or "")
+    if not status or status["certificate_type"] != "sandbox_admission_v1" or status["revoked"]:
+        raise RuntimeError("valid SandboxAdmissionCertificateV1 is unavailable")
+    admission = SandboxAdmissionCertificateV1.model_validate(status["certificate"])
+    _development_audit_for_admission(admission)
+    return admission
+
+
+async def evaluate_certified_alpha_current_signal(
+    admission: SandboxAdmissionCertificateV1,
+    history: list[Candle],
+    market,
+    *,
+    exchange: str,
+    notional: Decimal,
+):
+    linear, gbdt, ensemble = await asyncio.to_thread(
+        _certified_alpha_model_trio,
+        admission,
+    )
+    required = tuple(
+        sorted(
+            {
+                feature
+                for item in (linear, gbdt, ensemble)
+                for feature in item.required_data_features
+            }
+        )
+    )
+    datasets = await asyncio.to_thread(store.list_research_datasets, 2_000)
+    contract = assess_crypto_5m_contract(datasets, required_features=required)
+    if contract.status != "READY" or contract.fingerprint != admission.data_contract_fingerprint:
+        raise RuntimeError("certified alpha data contract changed or is no longer READY")
+    market_key = f"{exchange}:{market.symbol}"
+    readiness = next((item for item in contract.markets if item.market == market_key), None)
+    if readiness is None or readiness.status != "READY" or not readiness.dataset_id:
+        raise RuntimeError(f"certified alpha market is not READY: {market_key}")
+    tail = await asyncio.to_thread(
+        partial(
+            store.load_alpha_runtime_feature_tail,
+            readiness.dataset_id,
+            limit=5_000,
+        )
+    )
+    completed = closed_candles(history, "5m", market.timestamp)[-4_096:]
+    if len(completed) < 55:
+        raise RuntimeError("certified alpha runtime requires at least 55 closed 5m candles")
+    latest_quote_volume = completed[-1].close * completed[-1].volume
+    configuration = configuration_service.current_configuration()
+    estimated_cost = estimate_alpha_round_trip_cost(
+        fee_bps=configuration.fee_bps,
+        slippage_bps=configuration.slippage_bps,
+        spread_bps=market.spread_bps,
+        notional=max(notional, Decimal("0")),
+        latest_quote_volume=latest_quote_volume,
+    )
+    return await asyncio.to_thread(
+        partial(
+            evaluate_certified_alpha_signal,
+            linear,
+            gbdt,
+            ensemble,
+            candles=completed,
+            feature_tail=tail,
+            snapshot=market,
+            estimated_round_trip_cost=estimated_cost,
+        )
+    )
+
+
 def evaluate_current_plan_signal(plan: StrategyPlan, history, market):
     configuration = configuration_service.current_configuration()
     completed = closed_candles(history, plan.timeframe, market.timestamp)
+    if plan.research_profile == "crypto_5m_v1":
+        if plan.timeframe != "5m":
+            raise RuntimeError("crypto_5m_v1 execution is frozen to the 5m timeframe")
+
+        async def evaluate_alpha():
+            admission = await asyncio.to_thread(_alpha_admission_for_plan, plan)
+            signal, _ = await evaluate_certified_alpha_current_signal(
+                admission,
+                completed,
+                market,
+                exchange=plan.exchange,
+                notional=plan.sizing.notional,
+            )
+            return signal
+
+        return evaluate_alpha()
     return strategy_factory.evaluate(
         StrategyKind(plan.algorithm),
         candles=completed,
@@ -1457,144 +1548,230 @@ def evaluate_current_plan_signal(plan: StrategyPlan, history, market):
     )
 
 
+async def resolve_current_plan_signal(plan: StrategyPlan, history, market):
+    result = evaluate_current_plan_signal(plan, history, market)
+    return await result if inspect.isawaitable(result) else result
+
+
 def add_signal_gate(decision: RiskDecision, plan: StrategyPlan, signal) -> RiskDecision:
     assessment = assess_entry_signal(plan, signal)
-    aligned = assessment.execution_allowed
+    alpha_requires_current_direction = (
+        plan.research_profile == "crypto_5m_v1" and not signal.actionable
+    )
+    aligned = assessment.execution_allowed and not alpha_requires_current_direction
     check = RiskCheck(
         code="signal_lifecycle",
         passed=aligned,
-        blocking=assessment.blocking,
-        message=assessment.reason,
+        blocking=assessment.blocking or alpha_requires_current_direction,
+        message=(
+            "crypto_5m_v1 当前集成信号为 flat；方向一致、两倍成本优势和七类状态门"
+            "必须逐笔同时通过，禁止新增风险。"
+            if alpha_requires_current_direction
+            else assessment.reason
+        ),
     )
     return RiskDecision(
-        approved=decision.approved and assessment.execution_allowed,
+        approved=decision.approved and aligned,
         checks=[*decision.checks, check],
     )
 
 
-def build_plan_forward_outcome_evidence(
-    plan: StrategyPlan,
-    episodes: list[TradeEpisode],
-    plans_by_id: dict[str, StrategyPlan],
-) -> dict:
-    """Summarize mature, fully attributed outcomes for candidate ranking only."""
+async def process_sandbox_alpha_handoffs() -> int:
+    """Materialize at most one current-signal plan for each admitted strategy."""
 
-    matched_returns: list[Decimal] = []
-    matched_episode_ids: list[str] = []
-    for episode in episodes:
-        historical_plan = plans_by_id.get(episode.plan_id)
-        if (
-            episode.status != TradeEpisodeStatus.CLOSED
-            or episode.return_on_risk is None
-            or not historical_plan
-            or episode.symbol != plan.symbol
-            or episode.side != str(plan.side)
-            or historical_plan.timeframe != plan.timeframe
-            or historical_plan.algorithm != plan.algorithm
-        ):
-            continue
-        matched_returns.append(episode.return_on_risk)
-        matched_episode_ids.append(episode.id)
-    sample = len(matched_returns)
-    total_r = sum(matched_returns, Decimal("0"))
-    expectancy_r = total_r / Decimal(sample) if sample else None
-    return {
-        "sample": sample,
-        "total_r": total_r,
-        "expectancy_r": expectancy_r,
-        "mature_for_ranking": sample >= 5,
-        "episode_ids": matched_episode_ids[-10:],
-        "role": "ranking_only",
+    configuration = configuration_service.current_configuration()
+    if configuration.exchange_id != "okx" or configuration.trading_mode != TradingMode.SANDBOX:
+        return 0
+    handoffs = await asyncio.to_thread(store.list_sandbox_admission_handoffs, limit=200)
+    retryable = {
+        "admitted_waiting_current_signal",
+        "queued_until_okx_sandbox",
+        "waiting_current_signal",
+        "runtime_data_blocked",
+        "active_instance_exists",
     }
-
-
-def settle_agent_entry_exception(
-    plan: StrategyPlan,
-    episode: TradeEpisode,
-    exc: Exception,
-) -> TradeEpisodeStatus:
-    """Separate deterministic pre-submit rejection from exchange uncertainty."""
-
-    risk_state = risk_state_service.get()
-    exchange_effect_uncertain = (
-        not isinstance(exc, HTTPException)
-        or exc.status_code == 502
-        or risk_state.source == "execution_uncertain"
-    )
-    if exchange_effect_uncertain:
-        episode.status = TradeEpisodeStatus.UNCERTAIN
-        episode.summary = (
-            "entry execution may have reached the exchange; reconciliation required: "
-            f"{str(getattr(exc, 'detail', exc))[:240]}"
-        )
-    else:
-        episode.status = TradeEpisodeStatus.CANCELED
-        episode.summary = (
-            f"entry canceled before exchange submission: {str(getattr(exc, 'detail', exc))[:240]}"
-        )
-        plan.status = PlanStatus.ARCHIVED
-        store.save_strategy(plan)
-    agent_store.save_episode(episode)
-    return episode.status
-
-
-def archive_unselected_agent_candidate_plans(
-    candidate_plans: list[StrategyPlan],
-    selected_plan_id: str | None,
-) -> list[str]:
-    """Close research-only plan lifecycles once screening has selected a winner."""
-
-    archived: list[str] = []
-    for plan in candidate_plans:
-        if (
-            plan.id == selected_plan_id
-            or plan.decision_origin != "agent"
-            or plan.status != PlanStatus.DRAFT
-        ):
+    created = 0
+    for handoff in handoffs:
+        if handoff.get("status") not in retryable:
             continue
-        plan.status = PlanStatus.ARCHIVED
-        store.save_strategy(plan)
-        archived.append(plan.id)
-    return archived
-
-
-def archive_stale_agent_screening_plans() -> list[str]:
-    """Repair non-executable plans left by terminal historical Agent runs."""
-
-    protected_plan_ids = {
-        episode.plan_id
-        for episode in agent_store.list_episodes(10000)
-        if episode.status
-        in {
-            TradeEpisodeStatus.RESERVED,
-            TradeEpisodeStatus.PENDING_ENTRY,
-            TradeEpisodeStatus.OPEN,
-            TradeEpisodeStatus.UNCERTAIN,
-            TradeEpisodeStatus.AWAITING_REVIEW,
-        }
-    }
-    stale: list[StrategyPlan] = []
-    for plan in plans.values():
-        if (
-            plan.decision_origin != "agent"
-            or plan.status
-            not in {
-                PlanStatus.DRAFT,
-                PlanStatus.APPROVED,
-            }
-            or plan.id in protected_plan_ids
-        ):
+        certificate_id = str(handoff.get("certificate_id") or "")
+        status = await asyncio.to_thread(store.load_research_certificate_status, certificate_id)
+        if not status or status["certificate_type"] != "sandbox_admission_v1" or status["revoked"]:
             continue
-        run = agent_store.load_run(plan.agent_run_id) if plan.agent_run_id else None
-        if run and run.status == AgentRunStatus.RUNNING:
+        admission = SandboxAdmissionCertificateV1.model_validate(status["certificate"])
+        try:
+            await asyncio.to_thread(_development_audit_for_admission, admission)
+        except RuntimeError as exc:
+            await asyncio.to_thread(
+                store.save_sandbox_admission_handoff,
+                admission,
+                status="development_audit_invalid",
+                details={"reason": str(exc)},
+            )
             continue
-        stale.append(plan)
-    archived: list[str] = []
-    for plan in stale:
-        plan.status = PlanStatus.ARCHIVED
-        store.save_strategy(plan)
-        archived.append(plan.id)
-    return archived
+        existing = [
+            item
+            for item in plans.values()
+            if item.sandbox_admission_certificate_id == admission.id
+            and item.status != PlanStatus.ARCHIVED
+        ]
+        if existing:
+            await asyncio.to_thread(
+                partial(
+                    store.save_sandbox_admission_handoff,
+                    admission,
+                    status="active_instance_exists",
+                    details={"plan_id": existing[0].id},
+                )
+            )
+            continue
+        try:
+            portfolio = await runtime.portfolio()
+            candidates: list[tuple[Decimal, StrategyPlan, dict]] = []
+            symbols = [
+                symbol
+                for symbol in configuration.strategy.watchlist
+                if symbol in {"BTC/USDT", "ETH/USDT", "SOL/USDT"}
+            ]
+            for symbol in symbols:
+                market, history = await runtime.market_context(
+                    limit=4_096,
+                    symbol=symbol,
+                    timeframe="5m",
+                )
+                completed = closed_candles(history, "5m", market.timestamp)
+                if len(completed) < 55:
+                    continue
+                volatility = atr(completed, 14)
+                stop_distance = max(volatility * Decimal("1.8"), market.last * Decimal("0.002"))
+                provisional_notional = (
+                    portfolio.equity
+                    * admission.maximum_risk_per_trade
+                    / stop_distance
+                    * market.last
+                )
+                signal, inference = await evaluate_certified_alpha_current_signal(
+                    admission,
+                    completed,
+                    market,
+                    exchange="okx",
+                    notional=provisional_notional,
+                )
+                if not signal.actionable:
+                    continue
+                if configuration.market_type == "spot" and signal.direction == "short":
+                    continue
+                linear, _, _ = await asyncio.to_thread(_certified_alpha_model_trio, admission)
+                ir_payload = linear.canonical_ir_payload or {}
+                family = str(ir_payload.get("family") or StrategyKind.TREND.value)
+                try:
+                    strategy_kind = StrategyKind(family)
+                except ValueError:
+                    strategy_kind = StrategyKind.TREND
+                plan = strategy_factory.generate_unchecked(
+                    strategy_kind,
+                    candles=completed,
+                    snapshot=market,
+                    equity=portfolio.equity,
+                    risk_fraction=admission.maximum_risk_per_trade,
+                    exchange="okx",
+                    timeframe="5m",
+                    minimum_reward_risk=configuration.risk.minimum_reward_risk,
+                    allow_short=configuration.market_type == "swap",
+                    side_override=Side(str(signal.direction)),
+                )
+                plan = plan.model_copy(
+                    update={
+                        "lineage_id": admission.id,
+                        "algorithm": strategy_kind.value,
+                        "trading_mode": TradingMode.SANDBOX,
+                        "market_type": configuration.market_type,
+                        "margin_mode": (
+                            str(configuration.margin_mode)
+                            if configuration.market_type == "swap"
+                            else "cash"
+                        ),
+                        "leverage": (
+                            configuration.contract_leverage
+                            if configuration.market_type == "swap"
+                            else Decimal("1")
+                        ),
+                        "status": PlanStatus.ACTIVE,
+                        "regime": signal.regime,
+                        "confidence": signal.confidence,
+                        "signal_candle_at": signal.signal_candle_at,
+                        "data_as_of": signal.data_as_of,
+                        "strategy_spec": {},
+                        "strategy_spec_fingerprint": admission.strategy_ir_hash,
+                        "research_profile": "crypto_5m_v1",
+                        "alpha_artifact_fingerprint": admission.artifact_fingerprint,
+                        "sandbox_admission_certificate_id": admission.id,
+                        "validated_strategy_artifact": {
+                            "profile": "crypto_5m_v1",
+                            "model_artifact_ids": list(admission.model_artifact_ids),
+                            "ensemble_artifact_fingerprint": admission.artifact_fingerprint,
+                            "data_contract_fingerprint": admission.data_contract_fingerprint,
+                            "current_inference": inference.model_dump(mode="json"),
+                        },
+                        "exit": plan.exit.model_copy(
+                            update={"maximum_holding_bars": inference.horizon_bars}
+                        ),
+                        "reasons": [*signal.reasons, *plan.reasons],
+                        "source_prompt": "certified_alpha_runtime_only",
+                        "decision_origin": "alpha_factory",
+                        "approved_at": datetime.now(UTC),
+                    }
+                )
+                plan.approved_fingerprint = plan.fingerprint
+                candidates.append((signal.confidence, plan, inference.model_dump(mode="json")))
+            if not candidates:
+                await asyncio.to_thread(
+                    partial(
+                        store.save_sandbox_admission_handoff,
+                        admission,
+                        status="waiting_current_signal",
+                        details={"last_checked_at": datetime.now(UTC).isoformat()},
+                    )
+                )
+                continue
+            _, plan, inference_payload = max(candidates, key=lambda item: item[0])
+            plans[plan.id] = plan
+            await asyncio.to_thread(store.save_strategy, plan)
+            await asyncio.to_thread(
+                partial(
+                    store.save_sandbox_admission_handoff,
+                    admission,
+                    status="active_instance_exists",
+                    details={
+                        "plan_id": plan.id,
+                        "symbol": plan.symbol,
+                        "inference": inference_payload,
+                    },
+                )
+            )
+            add_audit(
+                "research",
+                "已认证 crypto_5m_v1 当前信号自动物化为 OKX 模拟盘活动计划",
+                certificate_id=admission.id,
+                plan_id=plan.id,
+                symbol=plan.symbol,
+            )
+            created += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await asyncio.to_thread(
+                partial(
+                    store.save_sandbox_admission_handoff,
+                    admission,
+                    status="runtime_data_blocked",
+                    details={
+                        "last_checked_at": datetime.now(UTC).isoformat(),
+                        "error": str(exc)[:500],
+                    },
+                )
+            )
+    return created
 
 
 async def capture_catalog_journal_scope(
@@ -1632,11 +1809,12 @@ async def capture_catalog_journal_scope(
             )
         )
         previous = (
-            MarketCatalogJournalSnapshot.model_validate(previous_payload)
+            await asyncio.to_thread(MarketCatalogJournalSnapshot.model_validate, previous_payload)
             if previous_payload
             else None
         )
-        snapshot, events = build_catalog_journal_observation(
+        snapshot, events = await asyncio.to_thread(
+            build_catalog_journal_observation,
             scoped_entries,
             exchange=exchange,
             market_type=market_type,
@@ -1702,592 +1880,327 @@ async def maintenance_loop() -> None:
         await asyncio.sleep(3600)
 
 
-async def strategy_execution_loop() -> None:
-    while True:
-        configuration = configuration_service.current_configuration()
-        try:
-            await run_strategy_scan_once(configuration.automatic_execution_enabled)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            metrics.increment("strategy_worker_errors_total")
-        await asyncio.sleep(configuration.strategy_poll_seconds)
-
-
-async def collect_agent_episode_evidence(
-    plan: StrategyPlan, episode: TradeEpisode
-) -> tuple[list[Order], list[Fill]]:
-    """Resolve entry orders and fills without trusting model-provided attribution."""
-
-    await runtime.initialize()
-    assert runtime.execution is not None
-    entry_orders: list[Order] = []
-    tracked_orders: list[Order] = []
-    tracked_order_ids = list(dict.fromkeys([*episode.entry_order_ids, *episode.exit_order_ids]))
-    for order_id in tracked_order_ids:
-        order: Order | None = None
-        try:
-            order = await runtime.execution.fetch_order(order_id, plan.symbol)
-        except Exception:
-            if runtime.order_ledger and order_id in runtime.order_ledger.records:
-                order = runtime.order_ledger.records[order_id].order
-        if order:
-            tracked_orders.append(order)
-            if order_id in episode.entry_order_ids:
-                entry_orders.append(order)
-    if len(entry_orders) != len(episode.entry_order_ids):
-        raise RuntimeError("not all Agent entry orders can be reconciled")
-    protection_exit_resolver = getattr(runtime.execution, "protection_exit_order_ids", None)
-    protection_exit_order_ids = (
-        await protection_exit_resolver(entry_orders, plan.symbol)
-        if protection_exit_resolver
-        else set()
-    )
-    tracked_order_ids = list(dict.fromkeys([*tracked_order_ids, *protection_exit_order_ids]))
-    client_prefixes = {
-        order.client_order_id[:-1] if order.client_order_id.endswith("e") else order.client_order_id
-        for order in tracked_orders
-        if order.client_order_id
-    }
-    tracked_client_order_ids = {
-        *episode.exit_client_order_ids,
-        *(order.client_order_id for order in tracked_orders if order.client_order_id),
-    }
-    fills: list[Fill] | None = None
-    fill_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            fills = await runtime.execution.fetch_fills(
-                plan.symbol,
-                episode.opened_at - timedelta(minutes=5),
-                limit=500,
-            )
-            break
-        except Exception as exc:
-            fill_error = exc
-            metrics.increment(
-                "agent_fill_history_retry_total",
-                attempt=str(attempt + 1),
-            )
-            if attempt < 2:
-                await asyncio.sleep(0.25 * (attempt + 1))
-    if fills is None:
-        assert fill_error is not None
-        raise fill_error
-    plan_fills = [
-        fill
-        for fill in fills
-        if fill.plan_id == plan.id
-        or fill.order_id in tracked_order_ids
-        or fill.client_order_id in tracked_client_order_ids
-        or (
-            fill.client_order_id
-            and any(fill.client_order_id.startswith(prefix) for prefix in client_prefixes)
-        )
-    ]
-    return entry_orders, plan_fills
-
-
-async def agent_execution_loop() -> None:
-    """Wake active durable goals and process one bounded run per schedule bucket."""
+async def official_event_collection_loop() -> None:
+    """Collect normalized events; only newly active major windows may recall the LLM."""
 
     while True:
         try:
-            await poll_agent_trade_events()
-            goals = await asyncio.to_thread(agent_store.list_goals, 100)
-            for goal in goals:
-                if goal.status != AgentGoalStatus.ACTIVE:
-                    continue
-                if goal.valid_until and goal.valid_until <= datetime.now(UTC):
-                    continue
-                policy = await asyncio.to_thread(agent_store.load_policy, goal.risk_policy_id)
-                if not policy:
-                    continue
-                schedule_now = datetime.now(UTC)
-                active_schedule_keys: list[str] = []
-                for symbol in goal.symbols:
-                    for timeframe in goal.timeframes:
-                        dedupe_key = scheduled_event_key(
-                            goal.id,
-                            goal.poll_seconds,
-                            now=schedule_now,
-                            symbol=symbol,
-                            timeframe=timeframe,
-                        )
-                        active_schedule_keys.append(dedupe_key)
-                        event = AgentEvent(
-                            event_type=AgentEventType.SCHEDULE_TRIGGERED,
-                            source="agent-scheduler",
-                            goal_id=goal.id,
-                            dedupe_key=dedupe_key,
-                            payload={
-                                "symbol": symbol,
-                                "timeframe": timeframe,
-                                "scheduled_at": schedule_now.isoformat(),
-                            },
-                        )
-                        canonical_event = await asyncio.to_thread(
-                            agent_store.append_event,
-                            event,
-                        )
-                        requeued = await asyncio.to_thread(
-                            agent_store.requeue_safe_failed_schedule_event,
-                            canonical_event.dedupe_key,
-                        )
-                        if requeued:
-                            metrics.increment(
-                                "agent_schedule_events_retried_total",
-                                symbol=symbol,
-                                timeframe=timeframe,
-                            )
-                superseded = await asyncio.to_thread(
-                    agent_store.supersede_stale_schedule_events,
-                    goal.id,
-                    active_schedule_keys,
-                )
-                if superseded:
-                    metrics.increment(
-                        "agent_schedule_events_superseded_total",
-                        value=superseded,
-                    )
-                coordinator = build_agent_coordinator(goal, policy)
-                run = await coordinator.process_next(
-                    worker_id=f"scheduler-{goal.id}", goal=goal, policy=policy
-                )
-                if run:
-                    metrics.increment(
-                        "agent_runs_total", status=str(run.status), mode=str(goal.autonomy_mode)
-                    )
+            await collect_official_events_once()
         except asyncio.CancelledError:
             raise
         except Exception:
-            metrics.increment("agent_worker_errors_total")
-        await asyncio.sleep(5)
+            metrics.increment("trading_intelligence_official_event_failures_total")
+        await asyncio.sleep(300)
 
 
-async def poll_agent_trade_events() -> None:
-    """Translate exchange/order truth into durable Agent lifecycle events."""
+def load_quant_v1_artifact(symbol: str) -> QuantModelArtifactV1 | None:
+    """Read display metadata without importing or constructing native predictors."""
 
-    episodes = await asyncio.to_thread(agent_store.list_episodes, 200)
-    tracked = [
-        episode
-        for episode in episodes
-        if episode.status
-        in {
-            TradeEpisodeStatus.RESERVED,
-            TradeEpisodeStatus.PENDING_ENTRY,
-            TradeEpisodeStatus.OPEN,
-            TradeEpisodeStatus.UNCERTAIN,
-        }
-    ]
-    if not tracked:
+    cached = quant_model_cache.get(symbol)
+    if cached is not None:
+        return cached.artifact
+    filename = {
+        "BTC/USDT:USDT": "btc-usdt-swap.json",
+        "ETH/USDT:USDT": "eth-usdt-swap.json",
+        "SOL/USDT:USDT": "sol-usdt-swap.json",
+    }.get(symbol)
+    if filename is None:
+        return None
+    path = QUANT_V1_MODEL_DIR / filename
+    if not path.is_file():
+        return None
+    artifact = QuantModelArtifactV1.model_validate_json(path.read_text(encoding="utf-8"))
+    if artifact.symbol != symbol or artifact.timeframe != "5m":
+        raise ValueError("Quant model artifact scope does not match BTC/ETH/SOL 5m v1")
+    return artifact
+
+
+def load_quant_v1_model(symbol: str) -> LightGBMQuantIntelligenceV1 | None:
+    # UI requests and minute workers can arrive together during cold startup.
+    # Only one native predictor per symbol may be created.
+    with quant_model_load_lock:
+        cached = quant_model_cache.get(symbol)
+        if cached is not None:
+            return cached
+        artifact = load_quant_v1_artifact(symbol)
+        if artifact is None:
+            return None
+        model = LightGBMQuantIntelligenceV1(artifact)
+        quant_model_cache[symbol] = model
+        return model
+
+
+async def infer_quant_v1_on_five_minute_close(state: MarketStateV2) -> None:
+    model = await asyncio.to_thread(load_quant_v1_model, state.symbol)
+    if model is None:
         return
-    await runtime.initialize()
-    assert runtime.execution is not None
-    symbols = list(dict.fromkeys(episode.symbol for episode in tracked))
-    for symbol in symbols:
-        with suppress(Exception):
-            await runtime.market_context(symbol=symbol)
-    portfolio = await runtime.portfolio()
-    positions = {position.symbol: position for position in portfolio.open_positions}
-    for episode in tracked:
-        goal = await asyncio.to_thread(agent_store.load_goal, episode.goal_id)
-        if not goal:
-            continue
-        policy = await asyncio.to_thread(agent_store.load_policy, goal.risk_policy_id)
-        if (
-            policy
-            and policy.max_daily_drawdown > 0
-            and portfolio.daily_drawdown_fraction >= policy.max_daily_drawdown
-        ):
-            risk_state_service.halt(
-                "Agent policy daily drawdown budget reached while monitoring positions",
-                source="agent_daily_drawdown",
-            )
-            await asyncio.to_thread(
-                agent_store.append_event,
-                AgentEvent(
-                    event_type=AgentEventType.RISK_HALTED,
-                    source="agent-monitor",
-                    goal_id=goal.id,
-                    dedupe_key=(
-                        f"goal:{goal.id}:risk_halted:{datetime.now(UTC).date().isoformat()}"
-                    ),
-                    payload={
-                        "daily_drawdown_fraction": str(portfolio.daily_drawdown_fraction),
-                        "policy_limit": str(policy.max_daily_drawdown),
-                        "episode_id": episode.id,
-                    },
-                ),
-            )
-        if episode.status == TradeEpisodeStatus.RESERVED:
-            # A reservation should immediately become an order. Surviving without an
-            # order means the process may have died in the exchange uncertainty window.
-            if (datetime.now(UTC) - episode.opened_at) > timedelta(minutes=2):
-                episode.status = TradeEpisodeStatus.UNCERTAIN
-                episode.summary = "entry reservation survived without a confirmed order"
-                await asyncio.to_thread(agent_store.save_episode, episode)
-                risk_state_service.halt(episode.summary, source="agent_reconciliation")
-                await asyncio.to_thread(
-                    agent_store.append_event,
-                    AgentEvent(
-                        event_type=AgentEventType.ORDER_UNCERTAIN,
-                        source="agent-monitor",
-                        goal_id=goal.id,
-                        dedupe_key=f"episode:{episode.id}:order_uncertain",
-                        payload={"episode_id": episode.id, "plan_id": episode.plan_id},
-                    ),
-                )
-            continue
-        if episode.status == TradeEpisodeStatus.UNCERTAIN:
-            plan = plans.get(episode.plan_id)
+    bucket = state.data_as_of.replace(
+        minute=(state.data_as_of.minute // 5) * 5,
+        second=0,
+        microsecond=0,
+    )
+    latest = await asyncio.to_thread(
+        trading_intelligence_store.latest_quant_prediction,
+        state.symbol,
+    )
+    if latest and latest.data_as_of >= bucket:
+        return
+    features = market_state_feature_vector(
+        state.model_dump(mode="json", exclude_none=True),
+        model.artifact.feature_names,
+    )
+    prediction = await asyncio.to_thread(
+        model.infer,
+        data_as_of=bucket,
+        features=features,
+    )
+    await asyncio.to_thread(trading_intelligence_store.save_quant_prediction, prediction)
+    await trading_intelligence_engine.ingest_external_event(
+        symbol=state.symbol,
+        event_type="QUANT_PREDICTION_UPDATED",
+        event_key=prediction.prediction_id,
+        payload={"quant_prediction_id": prediction.prediction_id},
+    )
+
+
+async def trading_intelligence_market_state_loop() -> None:
+    """Update v2 state on minute closes; ordinary updates never invoke an LLM."""
+
+    async def symbol_loop(symbol: str) -> None:
+        while True:
+            started = datetime.now(UTC)
             try:
-                if not plan:
-                    raise RuntimeError("Agent plan is unavailable for reconciliation")
-                entry_orders, evidence = await collect_agent_episode_evidence(plan, episode)
-                entry_side = OrderSide.BUY if plan.side == Side.LONG else OrderSide.SELL
-                entered = sum(
-                    (fill.quantity for fill in evidence if fill.side == entry_side),
-                    Decimal("0"),
+                await refresh_trading_intelligence_market_state(symbol)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                metrics.increment(
+                    "trading_intelligence_market_state_failures_total",
+                    symbol=symbol,
                 )
-                exited = sum(
-                    (fill.quantity for fill in evidence if fill.side != entry_side),
-                    Decimal("0"),
+            elapsed = (datetime.now(UTC) - started).total_seconds()
+            await asyncio.sleep(max(60 - elapsed, 1))
+
+    async with asyncio.TaskGroup() as workers:
+        for symbol in V2_SYMBOLS:
+            workers.create_task(symbol_loop(symbol), name=f"market-state:{symbol}")
+            workers.create_task(
+                trading_intelligence_decision_queue_loop(symbol), name=f"decision-queue:{symbol}"
+            )
+        workers.create_task(trading_intelligence_price_loop(), name="trading-intelligence-prices")
+
+
+async def trading_intelligence_decision_queue_loop(symbol: str) -> None:
+    while True:
+        try:
+            if not risk_state_service.get().halted:
+                await require_v2_automation().drain_decisions(symbol)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Deferred decision failed for %s", symbol)
+        await asyncio.sleep(1)
+
+
+async def trading_intelligence_price_loop() -> None:
+    """Read ticker cache; full LLM features stay on their own cadence."""
+    while True:
+        for symbol in V2_SYMBOLS:
+            try:
+                tick = runtime.market_data.websocket_snapshot_for(symbol.removesuffix(":USDT"))
+                if tick:
+                    await require_v2_automation().on_price_tick(tick)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                metrics.increment("trading_intelligence_price_tick_failures_total", symbol=symbol)
+        await asyncio.sleep(1)
+
+
+async def enqueue_v2_trade_completed(symbol: str, event_id: str) -> None:
+    require_v2_automation().enqueue_decision(symbol, "TRADE_COMPLETED", event_id)
+
+
+async def reconcile_v2_demo_state(exchange, *, cancel_all: bool = False) -> dict:
+    # Hold the account lock across venue awaits and ledger commits. Startup
+    # recovery, the position worker, and new entries must not manage one pool
+    # from different position versions or partially reconciled entry fills.
+    async with v2_entry_allocation_lock:
+        configuration = configuration_service.current_configuration()
+        automation = require_v2_automation()
+        service = EntryOrderService(
+            trading_intelligence_store,
+            on_terminal=automation.on_entry_terminal,
+            margin_mode=str(configuration.margin_mode),
+            execution_leverage=configuration.contract_leverage,
+        )
+        counters = await service.reconcile(
+            exchange,
+            cancel_all=(
+                cancel_all or not automation.runtime().enabled or risk_state_service.get().halted
+            ),
+        )
+        if counters.get("uncertain"):
+            raise PositionReconciliationIntegrityError("pending entry order remains uncertain")
+        result = await V2PositionReconciler(
+            trading_intelligence_store,
+            halt=risk_state_service.halt,
+            on_trade_completed=enqueue_v2_trade_completed,
+            margin_mode=str(configuration.margin_mode),
+            commissioned_max_leverage=configuration.risk.max_leverage,
+        ).reconcile(exchange)
+        risk_state_service.recover_protection_reconciliation()
+        return result
+
+
+async def reconcile_v2_before_resume() -> None:
+    automation = require_v2_automation().runtime()
+    entries = await asyncio.to_thread(
+        trading_intelligence_store.list_entry_orders,
+        needs_reconciliation=True,
+        mode="OKX_DEMO",
+    )
+    needs_demo = any(item.mode == "OKX_DEMO" and not item.terminal_notified for item in entries)
+    risk_state = risk_state_service.get()
+    protection_recovery_pending = (
+        risk_state.halted and risk_state.source == "protection_reconciliation"
+    )
+    if (
+        not needs_demo
+        and not trading_intelligence_store.list_positions()
+        and not protection_recovery_pending
+    ):
+        return
+    adapter = build_v2_demo_adapter()
+    try:
+        await reconcile_v2_demo_state(adapter, cancel_all=not automation.enabled)
+    finally:
+        await adapter.close()
+
+
+def build_v2_demo_adapter() -> CcxtExchangeAdapter:
+    view = configuration_service.get()
+    configuration = view.configuration
+    return CcxtExchangeAdapter(
+        "okx",
+        secret_store.get_credentials("okx:sandbox"),
+        sandbox=True,
+        live_enabled=False,
+        public_only=False,
+        market_type="swap",
+        margin_mode=configuration.margin_mode,
+        contract_leverage=configuration.contract_leverage,
+        store=store,
+        account_id="okx:demo:swap:v2",
+        proxy_url=configuration.network_proxy_url,
+    )
+
+
+async def trading_intelligence_position_loop() -> None:
+    adapter: CcxtExchangeAdapter | None = None
+    adapter_generation = -1
+    try:
+        while True:
+            service = trading_intelligence_automation
+            automation = service.runtime() if service else AutomationRuntimeV2()
+            pending = trading_intelligence_store.list_entry_orders(active_only=True)
+            positions = trading_intelligence_store.list_positions()
+            risk_state = risk_state_service.get()
+            protection_recovery_pending = (
+                risk_state.halted and risk_state.source == "protection_reconciliation"
+            )
+            if (
+                not positions
+                and not any(item.mode == "OKX_DEMO" for item in pending)
+                and (not automation.enabled or automation.requested_mode != TradingModeV2.OKX_DEMO)
+                and not protection_recovery_pending
+            ):
+                if adapter is not None:
+                    await adapter.close()
+                    adapter = None
+                await asyncio.sleep(5)
+                continue
+            if adapter is not None and adapter_generation != v2_configuration_generation:
+                await adapter.close()
+                adapter = None
+            if adapter is None:
+                adapter = build_v2_demo_adapter()
+                adapter_generation = v2_configuration_generation
+            try:
+                await reconcile_v2_demo_state(
+                    adapter,
+                    cancel_all=not automation.enabled or risk_state_service.get().halted,
                 )
-                attributable = max(entered - exited, Decimal("0"))
-                position = positions.get(episode.symbol)
-                aligned = bool(
-                    position and str(position.side) == episode.side and position.quantity > 0
+                current = service.runtime()
+                trading_intelligence_store.save_automation_runtime(
+                    current.model_copy(
+                        update={
+                            "status": (
+                                AutomationRuntimeStatus.STOPPED
+                                if not current.enabled
+                                else AutomationRuntimeStatus.DEGRADED
+                                if current.symbol_failures
+                                else AutomationRuntimeStatus.RUNNING
+                            ),
+                            "last_reconciliation_at": datetime.now(UTC),
+                            "last_error_code": next(
+                                iter(current.symbol_error_codes.values()),
+                                None,
+                            ),
+                            "last_error_hash": (
+                                current.last_error_hash if current.symbol_error_codes else None
+                            ),
+                            "updated_at": datetime.now(UTC),
+                        }
+                    ),
+                    expected_updated_at=current.updated_at,
                 )
-                expected = (
-                    min(attributable, position.quantity) if aligned and position else Decimal("0")
-                )
-                protected = await runtime.execution.verify_position_protection(
-                    plan, entry_orders, expected
-                )
-                if not protected:
-                    raise RuntimeError(
-                        "exchange protection does not exactly cover the attributed position"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                metrics.increment("trading_intelligence_position_loop_failures_total")
+                managed_positions = trading_intelligence_store.list_positions()
+                if managed_positions or isinstance(
+                    exc,
+                    PositionReconciliationIntegrityError,
+                ):
+                    risk_state_service.halt(
+                        "Trading Intelligence v2 Demo position worker failed while "
+                        f"managing an attributable position: {type(exc).__name__}",
+                        source="protection_reconciliation",
                     )
-                recovered_risk = risk_state_service.recover_protection_reconciliation()
-                global_resume_required = recovered_risk.halted
-                if expected > 0:
-                    episode.status = TradeEpisodeStatus.OPEN
-                    event_type = AgentEventType.POSITION_UPDATED
-                    event_suffix = "protection_reconciled"
-                    episode.summary = (
-                        "exchange position and native protection were reconciled; "
-                        + (
-                            "another global halt remains and requires operator review"
-                            if global_resume_required
-                            else "transient protection reconciliation halt recovered"
-                        )
+                    current = service.runtime()
+                    trading_intelligence_store.save_automation_runtime(
+                        current.model_copy(
+                            update={
+                                "status": AutomationRuntimeStatus.HALTED,
+                                "last_error_code": (f"position_integrity:{type(exc).__name__}"),
+                                "last_error_hash": sha256(str(exc).encode()).hexdigest(),
+                                "updated_at": datetime.now(UTC),
+                            }
+                        ),
+                        expected_updated_at=current.updated_at,
                     )
                 else:
-                    episode.status = TradeEpisodeStatus.AWAITING_REVIEW
-                    event_type = AgentEventType.POSITION_CLOSED
-                    event_suffix = "position_closed_after_reconciliation"
-                    episode.summary = (
-                        "no attributed position or active native protection remains; "
-                        "trade is ready for deterministic review"
+                    current = service.runtime()
+                    trading_intelligence_store.save_automation_runtime(
+                        current.model_copy(
+                            update={
+                                "status": AutomationRuntimeStatus.DEGRADED,
+                                "last_error_code": (f"position_transport:{type(exc).__name__}"),
+                                "last_error_hash": sha256(str(exc).encode()).hexdigest(),
+                                "updated_at": datetime.now(UTC),
+                            }
+                        ),
+                        expected_updated_at=current.updated_at,
                     )
-                await asyncio.to_thread(agent_store.save_episode, episode)
-                await asyncio.to_thread(
-                    agent_store.append_event,
-                    AgentEvent(
-                        event_type=event_type,
-                        source="agent-reconciliation",
-                        goal_id=goal.id,
-                        dedupe_key=f"episode:{episode.id}:{event_suffix}",
-                        payload={
-                            "episode_id": episode.id,
-                            "plan_id": episode.plan_id,
-                            "symbol": episode.symbol,
-                            "attributed_quantity": str(attributable),
-                            "verified_quantity": str(expected),
-                            "global_resume_required": global_resume_required,
-                        },
-                    ),
-                )
-            except Exception as exc:
-                episode.summary = f"protection reconciliation pending: {str(exc)[:180]}"
-                await asyncio.to_thread(agent_store.save_episode, episode)
-                risk_state_service.halt(episode.summary, source="protection_rebalance")
-                await asyncio.to_thread(
-                    agent_store.append_event,
-                    AgentEvent(
-                        event_type=AgentEventType.ORDER_UNCERTAIN,
-                        source="agent-reconciliation",
-                        goal_id=goal.id,
-                        dedupe_key=f"episode:{episode.id}:protection_uncertain",
-                        payload={
-                            "episode_id": episode.id,
-                            "plan_id": episode.plan_id,
-                            "symbol": episode.symbol,
-                            "reason": str(exc)[:240],
-                        },
-                    ),
-                )
-            continue
-        orders: list[Order] = []
-        for order_id in episode.entry_order_ids:
-            try:
-                order = await runtime.execution.fetch_order(order_id, episode.symbol)
-                orders.append(order)
-                if runtime.order_ledger:
-                    runtime.order_ledger.record(order, protection_verified=True)
-            except Exception:
-                continue
-        if episode.status == TradeEpisodeStatus.PENDING_ENTRY:
-            filled = {OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED}
-            if any(order.status in filled for order in orders):
-                episode.status = TradeEpisodeStatus.OPEN
-                await asyncio.to_thread(agent_store.save_episode, episode)
-                await asyncio.to_thread(
-                    agent_store.append_event,
-                    AgentEvent(
-                        event_type=AgentEventType.POSITION_OPENED,
-                        source="agent-monitor",
-                        goal_id=goal.id,
-                        dedupe_key=f"episode:{episode.id}:position_opened",
-                        payload={
-                            "episode_id": episode.id,
-                            "plan_id": episode.plan_id,
-                            "symbol": episode.symbol,
-                        },
-                    ),
-                )
-            elif orders and all(
-                order.status in {OrderStatus.CANCELED, OrderStatus.REJECTED} for order in orders
-            ):
-                episode.status = TradeEpisodeStatus.CANCELED
-                episode.summary = "all Agent entry orders reached a terminal non-fill state"
-                await asyncio.to_thread(agent_store.save_episode, episode)
-                await asyncio.to_thread(archive_agent_plan_for_canceled_episode, episode)
-                await asyncio.to_thread(
-                    agent_store.append_event,
-                    AgentEvent(
-                        event_type=AgentEventType.ORDER_CANCELED,
-                        source="agent-monitor",
-                        goal_id=goal.id,
-                        dedupe_key=f"episode:{episode.id}:entry_canceled",
-                        payload={
-                            "episode_id": episode.id,
-                            "plan_id": episode.plan_id,
-                            "symbol": episode.symbol,
-                        },
-                    ),
-                )
-            continue
-        plan = plans.get(episode.plan_id)
-        try:
-            if not plan:
-                raise RuntimeError("Agent plan is unavailable for open-position monitoring")
-            entry_orders, evidence = await collect_agent_episode_evidence(plan, episode)
-            entry_side = OrderSide.BUY if plan.side == Side.LONG else OrderSide.SELL
-            entered = sum(
-                (fill.quantity for fill in evidence if fill.side == entry_side),
-                Decimal("0"),
-            )
-            exited_fills = [fill for fill in evidence if fill.side != entry_side]
-            exited = sum((fill.quantity for fill in exited_fills), Decimal("0"))
-            if entered <= 0:
-                raise RuntimeError("verified Agent entry fills are temporarily unavailable")
-            attributable = max(entered - exited, Decimal("0"))
-            position = positions.get(episode.symbol)
-            aligned = bool(
-                position and str(position.side) == episode.side and position.quantity > 0
-            )
-            if not aligned and attributable > 0:
-                raise RuntimeError(
-                    "account position is flat but attributed exit fills are incomplete"
-                )
-            expected = (
-                min(attributable, position.quantity) if aligned and position else Decimal("0")
-            )
-            protected = await runtime.execution.verify_position_protection(
-                plan, entry_orders, expected
-            )
-            if not protected:
-                raise RuntimeError(
-                    "native protection does not exactly cover the monitored position"
-                )
-            previous_exit_ids = set(episode.exit_order_ids)
-            episode.exit_order_ids = list(
-                dict.fromkeys(
-                    [
-                        *episode.exit_order_ids,
-                        *(fill.order_id for fill in exited_fills if fill.order_id),
-                    ]
-                )
-            )
-            discovered_exit_ids = set(episode.exit_order_ids) - previous_exit_ids
-            if expected <= 0:
-                episode.status = TradeEpisodeStatus.AWAITING_REVIEW
-                episode.summary = "position closure and native protection cleanup verified"
-                await asyncio.to_thread(agent_store.save_episode, episode)
-                await asyncio.to_thread(
-                    agent_store.append_event,
-                    AgentEvent(
-                        event_type=AgentEventType.POSITION_CLOSED,
-                        source="agent-monitor",
-                        goal_id=goal.id,
-                        dedupe_key=f"episode:{episode.id}:position_closed",
-                        payload={
-                            "episode_id": episode.id,
-                            "plan_id": episode.plan_id,
-                            "symbol": episode.symbol,
-                            "exit_order_ids": episode.exit_order_ids,
-                        },
-                    ),
-                )
-            else:
-                aligned_summary = (
-                    "position quantity and native protection remain aligned after exits"
-                    if discovered_exit_ids
-                    else "position quantity and native protection are aligned"
-                )
-                summary_changed = episode.summary != aligned_summary
-                episode.summary = aligned_summary
-                if summary_changed:
-                    await asyncio.to_thread(agent_store.save_episode, episode)
-            if expected > 0 and discovered_exit_ids:
-                await asyncio.to_thread(agent_store.save_episode, episode)
-                await asyncio.to_thread(
-                    agent_store.append_event,
-                    AgentEvent(
-                        event_type=AgentEventType.POSITION_UPDATED,
-                        source="agent-monitor",
-                        goal_id=goal.id,
-                        dedupe_key=(
-                            f"episode:{episode.id}:exit_fills:"
-                            + ":".join(sorted(discovered_exit_ids))
-                        )[:300],
-                        payload={
-                            "episode_id": episode.id,
-                            "plan_id": episode.plan_id,
-                            "symbol": episode.symbol,
-                            "remaining_quantity": str(expected),
-                            "new_exit_order_ids": sorted(discovered_exit_ids),
-                        },
-                    ),
-                )
-        except Exception as exc:
-            episode.status = TradeEpisodeStatus.UNCERTAIN
-            episode.summary = f"open-position protection is uncertain: {str(exc)[:170]}"
-            await asyncio.to_thread(agent_store.save_episode, episode)
-            risk_state_service.halt(episode.summary, source="protection_reconciliation")
-            await asyncio.to_thread(
-                agent_store.append_event,
-                AgentEvent(
-                    event_type=AgentEventType.ORDER_UNCERTAIN,
-                    source="agent-monitor",
-                    goal_id=goal.id,
-                    dedupe_key=f"episode:{episode.id}:open_protection_uncertain",
-                    payload={
-                        "episode_id": episode.id,
-                        "plan_id": episode.plan_id,
-                        "symbol": episode.symbol,
-                        "reason": str(exc)[:240],
-                    },
-                ),
-            )
-
-
-async def run_strategy_scan_once(automatic_execution_enabled: bool) -> None:
-    await expire_stale_strategy_orders()
-    if not automatic_execution_enabled:
-        return
-    for plan in list(plans.values()):
-        if plan.status != PlanStatus.ACTIVE:
-            continue
-        # Agent-owned plans have their own authorize -> activate -> submit
-        # lifecycle with a run-scoped idempotency key. Letting the generic
-        # strategy scanner submit them as well creates a second execution
-        # owner and a duplicate-order race.
-        if is_agent_owned_plan(plan):
-            continue
-        market, _ = await runtime.market_context(symbol=plan.symbol, timeframe=plan.timeframe)
-        executable_price = market.ask if plan.side == "long" else market.bid
-        if not (plan.entry.zone.lower <= executable_price <= plan.entry.zone.upper):
-            continue
-        response = await execute_strategy(plan.id)
-        if response.order:
-            plan.status = PlanStatus.PAUSED
-            store.save_strategy(plan)
-            add_audit(
-                "execution",
-                "入场条件满足，自动提交保护订单并暂停重复信号",
-                plan_id=plan.id,
-                order_count=len(response.orders),
-            )
-            metrics.increment("automatic_executions_total")
-
-
-async def expire_stale_strategy_orders() -> None:
-    now = datetime.now(UTC)
-    for plan in list(plans.values()):
-        expires_at = plan.entry.expires_at
-        if plan.status not in {PlanStatus.ACTIVE, PlanStatus.PAUSED} or not expires_at:
-            continue
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-        if expires_at > now:
-            continue
-        if plan.status == PlanStatus.PAUSED and not (runtime.order_ledger and runtime.execution):
-            risk_state_service.halt(
-                "策略已到期但执行网关不可用，无法确认撤单",
-                source="reconciliation",
-            )
-            continue
-        if runtime.order_ledger and runtime.execution:
-            for record in list(runtime.order_ledger.records.values()):
-                if record.order.plan_id == plan.id and record.order.status in {
-                    "pending",
-                    "open",
-                    "partially_filled",
-                }:
-                    canceled = await runtime.execution.cancel_order(
-                        record.order.id, record.order.symbol
-                    )
-                    runtime.order_ledger.record(
-                        canceled,
-                        protection_verified=record.protection_verified,
-                    )
-        plan.status = PlanStatus.ARCHIVED
-        store.save_strategy(plan)
-        add_audit("strategy", "策略与未成交入场单已到期撤销", plan_id=plan.id)
-
-
-def archive_agent_plan_for_canceled_episode(episode: TradeEpisode) -> bool:
-    """Make a terminal non-fill close the corresponding Agent plan lifecycle."""
-
-    if episode.status != TradeEpisodeStatus.CANCELED:
-        return False
-    plan = plans.get(episode.plan_id)
-    if (
-        not plan
-        or plan.decision_origin != "agent"
-        or plan.status
-        not in {
-            PlanStatus.APPROVED,
-            PlanStatus.ACTIVE,
-            PlanStatus.PAUSED,
-        }
-    ):
-        return False
-    plan.status = PlanStatus.ARCHIVED
-    store.save_strategy(plan)
-    return True
-
-
-def reconcile_terminal_agent_plan_states() -> int:
-    """Repair stale Agent plan states left by older process versions."""
-
-    return sum(
-        archive_agent_plan_for_canceled_episode(episode)
-        for episode in agent_store.list_episodes(10000)
-    )
+                if adapter is not None:
+                    await adapter.close()
+                    adapter = None
+            await asyncio.sleep(1)
+    finally:
+        if adapter is not None:
+            await adapter.close()
 
 
 async def initialize_runtime_on_startup() -> bool:
@@ -2306,9 +2219,70 @@ async def initialize_runtime_on_startup() -> bool:
         return False
 
 
+def ensure_default_entry_profile_timeframes() -> list[str]:
+    """Add required internal timeframe roles to legacy user configurations."""
+
+    configuration = configuration_service.current_configuration()
+    required = get_entry_profile(DEFAULT_ENTRY_PROFILE_ID).context_timeframes
+    missing = [item for item in required if item not in configuration.strategy.timeframes]
+    if not missing:
+        return []
+    strategy = configuration.strategy.model_copy(
+        update={"timeframes": [*configuration.strategy.timeframes, *missing]}
+    )
+    store.save_configuration(configuration.model_copy(update={"strategy": strategy}))
+    return missing
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global liquidation_collector
+    global liquidation_collector, review_worker_task, trading_intelligence_automation
+    global v2_position_worker_task
+    stored_configuration = configuration_service.current_configuration()
+    if (
+        stored_configuration.live_trading_enabled
+        or stored_configuration.automatic_execution_enabled
+    ):
+        await asyncio.to_thread(
+            store.save_configuration,
+            stored_configuration.model_copy(
+                update={
+                    "live_trading_enabled": False,
+                    "automatic_execution_enabled": False,
+                }
+            ),
+        )
+        add_audit(
+            "trading_intelligence",
+            "retired legacy automatic/live configuration switches during v2 startup",
+            severity="warning",
+        )
+    previous_risk_state = risk_state_service.get()
+    migrated_risk_state = risk_state_service.recover_legacy_strategy_governance_halt()
+    if previous_risk_state.halted and not migrated_risk_state.halted:
+        add_audit(
+            "risk",
+            "application startup migrated obsolete strategy-governance halt "
+            "to a strategy-level entry gate",
+            severity="warning",
+            previous_reason=previous_risk_state.reason,
+            previous_source=previous_risk_state.source,
+        )
+    recovered_position_overflows = await asyncio.to_thread(
+        trading_intelligence_store.recover_legacy_position_quantity_overflows
+    )
+    if recovered_position_overflows:
+        risk_state_service.halt(
+            "Recovered invalid v2 position quantities; manual Demo account "
+            "reconciliation is required before automated management can resume",
+            source="position_integrity",
+        )
+        add_audit(
+            "trading_intelligence",
+            "Recovered legacy aggregate-position quantity overflow and halted automation",
+            severity="critical",
+            position_ids=[item["position_id"] for item in recovered_position_overflows],
+        )
     seeded_library_entries = await asyncio.to_thread(
         seed_strategy_library_candidates,
         store,
@@ -2319,40 +2293,6 @@ async def lifespan(_: FastAPI):
             "application startup seeded the non-empty public strategy library",
             seeded_entries=seeded_library_entries,
             total_entries=len(list_strategy_library()),
-        )
-    archived_terminal_plans = await asyncio.to_thread(reconcile_terminal_agent_plan_states)
-    if archived_terminal_plans:
-        add_audit(
-            "agent",
-            "application startup archived Agent plans whose entry episodes were canceled",
-            severity="warning",
-            archived_plans=archived_terminal_plans,
-        )
-    interrupted_agent_work = await asyncio.to_thread(agent_store.recover_interrupted_work)
-    archived_stale_screening_plans = await asyncio.to_thread(archive_stale_agent_screening_plans)
-    if archived_stale_screening_plans:
-        add_audit(
-            "agent",
-            "application startup archived stale Agent screening plans",
-            severity="warning",
-            archived_plans=len(archived_stale_screening_plans),
-        )
-    uncertain_agent_work = [
-        item for item in interrupted_agent_work if item["external_effect_uncertain"]
-    ]
-    if interrupted_agent_work:
-        add_audit(
-            "agent",
-            "应用启动时已收口进程中断的 Agent 工具调用",
-            severity="critical" if uncertain_agent_work else "warning",
-            recovered_tool_calls=len(interrupted_agent_work),
-            uncertain_execution_calls=len(uncertain_agent_work),
-            tool_names=",".join(sorted({item["tool_name"] for item in interrupted_agent_work})),
-        )
-    if uncertain_agent_work:
-        risk_state_service.halt(
-            "检测到进程中断时可能影响交易状态的 Agent 调用；完成订单、仓位与保护单对账前禁止新开仓",
-            source="agent_restart_recovery",
         )
     interrupted_jobs = await asyncio.to_thread(store.list_research_jobs, 200)
     for payload in interrupted_jobs:
@@ -2396,8 +2336,32 @@ async def lifespan(_: FastAPI):
                 universe_job,
             )
             schedule_research_universe_job(universe_job)
+    interrupted_reviews = await asyncio.to_thread(store.list_strategy_review_jobs, 1000)
+    for payload in interrupted_reviews:
+        review_job = StrategyReviewJob.model_validate(payload)
+        if review_job.review_contract_version > 1 and should_retry_review_after_restart(review_job):
+            review_job.status = StrategyReviewJobStatus.QUEUED
+            review_job.stage = "queued"
+            review_job.error = "应用重启后已从持久化检查点恢复并自动重试"
+            review_job.completed_at = None
+            review_job.updated_at = datetime.now(UTC)
+            await asyncio.to_thread(store.save_strategy_review_job, review_job)
     await initialize_runtime_on_startup()
     configuration = configuration_service.current_configuration()
+    trading_intelligence_automation = TradingIntelligenceAutomation(
+        trading_intelligence_store,
+        trading_intelligence_engine,
+        decide=invoke_automated_trading_intelligence_decision,
+        execute=execute_automated_trading_intelligence_plan,
+        reconcile=reconcile_v2_before_resume,
+    )
+    if env_settings.cosmos_automation_start_paused:
+        previous_automation = trading_intelligence_automation.runtime()
+        trading_intelligence_automation.configure(
+            enabled=False,
+            requested_mode=previous_automation.requested_mode,
+            symbols=previous_automation.symbols,
+        )
     liquidation_collector = BinanceLiquidationCollector(
         store,
         symbols=configuration.strategy.watchlist,
@@ -2409,38 +2373,64 @@ async def lifespan(_: FastAPI):
         catalog_journal_collection_loop(),
         name="market-catalog-journal-collection",
     )
-    strategy_worker = asyncio.create_task(
-        strategy_execution_loop(), name="automatic-strategy-execution"
+    official_event_worker = asyncio.create_task(
+        official_event_collection_loop(),
+        name="trading-intelligence-official-events",
     )
-    agent_worker = asyncio.create_task(agent_execution_loop(), name="durable-agent-execution")
-    multi_leg_monitor = asyncio.create_task(
-        multi_leg_exit_monitor_loop(),
-        name="multi-leg-exit-monitor",
+    market_state_worker = asyncio.create_task(
+        trading_intelligence_market_state_loop(),
+        name="trading-intelligence-market-state",
     )
+    v2_position_worker_task = asyncio.create_task(
+        trading_intelligence_position_loop(),
+        name="trading-intelligence-position-reconciliation",
+    )
+    review_worker_task = asyncio.create_task(
+        strategy_review_worker_loop(),
+        name="durable-strategy-review",
+    )
+    critical_workers.clear()
+    for task in (official_event_worker, market_state_worker, v2_position_worker_task):
+        critical_workers[task.get_name()] = task
+        task.add_done_callback(on_critical_worker_exit)
     try:
+        if not risk_state_service.get().halted:
+            await trading_intelligence_automation.resume(evaluate_market_states=False)
         yield
     finally:
+        critical_workers.clear()
         maintenance.cancel()
         catalog_worker.cancel()
-        strategy_worker.cancel()
-        agent_worker.cancel()
-        multi_leg_monitor.cancel()
+        official_event_worker.cancel()
+        market_state_worker.cancel()
+        if v2_position_worker_task is not None:
+            v2_position_worker_task.cancel()
+        if review_worker_task is not None:
+            review_worker_task.cancel()
         for task in list(backtest_job_tasks):
             task.cancel()
         for task in list(campaign_job_tasks):
             task.cancel()
         for task in list(universe_job_tasks):
             task.cancel()
-        with suppress(asyncio.CancelledError):
-            await maintenance
-        with suppress(asyncio.CancelledError):
-            await catalog_worker
-        with suppress(asyncio.CancelledError):
-            await strategy_worker
-        with suppress(asyncio.CancelledError):
-            await agent_worker
-        with suppress(asyncio.CancelledError):
-            await multi_leg_monitor
+        await asyncio.gather(
+            maintenance,
+            catalog_worker,
+            official_event_worker,
+            market_state_worker,
+            return_exceptions=True,
+        )
+        if v2_position_worker_task is not None:
+            await asyncio.gather(v2_position_worker_task, return_exceptions=True)
+            v2_position_worker_task = None
+        if review_worker_task is not None:
+            await asyncio.gather(review_worker_task, return_exceptions=True)
+            review_worker_task = None
+        review_worker_health.update(
+            status="stopped",
+            activity="shutdown",
+            current_job_id=None,
+        )
         if backtest_job_tasks:
             await asyncio.gather(*backtest_job_tasks, return_exceptions=True)
         if campaign_job_tasks:
@@ -2450,13 +2440,14 @@ async def lifespan(_: FastAPI):
         if liquidation_collector is not None:
             await liquidation_collector.close()
             liquidation_collector = None
+        trading_intelligence_automation = None
         await runtime.close()
 
 
 app = FastAPI(
     title="COSMOS Quant API",
-    version="1.0.0",
-    description="Explainable strategy, risk, backtest, configuration, and execution API",
+    version="2.0.0",
+    description="Event-driven Trading Intelligence, deterministic risk, and offline research API",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -2470,6 +2461,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+local_access = LocalAccess(
+    [*env_settings.cors_origins, "http://127.0.0.1:5173", "http://localhost:5173"],
+)
+
+
+@app.middleware("http")
+async def require_local_origin(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    protected = path.startswith("/api/") or path in {
+        "/metrics",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/redoc",
+        "/openapi.json",
+    }
+    if protected and not local_access.trusted_request(
+        request.headers.get("origin"),
+        request.headers.get("sec-fetch-site"),
+        str(request.url),
+    ):
+        return JSONResponse({"detail": "请求来源不受信任"}, status_code=403)
+    return await call_next(request)
+
 
 strategy_factory = StrategyFactory()
 plans: dict[str, StrategyPlan] = {
@@ -2501,6 +2518,46 @@ def reconciliation_protected_plan_ids() -> set[str]:
             TradeEpisodeStatus.AWAITING_REVIEW,
         }
     )
+    configuration = configuration_service.current_configuration()
+    if (
+        runtime.order_ledger is not None
+        and configuration.exchange_id == "okx"
+        and configuration.trading_mode == TradingMode.SANDBOX
+    ):
+        for position in trading_intelligence_store.list_positions():
+            plan_ids.add(position.plan_id)
+            runtime.order_ledger.managed_auxiliary_client_ids.update(
+                V2PositionReconciler.close_client_ids(position)
+            )
+            for order_id in position.exit_order_ids:
+                artifact = trading_intelligence_store.get_artifact(order_id)
+                if not artifact or artifact["artifact_type"] != "ExchangeOrder":
+                    continue
+                exit_order = Order.model_validate(artifact["payload"])
+                if exit_order.client_order_id:
+                    runtime.order_ledger.managed_auxiliary_client_ids.add(
+                        exit_order.client_order_id
+                    )
+            for order_id in position.entry_order_ids:
+                artifact = trading_intelligence_store.get_artifact(order_id)
+                if not artifact or artifact["artifact_type"] != "ExchangeOrder":
+                    continue
+                order = Order.model_validate(artifact["payload"])
+                if order.plan_id != position.plan_id:
+                    order = order.model_copy(update={"plan_id": position.plan_id})
+                    trading_intelligence_store.save_artifact(
+                        order.id,
+                        "ExchangeOrder",
+                        order,
+                    )
+                existing = runtime.order_ledger.records.get(order.id)
+                if (
+                    existing
+                    and existing.order.plan_id == order.plan_id
+                    and existing.protection_verified
+                ):
+                    continue
+                runtime.order_ledger.record(order, protection_verified=True)
     return plan_ids
 
 
@@ -2649,167 +2706,6 @@ def constrain_plan_to_portfolio(
     return plan
 
 
-def is_agent_owned_plan(plan: StrategyPlan) -> bool:
-    """Return whether execution ownership belongs to an Agent run."""
-
-    return plan.decision_origin == "agent" or plan.agent_goal_id is not None
-
-
-def entry_window_expired(
-    plan: StrategyPlan,
-    *,
-    now: datetime | None = None,
-) -> bool:
-    expires_at = plan.entry.expires_at
-    if expires_at is None:
-        return False
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=UTC)
-    return expires_at <= (now or datetime.now(UTC))
-
-
-def ensure_plan(history, market, portfolio: PortfolioState) -> StrategyPlan | None:
-    configuration = configuration_service.current_configuration()
-    history = closed_candles(
-        history,
-        configuration.default_timeframe,
-        market.timestamp,
-    )
-    if len(history) < 55:
-        raise RuntimeError("已收盘 K 线不足 55 根，不能生成策略")
-    selected_kind = configured_strategy_kind(configuration, history)
-    for candidate in plans.values():
-        if (
-            not is_agent_owned_plan(candidate)
-            and candidate.status in {PlanStatus.DRAFT, PlanStatus.APPROVED}
-            and entry_window_expired(candidate)
-        ):
-            previous_status = str(candidate.status)
-            candidate.status = PlanStatus.ARCHIVED
-            store.save_strategy(candidate)
-            add_audit(
-                "strategy",
-                "未执行计划的入场窗口已过期，已归档并允许按最新行情重新生成",
-                plan_id=candidate.id,
-                previous_status=previous_status,
-            )
-            continue
-        if (
-            candidate.exchange == configuration.exchange_id
-            and candidate.trading_mode == configuration.trading_mode
-            and candidate.market_type == configuration.market_type
-            and not is_agent_owned_plan(candidate)
-            and configuration.market_type == "spot"
-            and candidate.side == Side.SHORT
-            and candidate.status != PlanStatus.ARCHIVED
-        ):
-            candidate.status = PlanStatus.ARCHIVED
-            store.save_strategy(candidate)
-            add_audit(
-                "strategy",
-                "现货环境不支持建立空头，旧做空策略已自动归档",
-                severity="warning",
-                plan_id=candidate.id,
-            )
-    matching = [
-        plan
-        for plan in plans.values()
-        if plan.symbol == configuration.default_symbol
-        and plan.algorithm == selected_kind.value
-        and plan.timeframe == configuration.default_timeframe
-        and plan.exchange == configuration.exchange_id
-        and plan.trading_mode == configuration.trading_mode
-        and plan.market_type == configuration.market_type
-        and plan.leverage
-        == (
-            configuration.contract_leverage if configuration.market_type == "swap" else Decimal("1")
-        )
-        and plan.margin_mode
-        == (str(configuration.margin_mode) if configuration.market_type == "swap" else "cash")
-        and not is_agent_owned_plan(plan)
-        and plan.status != PlanStatus.ARCHIVED
-        and not (configuration.market_type == "spot" and plan.side == Side.SHORT)
-    ]
-    if matching:
-        status_priority = {
-            PlanStatus.ACTIVE: 5,
-            PlanStatus.PAUSED: 4,
-            PlanStatus.APPROVED: 3,
-            PlanStatus.DRAFT: 2,
-            PlanStatus.ARCHIVED: 1,
-        }
-        selected = max(
-            matching,
-            key=lambda plan: (
-                status_priority.get(PlanStatus(plan.status), 0),
-                plan.version,
-                plan.created_at,
-            ),
-        )
-        # A draft has no execution authorization or immutable approval
-        # fingerprint yet, so it may be safely reduced when free margin or
-        # portfolio capacity has fallen since it was generated. Approved and
-        # active plans are never silently mutated; they must be revised.
-        if selected.status == PlanStatus.DRAFT:
-            previous_notional = selected.sizing.notional
-            selected = constrain_plan_to_portfolio(
-                selected,
-                portfolio,
-                configuration,
-            )
-            if selected.sizing.notional != previous_notional:
-                plans[selected.id] = selected
-                store.save_strategy(selected)
-                add_audit(
-                    "risk",
-                    "未授权草稿已按最新账户容量自动缩仓",
-                    plan_id=selected.id,
-                    previous_notional=str(previous_notional),
-                    adjusted_notional=str(selected.sizing.notional),
-                )
-        return selected
-    try:
-        generation_kwargs = dict(
-            candles=history,
-            snapshot=market,
-            equity=portfolio.equity,
-            risk_fraction=configuration.risk.risk_per_trade,
-            exchange=configuration.exchange_id,
-            timeframe=configuration.default_timeframe,
-            minimum_reward_risk=configuration.risk.minimum_reward_risk,
-            allow_short=configuration.market_type == "swap",
-            confirmation_candles=confirmation_history(history, configuration.default_timeframe),
-            require_confirmation=requires_higher_confirmation(configuration),
-        )
-        if configuration.strategy.automatic_regime_selection:
-            plan = strategy_factory.generate_automatic(**generation_kwargs)
-        else:
-            plan = strategy_factory.generate(selected_kind, **generation_kwargs)
-    except NoTradeSignal:
-        return None
-    plan.lineage_id = plan.id
-    plan.trading_mode = configuration.trading_mode
-    plan.market_type = configuration.market_type
-    plan.margin_mode = (
-        str(configuration.margin_mode) if configuration.market_type == "swap" else "cash"
-    )
-    plan.leverage = (
-        configuration.contract_leverage if configuration.market_type == "swap" else Decimal("1")
-    )
-    if configuration.market_type == "swap":
-        plan.reasons.append(
-            f"USDT 永续采用 {plan.leverage:f}x "
-            f"{'全仓' if plan.margin_mode == 'cross' else '逐仓'}保证金；"
-            "仓位按账户权益和止损距离计算"
-        )
-    plan = constrain_plan_to_portfolio(plan, portfolio, configuration)
-    plan.source_prompt = configuration.strategy.default_prompt
-    plans[plan.id] = plan
-    store.save_strategy(plan)
-    add_audit("strategy", f"已生成初始 {plan.symbol} 可解释策略", plan_id=plan.id)
-    return plan
-
-
 class GenerateRequest(BaseModel):
     symbol: str | None = None
     timeframe: str | None = None
@@ -2869,6 +2765,7 @@ class AIProposalItem(BaseModel):
     usage: AIUsage
     latency_ms: int
     route: list[AIProvider]
+    preflight: dict[str, str | int | float | bool | list[str]] = Field(default_factory=dict)
 
 
 class AIProposalResponse(BaseModel):
@@ -2880,7 +2777,7 @@ class ResearchUniverseRequest(BaseModel):
     symbols: list[str] = Field(default_factory=list, max_length=100)
     timeframes: list[str] = Field(min_length=1, max_length=12)
     exchange_ids: list[str] = Field(default_factory=list, max_length=3)
-    bars: int = Field(default=5000, ge=500, le=50000)
+    bars: int = Field(default=5000, ge=500, le=220000)
     max_markets: int = Field(default=12, ge=1, le=300)
     selection_mode: str = Field(
         default="explicit",
@@ -2899,6 +2796,22 @@ class ResearchUniverseRequest(BaseModel):
     )
     minimum_symbols_per_exchange: int = Field(default=3, ge=1, le=50)
     maximum_symbols_per_exchange: int = Field(default=10, ge=1, le=100)
+    research_profile: Literal["crypto_5m_v1"] | None = None
+    horizons: tuple[Literal[3], Literal[6], Literal[12]] = (3, 6, 12)
+
+    @model_validator(mode="after")
+    def enforce_crypto_5m_profile(self):
+        if self.research_profile != "crypto_5m_v1":
+            return self
+        if set(self.symbols) != {"BTC/USDT", "ETH/USDT", "SOL/USDT"}:
+            raise ValueError("crypto_5m_v1 requires BTC/ETH/SOL")
+        if set(self.exchange_ids) != {"binance", "okx"}:
+            raise ValueError("crypto_5m_v1 requires Binance and OKX")
+        if self.timeframes != ["5m"]:
+            raise ValueError("crypto_5m_v1 history is frozen at 5m")
+        if self.bars < 210_240:
+            raise ValueError("crypto_5m_v1 requires at least 730 days of 5m bars")
+        return self
 
 
 class HistoricalUniverseArchiveImportRequest(BaseModel):
@@ -3257,20 +3170,6 @@ def strategy_sizing_equity(
     return portfolio.equity
 
 
-class ActivateRequest(BaseModel):
-    confirmation: str
-
-
-class ApproveRequest(BaseModel):
-    confirmation: str
-
-
-class ExecuteResponse(BaseModel):
-    decision: RiskDecision
-    order: Order | None = None
-    orders: list[Order] = Field(default_factory=list)
-
-
 class HaltRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=300)
 
@@ -3288,17 +3187,34 @@ async def operational_headers_and_metrics(request: Request, call_next):
         status = response.status_code
     finally:
         route = request.scope.get("route")
-        path = getattr(route, "path", request.url.path)
+        # Unauthenticated and unmatched paths must not create unbounded metric labels.
+        path = getattr(route, "path", "<unmatched>")
+        method = (
+            request.method
+            if request.method
+            in {
+                "GET",
+                "HEAD",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+                "OPTIONS",
+                "TRACE",
+                "CONNECT",
+            }
+            else "OTHER"
+        )
         metrics.increment(
             "http_requests_total",
-            method=request.method,
+            method=method,
             path=path,
             status=str(status),
         )
         metrics.increment(
             "http_request_duration_seconds_total",
             perf_counter() - started,
-            method=request.method,
+            method=method,
             path=path,
         )
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -3331,7 +3247,10 @@ async def prometheus_metrics():
 @app.get("/api/ready")
 async def readiness():
     checks: dict[str, str | bool] = {
-        "database": store.integrity_check(),
+        # PRAGMA integrity_check scans the complete database and can take minutes
+        # for multi-gigabyte research ledgers. Keep the API event loop responsive
+        # while the explicit readiness probe performs that deep check.
+        "database": await asyncio.to_thread(store.integrity_check),
         "configuration": True,
     }
     try:
@@ -3341,7 +3260,14 @@ async def readiness():
         checks["runtime"] = str(exc)
     state = risk_state_service.get()
     checks["trading_halted"] = state.halted
-    ready = checks["database"] == "ok" and checks.get("runtime") is True
+    checks["critical_workers"] = bool(critical_workers) and all(
+        not task.done() for task in critical_workers.values()
+    )
+    ready = (
+        checks["database"] == "ok"
+        and checks.get("runtime") is True
+        and checks["critical_workers"] is True
+    )
     if not ready:
         raise HTTPException(503, {"ready": False, "checks": checks})
     return {"ready": True, "checks": checks}
@@ -3366,18 +3292,25 @@ async def latest_backup():
 
 @app.get("/api/health")
 async def health():
-    view = configuration_service.get()
     return {
         "status": "ok",
         "version": app.version,
         "server_time": datetime.now(UTC),
-        "trading_mode": view.configuration.trading_mode,
-        "live_trading_enabled": view.configuration.live_trading_enabled,
-        "exchange": view.configuration.exchange_id,
-        "credentials": view.credentials,
-        "market_client_ready": runtime.market is not None,
-        "risk_state": risk_state_service.get(),
     }
+
+
+@app.get("/api/readiness")
+async def worker_readiness():
+    workers = {name: not task.done() for name, task in critical_workers.items()}
+    ready = bool(workers) and all(workers.values())
+    return JSONResponse(
+        {
+            "status": "ready" if ready else "degraded",
+            "workers": workers,
+            "risk_halted": risk_state_service.get().halted,
+        },
+        status_code=200 if ready else 503,
+    )
 
 
 @app.get("/api/acceptance/product", response_model=ProductAcceptanceReport)
@@ -3417,6 +3350,23 @@ async def get_ai_usage(
         days=days,
         provider=provider,
     )
+
+
+@app.get("/api/ai/health")
+async def get_ai_health():
+    return {
+        "generated_at": datetime.now(UTC),
+        "providers": await asyncio.to_thread(ai_gateway.health_snapshot),
+        "research_fallback": "deterministic",
+        "review_llm_calls": 0,
+        "execution_llm_calls": 0,
+        "pipeline_continues_when_ai_unavailable": True,
+        "role_isolation": {
+            "research": "optional_ai_generation_with_quality_gate",
+            "review": "deterministic_only",
+            "trading": "deterministic_only",
+        },
+    }
 
 
 @app.put("/api/ai/settings", response_model=AIConfigurationView)
@@ -3467,4362 +3417,1546 @@ async def discover_ai_models(provider: AIProvider):
         raise HTTPException(502, {"code": exc.code, "message": exc.public_message}) from exc
 
 
-class AgentPolicyUpdate(BaseModel):
-    policy: AgentPolicy
-    confirmation: str
+class SandboxAdmissionIssueRequest(BaseModel):
+    strategy_ir_hash: str = Field(min_length=16)
+    ensemble_model_id: str
+    model_artifact_ids: tuple[str, ...] = Field(min_length=3)
+    development_audit_certificate_id: str = Field(min_length=16)
 
 
-class AgentGoalScopeUpdate(BaseModel):
-    objective: str = Field(min_length=8, max_length=1000)
-    symbols: list[str] = Field(min_length=1)
-    timeframes: list[str] = Field(min_length=1)
-    poll_seconds: int = Field(default=60, ge=15, le=3600)
-    confirmation: str
+class DevelopmentAuditIssueRequest(BaseModel):
+    strategy_ir_hash: str = Field(min_length=16)
+    ensemble_model_id: str
+    model_artifact_ids: tuple[str, ...] = Field(min_length=3)
+    campaign_id: str = Field(min_length=8)
 
 
-class AgentTriggerRequest(BaseModel):
-    event_type: AgentEventType = AgentEventType.MANUAL_TRIGGERED
-    payload: dict = Field(default_factory=dict)
-    dedupe_key: str | None = None
+class SandboxExecutionEvidenceRequest(BaseModel):
+    episode_id: str
+    expected_round_trip_cost_bps: Decimal = Field(ge=0)
+    realized_round_trip_cost_bps: Decimal = Field(ge=0)
+    expected_slippage_bps: Decimal = Field(ge=0)
+    realized_slippage_bps: Decimal = Field(ge=0)
+    native_protection_verified: bool
+    reconciled: bool
 
 
-class AgentGoalStatusUpdate(BaseModel):
-    status: AgentGoalStatus
-    confirmation: str
+_live_unlock_challenges: dict[str, dict] = {}
+_live_unlock_grants: dict[str, dict] = {}
+LIVE_CONFIRMATION_PHRASES = {
+    1: "我确认将进入实盘授权",
+    2: "我确认使用真实资金自动交易",
+}
 
 
-def platform_agent_mode(configuration: UserConfiguration) -> AgentAutonomyMode:
-    return {
-        TradingMode.PAPER: AgentAutonomyMode.PAPER,
-        TradingMode.SANDBOX: AgentAutonomyMode.SANDBOX,
-        TradingMode.LIVE: AgentAutonomyMode.LIVE_CAPPED,
-    }[configuration.trading_mode]
+def strategy_certificate_configuration_fingerprint(
+    configuration: UserConfiguration,
+) -> str:
+    """Bind strategy evidence without making SANDBOX -> LIVE itself a mutation."""
 
-
-def launch_policy(request: AgentLaunchRequest) -> AgentPolicy:
-    configuration = configuration_service.current_configuration()
-    execution_mode = platform_agent_mode(configuration)
-    can_trade = request.autonomy_mode == execution_mode
-    risk = configuration.risk
-    return AgentPolicy(
-        id=f"launch-{request.profile_id}-{request.autonomy_mode}",
-        autonomy_mode=request.autonomy_mode,
-        allowed_symbols=request.symbols,
-        allowed_timeframes=request.timeframes,
-        max_risk_per_trade=risk.risk_per_trade if can_trade else Decimal("0"),
-        max_daily_drawdown=risk.max_daily_drawdown if can_trade else Decimal("0"),
-        max_open_positions=min(risk.max_open_positions, 3) if can_trade else 0,
-        max_trades_per_day=6 if can_trade else 0,
-        max_leverage=(
-            configuration.contract_leverage
-            if can_trade and configuration.market_type == "swap"
-            else Decimal("1")
-        ),
-        require_native_protection=True,
-        allow_agent_entry=can_trade,
-        allow_agent_cancel_entry=True,
-        allow_agent_reduce=True,
-        allow_agent_exit=True,
-        allow_agent_halt=True,
-    )
-
-
-def validate_launch_scope(request: AgentLaunchRequest) -> None:
-    configuration = configuration_service.current_configuration()
-    supported_modes = {
-        AgentAutonomyMode.OBSERVE,
-        AgentAutonomyMode.RESEARCH,
-        platform_agent_mode(configuration),
-    }
-    if request.autonomy_mode not in supported_modes:
-        raise HTTPException(409, "启动模式与当前交易环境不匹配")
-    if not set(request.symbols).issubset(configuration.strategy.watchlist):
-        raise HTTPException(409, "启动品种超出系统交易白名单")
-    if not set(request.timeframes).issubset(configuration.strategy.timeframes):
-        raise HTTPException(409, "启动周期超出系统周期白名单")
-
-
-def launch_preview_payload(request: AgentLaunchRequest) -> AgentLaunchPreview:
-    validate_launch_scope(request)
-    policy = launch_policy(request)
-    grant_payload = {
-        "profile_id": request.profile_id,
-        "symbols": sorted(request.symbols),
-        "timeframes": sorted(request.timeframes),
-        "autonomy_mode": str(request.autonomy_mode),
-        "risk_template": request.risk_template,
-        "policy_fingerprint": policy.fingerprint,
-    }
-    grant_fingerprint = stable_fingerprint(grant_payload)
-    stored_payload = store.load_agent_launch_profile(request.profile_id)
-    stored = AgentLaunchProfile.model_validate(stored_payload) if stored_payload else None
-    configuration = configuration_service.current_configuration()
-    risk = configuration.risk
-    blocking: list[str] = []
-    state = risk_state_service.get()
-    if state.halted and request.autonomy_mode == platform_agent_mode(configuration):
-        blocking.append(state.reason or "全局风险闸已停止新开仓")
-    return AgentLaunchPreview(
-        profile_id=request.profile_id,
-        grant_fingerprint=grant_fingerprint,
-        confirmation_required=(
-            stored is None or stored.authorized_fingerprint != grant_fingerprint
-        ),
-        reuses_goal_id=stored.goal_id if stored else None,
-        mode=request.autonomy_mode,
-        symbols=request.symbols,
-        timeframes=request.timeframes,
-        risk_summary={
-            "交易环境": str(configuration.trading_mode),
-            "单笔风险": f"{risk.risk_per_trade * 100:f}%",
-            "日内回撤": f"{risk.max_daily_drawdown * 100:f}%",
-            "最大持仓": min(risk.max_open_positions, 3),
-            "原生保护单": True,
-        },
-        blocking_reasons=blocking,
-    )
-
-
-def strategy_overview_summary(plan: StrategyPlan) -> AgentStrategySummary:
-    return AgentStrategySummary(
-        plan_id=plan.id,
-        name=plan.name,
-        symbol=plan.symbol,
-        timeframe=plan.timeframe,
-        family=plan.algorithm,
-        status=str(plan.status),
-        source=("agent" if plan.agent_goal_id else plan.decision_origin),
-        fingerprint=plan.fingerprint,
-        updated_at=plan.data_as_of or plan.signal_candle_at or plan.created_at,
-    )
-
-
-def build_agent_runtime_overview() -> AgentRuntimeOverview:
-    goals = [
-        goal
-        for goal in agent_store.list_goals(200)
-        if goal.status != AgentGoalStatus.ARCHIVED
-    ]
-    runs = agent_store.list_runs(200)
-    episodes = agent_store.list_episodes(500)
-    coverage = agent_store.schedule_market_coverage([goal.id for goal in goals])
-    risk_state = risk_state_service.get()
-    now = datetime.now(UTC)
-    goal_views: list[AgentGoalOverview] = []
-    latest_heartbeat: datetime | None = None
-    for goal in goals:
-        goal_runs = [item for item in runs if item.goal_id == goal.id]
-        latest_run = goal_runs[0] if goal_runs else None
-        last_decision = None
-        if latest_run:
-            decisions = agent_store.decisions_for_run(latest_run.id, 50)
-            last_decision = decisions[-1] if decisions else None
-        goal_coverage = {
-            (item["symbol"], item["timeframe"]): item
-            for item in coverage
-            if item["goal_id"] == goal.id
-        }
-        senses: list[AgentMarketSense] = []
-        heartbeat_candidates: list[datetime] = []
-        next_scan_candidates: list[datetime] = []
-        for symbol in goal.symbols:
-            for timeframe in goal.timeframes:
-                item = goal_coverage.get((symbol, timeframe)) or {
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                }
-                processed = item.get("event_processed_at") or item.get("event_created_at")
-                processed_at = datetime.fromisoformat(processed) if processed else None
-                if processed_at:
-                    heartbeat_candidates.append(processed_at)
-                interval = max(goal.poll_seconds, timeframe_seconds(timeframe))
-                bucket = int(now.timestamp()) // interval
-                next_scan = datetime.fromtimestamp((bucket + 1) * interval, UTC)
-                next_scan_candidates.append(next_scan)
-                event_status = item.get("event_status")
-                run_status = item.get("last_run_status")
-                sense_status = (
-                    "paused"
-                    if goal.status != AgentGoalStatus.ACTIVE
-                    else "healthy"
-                    if event_status == str(AgentEventStatus.PROCESSED)
-                    and run_status
-                    in {
-                        str(AgentRunStatus.WAITING),
-                        str(AgentRunStatus.COMPLETED),
-                        str(AgentRunStatus.HALTED),
-                    }
-                    else "running"
-                    if event_status == str(AgentEventStatus.CLAIMED)
-                    else "queued"
-                    if event_status in {None, str(AgentEventStatus.PENDING)}
-                    else "degraded"
-                )
-                senses.append(
-                    AgentMarketSense(
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        status=sense_status,
-                        last_event_at=processed_at,
-                        next_scan_at=next_scan,
-                        last_run_status=run_status,
-                    )
-                )
-        if latest_run:
-            heartbeat_candidates.append(latest_run.updated_at)
-        heartbeat = max(heartbeat_candidates, default=None)
-        if heartbeat and (latest_heartbeat is None or heartbeat > latest_heartbeat):
-            latest_heartbeat = heartbeat
-        goal_plans = sorted(
-            [plan for plan in plans.values() if plan.agent_goal_id == goal.id],
-            key=lambda item: item.data_as_of or item.signal_candle_at or item.created_at,
-            reverse=True,
-        )
-        recent_strategies = [strategy_overview_summary(item) for item in goal_plans[:5]]
-        current_plan = next(
-            (item for item in goal_plans if item.status != PlanStatus.ARCHIVED),
-            None,
-        )
-        goal_episodes = [item for item in episodes if item.goal_id == goal.id]
-        active_episodes = [
-            item
-            for item in goal_episodes
-            if item.status
-            in {
-                TradeEpisodeStatus.RESERVED,
-                TradeEpisodeStatus.PENDING_ENTRY,
-                TradeEpisodeStatus.OPEN,
-                TradeEpisodeStatus.AWAITING_REVIEW,
-            }
-        ]
-        blocking: list[str] = []
-        is_execution_goal = goal.autonomy_mode in {
-            AgentAutonomyMode.PAPER,
-            AgentAutonomyMode.SANDBOX,
-            AgentAutonomyMode.LIVE_CAPPED,
-        }
-        if risk_state.halted and is_execution_goal:
-            blocking.append(risk_state.reason or "全局风险闸已停止新开仓")
-        if latest_run and latest_run.last_error:
-            blocking.append(latest_run.last_error)
-        if not goal_coverage:
-            blocking.append("尚无市场调度记录")
-        stale_after = max(goal.poll_seconds * 3, 180)
-        runtime_status: Literal["running", "waiting", "paused", "blocked", "offline"]
-        if goal.status != AgentGoalStatus.ACTIVE:
-            runtime_status = "paused"
-        elif blocking and is_execution_goal:
-            runtime_status = "blocked"
-        elif latest_run and latest_run.status == AgentRunStatus.RUNNING:
-            runtime_status = "running"
-        elif heartbeat and (now - heartbeat).total_seconds() > stale_after:
-            runtime_status = "offline"
-        else:
-            runtime_status = "waiting"
-        goal_views.append(
-            AgentGoalOverview(
-                goal_id=goal.id,
-                objective=goal.objective,
-                status=str(goal.status),
-                autonomy_mode=str(goal.autonomy_mode),
-                symbols=goal.symbols,
-                timeframes=goal.timeframes,
-                runtime_status=runtime_status,
-                last_heartbeat_at=heartbeat,
-                next_scan_at=min(next_scan_candidates, default=None),
-                last_action=str(last_decision.action) if last_decision else None,
-                last_action_summary=last_decision.reason if last_decision else None,
-                current_strategy=(
-                    strategy_overview_summary(current_plan) if current_plan else None
-                ),
-                recently_generated_strategies=recent_strategies,
-                market_sense=senses,
-                active_episode_count=len(active_episodes),
-                uncertain_episode_count=sum(
-                    item.status == TradeEpisodeStatus.UNCERTAIN for item in goal_episodes
-                ),
-                blocking_reasons=blocking,
-            )
-        )
-    return AgentRuntimeOverview(
-        active_goal_count=sum(goal.status == AgentGoalStatus.ACTIVE for goal in goals),
-        latest_heartbeat_at=latest_heartbeat,
-        risk_halted=risk_state.halted,
-        risk_reason=risk_state.reason,
-        goals=goal_views,
-    )
-
-
-def sandbox_forward_performance() -> AgentForwardPerformance:
-    configuration = configuration_service.current_configuration()
-    policies = agent_store.list_policies(500)
-    sandbox_policies = [
-        policy
-        for policy in policies
-        if policy.autonomy_mode == AgentAutonomyMode.SANDBOX and policy.allow_agent_entry
-    ]
-    sandbox_policy_ids = {policy.id for policy in sandbox_policies}
-    required_symbols = list(
-        dict.fromkeys(symbol for policy in sandbox_policies for symbol in policy.allowed_symbols)
-    )
-    episodes = [
-        episode
-        for episode in agent_store.list_episodes(10000)
-        if episode.policy_id in sandbox_policy_ids
-    ]
-    return build_forward_performance(
-        episodes,
-        configuration.agent_forward_validation,
-        scope_mode=AgentAutonomyMode.SANDBOX,
-        required_symbols=required_symbols,
-    )
-
-
-def validate_agent_policy_against_platform(policy: AgentPolicy) -> None:
-    configuration = configuration_service.current_configuration()
-    execution_modes = {
-        AgentAutonomyMode.PAPER: TradingMode.PAPER,
-        AgentAutonomyMode.SANDBOX: TradingMode.SANDBOX,
-        AgentAutonomyMode.LIVE_CAPPED: TradingMode.LIVE,
-    }
-    expected_mode = execution_modes.get(policy.autonomy_mode)
-    if expected_mode is not None and configuration.trading_mode != expected_mode:
-        mode_label = "实盘模式" if expected_mode == TradingMode.LIVE else f"{expected_mode} 模式"
-        raise HTTPException(
-            409,
-            f"Agent {policy.autonomy_mode} 授权只能在平台{mode_label}中创建或使用",
-        )
-    if policy.allow_agent_entry and (
-        policy.autonomy_mode not in execution_modes
-        or policy.max_risk_per_trade <= 0
-        or policy.max_daily_drawdown <= 0
-        or policy.max_open_positions <= 0
-        or policy.max_trades_per_day <= 0
-        or not policy.allowed_symbols
-        or not policy.allowed_timeframes
-    ):
-        raise HTTPException(409, "Agent 自动入场授权必须具有非零且完整的风险预算与市场白名单")
-    if policy.max_risk_per_trade > configuration.risk.risk_per_trade:
-        raise HTTPException(409, "Agent 单笔风险授权不能超过平台硬风控上限")
-    if policy.max_daily_drawdown > configuration.risk.max_daily_drawdown:
-        raise HTTPException(409, "Agent 日内回撤授权不能超过平台硬风控上限")
-    if policy.max_leverage > configuration.risk.max_leverage:
-        raise HTTPException(409, "Agent 杠杆授权不能超过平台硬风控上限")
-    if (
-        policy.allow_agent_entry
-        and str(configuration.market_type) == "swap"
-        and policy.max_leverage < configuration.contract_leverage
-    ):
-        raise HTTPException(409, "Agent 杠杆上限不能低于当前固定执行杠杆，否则授权不可执行")
-    if not set(policy.allowed_symbols).issubset(configuration.strategy.watchlist):
-        raise HTTPException(409, "Agent 品种授权必须是平台关注列表的子集")
-    if not set(policy.allowed_timeframes).issubset(configuration.strategy.timeframes):
-        raise HTTPException(409, "Agent 周期授权必须是平台策略周期的子集")
-    if (
-        policy.autonomy_mode
-        in {
-            AgentAutonomyMode.SANDBOX,
-            AgentAutonomyMode.LIVE_CAPPED,
-        }
-        and not policy.require_native_protection
-    ):
-        raise HTTPException(409, "交易所自动交易模式必须强制使用原生保护单")
-    if policy.autonomy_mode == AgentAutonomyMode.LIVE_CAPPED and (
-        configuration.trading_mode != TradingMode.LIVE or not configuration.live_trading_enabled
-    ):
-        raise HTTPException(409, "创建 live_capped 授权前必须先显式解锁平台实盘模式")
-
-
-def validate_agent_plan_grant(plan: StrategyPlan) -> None:
-    if plan.decision_origin != "agent":
-        return
-    if not all(
-        (
-            plan.agent_goal_id,
-            plan.agent_run_id,
-            plan.agent_policy_id,
-            plan.agent_policy_fingerprint,
-        )
-    ):
-        raise HTTPException(409, "Agent 计划缺少完整目标、运行或权限绑定")
-    goal = agent_store.load_goal(plan.agent_goal_id)
-    policy = agent_store.load_policy(plan.agent_policy_id)
-    if not goal or goal.status != AgentGoalStatus.ACTIVE:
-        raise HTTPException(409, "Agent 目标已失效，禁止激活或执行计划")
-    if goal.valid_until and goal.valid_until <= datetime.now(UTC):
-        raise HTTPException(409, "Agent 目标已过期，禁止激活或执行计划")
-    if not policy or policy.fingerprint != plan.agent_policy_fingerprint:
-        raise HTTPException(409, "Agent 权限已变化，计划必须重新生成和验证")
-    if not policy.allow_agent_entry:
-        raise HTTPException(409, "当前 Agent 权限不允许增加账户风险")
-    if goal.autonomy_mode != policy.autonomy_mode:
-        raise HTTPException(409, "Agent 目标与权限模式不一致")
-    validate_plan_research_provenance(plan)
-    validate_plan_campaign_provenance(plan)
-    validate_agent_policy_against_platform(policy)
-
-
-def selected_causal_policy_definition(
-    report: ResearchCampaignReport,
-) -> dict | None:
-    if not report.causal_policy_definitions or not report.selected_library_entry_id:
-        return None
-    return next(
-        (
-            item
-            for item in report.causal_policy_definitions
-            if item.get("campaign_entry_id") == report.selected_library_entry_id
-        ),
-        None,
-    )
-
-
-def build_plan_causal_policy_selection_evidence(
-    plan: StrategyPlan,
-    report: ResearchCampaignReport,
-    *,
-    assessment: MarketStateAssessment,
-    available_data: set[str],
-    selected_library_entry_id: str,
-    actionable_library_evidence: list[dict] | None = None,
-) -> dict:
-    """Freeze the exact causal policy decision that selected a concrete spec."""
-
-    definition = selected_causal_policy_definition(report)
-    certificate = report.execution_certificate
-    if definition is None or certificate is None:
-        raise ValueError("Campaign does not contain a certified causal policy")
-    policy_fingerprint = validate_causal_policy_definition(definition)
-    if policy_fingerprint != certificate.strategy_fingerprint or policy_fingerprint != next(
-        item.strategy_fingerprint
-        for item in report.candidates
-        if item.library_entry_id == report.selected_library_entry_id
-    ):
-        raise ValueError("causal policy certificate and Campaign evidence differ")
-    if bool(definition["abstain_on_ambiguous_regime"]) and assessment.ambiguous:
-        raise ValueError("certified causal policy requires abstention in an ambiguous regime")
-    if assessment.confidence < Decimal(str(definition.get("minimum_regime_confidence", "0"))):
-        raise ValueError("current regime confidence is below the certified policy threshold")
-    priors = [CausalStrategyPrior.model_validate(item) for item in definition["priors"]]
-    ranked = rank_causal_strategy_priors(priors, assessment, set(available_data))
-    admitted = ranked[: int(definition["maximum_candidates_per_bar"])]
-    selected_prior = next(
-        (prior for prior, _, _ in admitted if prior.id == selected_library_entry_id),
-        None,
-    )
-    if selected_prior is None:
-        raise ValueError("concrete strategy was not admitted by the certified causal policy")
-    if selected_prior.spec_fingerprint != plan.strategy_spec_fingerprint:
-        raise ValueError("selected public strategy fingerprint differs from the trade plan")
-    if plan.signal_candle_at is None or plan.data_as_of is None:
-        raise ValueError("causal policy plan must bind signal and market evidence times")
-    minimum_signal_confidence = Decimal(str(definition.get("minimum_signal_confidence", "0")))
-    raw_consensus_evidence = actionable_library_evidence or [
+    return stable_fingerprint(
         {
-            "library_entry_id": selected_library_entry_id,
-            "strategy_fingerprint": plan.strategy_spec_fingerprint,
-            "side": str(plan.side),
-            "confidence": str(plan.confidence),
-            "signal_candle_at": plan.signal_candle_at.isoformat(),
-            "data_as_of": plan.data_as_of.isoformat(),
+            "scheme": "full-strategy-certificate-config-v2",
+            "exchange_id": configuration.exchange_id,
+            "market_type": str(configuration.market_type),
+            "margin_mode": str(configuration.margin_mode),
+            "contract_leverage": str(configuration.contract_leverage),
+            "fee_bps": str(configuration.fee_bps),
+            "slippage_bps": str(configuration.slippage_bps),
+            "risk": configuration.risk.model_dump(mode="json"),
         }
-    ]
-    admitted_priors = {prior.id: prior for prior, _, _ in admitted}
-    consensus_evidence: list[dict] = []
-    for item in raw_consensus_evidence:
-        entry_id = str(item.get("library_entry_id") or "")
-        prior = admitted_priors.get(entry_id)
-        if prior is None or str(item.get("side")) != str(plan.side):
-            continue
-        if str(item.get("strategy_fingerprint")) != prior.spec_fingerprint:
-            continue
-        if Decimal(str(item.get("confidence") or "0")) < minimum_signal_confidence:
-            continue
-        if (
-            str(item.get("signal_candle_at")) != plan.signal_candle_at.isoformat()
-            or str(item.get("data_as_of")) != plan.data_as_of.isoformat()
-        ):
-            continue
-        consensus_evidence.append(
-            {
-                "library_entry_id": entry_id,
-                "strategy_fingerprint": prior.spec_fingerprint,
-                "side": str(plan.side),
-                "confidence": str(item["confidence"]),
-                "signal_candle_at": str(item["signal_candle_at"]),
-                "data_as_of": str(item["data_as_of"]),
-            }
-        )
-    consensus_evidence = sorted(
-        {item["library_entry_id"]: item for item in consensus_evidence}.values(),
-        key=lambda item: item["library_entry_id"],
-    )
-    required_consensus = int(definition.get("minimum_directional_consensus", 1))
-    if (
-        selected_library_entry_id not in {item["library_entry_id"] for item in consensus_evidence}
-        or len(consensus_evidence) < required_consensus
-    ):
-        raise ValueError("current signals do not satisfy certified directional consensus")
-    payload = {
-        "policy_fingerprint": policy_fingerprint,
-        "campaign_entry_id": report.selected_library_entry_id,
-        "selected_library_entry_id": selected_library_entry_id,
-        "selected_strategy_fingerprint": selected_prior.spec_fingerprint,
-        "ranked_admitted_library_entry_ids": [prior.id for prior, _, _ in admitted],
-        "directional_consensus_entries": consensus_evidence,
-        "directional_consensus_count": len(consensus_evidence),
-        "available_data": sorted(available_data),
-        "assessment": assessment.model_dump(mode="json"),
-        "signal_candle_at": plan.signal_candle_at.isoformat(),
-        "data_as_of": plan.data_as_of.isoformat(),
-        "selector_version": int(definition["policy_version"]),
-        "realized_return_inputs_forbidden": True,
-    }
-    payload["fingerprint"] = sha256(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()[:24]
-    return payload
-
-
-def validate_plan_causal_policy_selection(
-    plan: StrategyPlan,
-    report: ResearchCampaignReport,
-) -> bool:
-    evidence = getattr(plan, "causal_policy_selection_evidence", None)
-    selected_entry_id = getattr(
-        plan,
-        "causal_policy_selected_library_entry_id",
-        None,
-    )
-    if not evidence or not selected_entry_id:
-        return False
-    try:
-        expected = build_plan_causal_policy_selection_evidence(
-            plan,
-            report,
-            assessment=MarketStateAssessment.model_validate(evidence["assessment"]),
-            available_data=set(evidence["available_data"]),
-            selected_library_entry_id=selected_entry_id,
-            actionable_library_evidence=evidence.get(
-                "directional_consensus_entries",
-                [],
-            ),
-        )
-    except (KeyError, StopIteration, TypeError, ValueError):
-        return False
-    return bool(
-        expected == evidence
-        and getattr(plan, "causal_policy_fingerprint", None) == evidence["policy_fingerprint"]
     )
 
 
-def matching_execution_campaign(
-    plan: StrategyPlan,
-    campaign_payloads: list[dict],
-    *,
-    require_plan_binding: bool = True,
-    causal_policy_assessment: MarketStateAssessment | None = None,
-    causal_policy_available_data: set[str] | None = None,
-    causal_policy_selected_library_entry_id: str | None = None,
-    causal_policy_actionable_evidence: list[dict] | None = None,
-) -> ResearchCampaignReport | None:
-    """Find the exact cross-market admission used for exchange execution."""
+def reconcile_strategy_review_backlog(entry_profile: str = DEFAULT_ENTRY_PROFILE_ID) -> dict:
+    """Queue v2 candidates while preserving every legacy candidate and review."""
 
-    if not plan.strategy_spec_fingerprint:
-        return None
-    for payload in campaign_payloads:
-        report = ResearchCampaignReport.model_validate(payload)
-        certificate = report.execution_certificate
-        selected = next(
-            (
-                item
-                for item in report.candidates
-                if item.library_entry_id == report.selected_library_entry_id
-            ),
-            None,
-        )
-        if certificate is None:
-            continue
-        dataset_fingerprints: dict[str, str] = {}
-        certificate_scope_valid = True
-        for dataset_id in [*report.research_dataset_ids, *report.blind_dataset_ids]:
-            dataset_payload = store.load_research_dataset(dataset_id)
-            if not dataset_payload:
-                certificate_scope_valid = False
-                break
-            dataset = ResearchDataset.model_validate(dataset_payload)
-            dataset_fingerprints[dataset_id] = dataset.data_fingerprint
-        if not certificate_scope_valid:
-            continue
-        try:
-            validate_campaign_execution_certificate(
-                report,
-                certificate,
-                dataset_fingerprints=dataset_fingerprints,
-            )
-        except ValueError:
-            continue
-        policy_definition = selected_causal_policy_definition(report)
-        if policy_definition is not None:
-            if (
-                causal_policy_assessment is not None
-                and causal_policy_available_data is not None
-                and causal_policy_selected_library_entry_id is not None
-            ):
-                try:
-                    selection_evidence = build_plan_causal_policy_selection_evidence(
-                        plan,
-                        report,
-                        assessment=causal_policy_assessment,
-                        available_data=causal_policy_available_data,
-                        selected_library_entry_id=(causal_policy_selected_library_entry_id),
-                        actionable_library_evidence=(causal_policy_actionable_evidence),
-                    )
-                except (StopIteration, ValueError):
-                    strategy_binding_valid = False
-                else:
-                    strategy_binding_valid = bool(
-                        selected is not None
-                        and selected.strategy_fingerprint
-                        == selection_evidence["policy_fingerprint"]
-                        and certificate.strategy_fingerprint
-                        == selection_evidence["policy_fingerprint"]
-                    )
-            else:
-                strategy_binding_valid = bool(
-                    selected is not None
-                    and selected.strategy_fingerprint == certificate.strategy_fingerprint
-                    and validate_plan_causal_policy_selection(plan, report)
-                )
-        else:
-            strategy_binding_valid = bool(
-                selected is not None
-                and selected.strategy_fingerprint == plan.strategy_spec_fingerprint
-                and certificate.strategy_fingerprint == plan.strategy_spec_fingerprint
-            )
-        plan_binding_valid = (
-            getattr(plan, "research_campaign_id", None) == report.id
-            and getattr(plan, "campaign_certificate_fingerprint", None) == certificate.fingerprint
-        )
-        if (
-            report.autonomous_execution_eligible
-            and report.pbo.passed
-            and bool(report.blind_dataset_ids)
-            and report.blind_selected_candidate_passed
-            and selected is not None
-            and selected.cross_market_passed
-            and strategy_binding_valid
-            and (plan_binding_valid or not require_plan_binding)
-        ):
-            return report
-    return None
-
-
-def validate_plan_campaign_provenance(plan: StrategyPlan) -> None:
-    """Never let one backtest authorize an Agent exchange position."""
-
-    if plan.trading_mode == TradingMode.PAPER:
-        return
-    campaign = matching_execution_campaign(
-        plan,
-        store.list_research_campaigns(100),
-    )
-    if campaign is None:
-        raise HTTPException(
-            409,
-            "Agent exchange execution requires an exact-spec immutable Campaign "
-            "certificate bound to this plan, with passed PBO, cross-market and "
-            "single-use blind admission",
-        )
-
-
-def validate_plan_research_provenance(plan: StrategyPlan) -> None:
-    """Revalidate AI/ML Champion status and immutable evidence before execution."""
-
-    source = plan.strategy_spec.get("source") if plan.strategy_spec else None
-    if source not in {"ai", "ml"}:
-        return
-    if not plan.research_candidate_id or not plan.validated_strategy_artifact:
-        raise HTTPException(
-            409,
-            "AI/ML 交易计划缺少已验证 Champion 执行工件。",
-        )
-    payload = store.load_strategy_candidate(plan.research_candidate_id)
-    if not payload:
-        raise HTTPException(409, "计划绑定的研究 Champion 已不存在。")
-    candidate = parse_strategy_candidate_payload(
-        payload,
-        audit_context="plan_research_provenance",
-    )
-    if candidate is None:
-        raise HTTPException(
-            409,
-            "计划绑定的研究 Champion 与当前策略合约不兼容，必须重新研究和编译。",
-        )
-    if candidate.spec != plan.strategy_spec:
-        raise HTTPException(409, "计划 StrategySpec 与绑定的 Champion 不一致。")
-    dataset_payload = (
-        store.load_research_dataset(candidate.dataset_id) if candidate.dataset_id else None
-    )
-    if not dataset_payload:
-        raise HTTPException(409, "Champion 绑定的不可变研究数据集已不可用。")
-    dataset = ResearchDataset.model_validate(dataset_payload)
-    try:
-        artifact = ValidatedStrategyArtifact.model_validate(plan.validated_strategy_artifact)
-        validate_compiled_champion(
-            candidate,
-            artifact,
-            dataset_id=dataset.id,
-            data_fingerprint=dataset.data_fingerprint,
-        )
-    except ValueError as exc:
-        raise HTTPException(409, f"Champion 执行工件验证失败：{exc}") from exc
-
-
-def require_agent_position_management_commissioning() -> None:
-    """Prevent an Agent from opening a position it cannot safely manage."""
-
+    payloads = store.list_strategy_review_candidate_payloads(1000)
     configuration = configuration_service.current_configuration()
-    if configuration.trading_mode == TradingMode.PAPER:
-        return
-    commissioning = configuration_service.commissioning_for(configuration)
-    if not (commissioning and commissioning.agent_position_management_passed):
-        raise RuntimeError(
-            "exchange Agent trading is locked until the sandbox "
-            "position-management commissioning has passed"
+    contract_version = configuration.strategy.validation.review_contract_version
+    policy_fingerprint = review_policy_fingerprint(configuration)
+    queued = migrated = rejected = existing = legacy = 0
+    for payload in payloads:
+        context_payload = payload.get("research_context")
+        if not isinstance(context_payload, dict):
+            legacy += 1
+            continue
+        candidate_id = str(payload.get("id") or f"legacy_{stable_fingerprint(payload)}")
+        candidate = parse_strategy_candidate_payload(
+            payload,
+            audit_context="review_backlog_reconcile",
+            emit_audit=False,
         )
-
-
-def build_agent_episode_runtime_views(
-    episodes: list[TradeEpisode],
-) -> list[AgentEpisodeRuntime]:
-    records = runtime.order_ledger.records if runtime.order_ledger else {}
-    report = runtime.reconciliation_report
-    uncertain_ids = set(report.uncertain_order_ids) if report else set()
-    unknown_ids = set(report.unknown_open_order_ids) if report else set()
-    unprotected_ids = set(report.unprotected_order_ids) if report else set()
-    views: list[AgentEpisodeRuntime] = []
-    for episode in episodes:
-        plan = plans.get(episode.plan_id)
-        entry_records = [
-            records[order_id] for order_id in episode.entry_order_ids if order_id in records
-        ]
-        entry_quantity = sum(
-            (record.order.filled_quantity for record in entry_records),
-            Decimal("0"),
-        )
-        entry_notional = sum(
-            (
-                record.order.filled_quantity * record.order.average_fill_price
-                for record in entry_records
-                if record.order.average_fill_price is not None
-            ),
-            Decimal("0"),
-        )
-        priced_quantity = sum(
-            (
-                record.order.filled_quantity
-                for record in entry_records
-                if record.order.average_fill_price is not None
-            ),
-            Decimal("0"),
-        )
-        average_entry = (
-            entry_notional / priced_quantity if priced_quantity > 0 and entry_notional > 0 else None
-        )
-        protected_order_ids = [
-            record.order.id for record in entry_records if record.protection_verified
-        ]
-        entry_ids = set(episode.entry_order_ids)
-        reconciliation_clean = bool(report) and not (
-            entry_ids & (uncertain_ids | unknown_ids | unprotected_ids)
-        )
-        protection_verified = bool(entry_ids) and (
-            len(entry_records) == len(entry_ids)
-            and len(protected_order_ids) == len(entry_ids)
-            and reconciliation_clean
-        )
-        if episode.status in {
-            TradeEpisodeStatus.OPEN,
-            TradeEpisodeStatus.PENDING_ENTRY,
-            TradeEpisodeStatus.UNCERTAIN,
-        }:
-            protection_status = "verified" if protection_verified else "uncertain"
-        else:
-            protection_status = "not_applicable"
-        last_reconciled_at = max(
-            (record.last_reconciled_at for record in entry_records),
-            default=None,
-        )
-        views.append(
-            AgentEpisodeRuntime(
-                episode_id=episode.id,
-                plan_id=episode.plan_id,
-                symbol=episode.symbol,
-                plan_status=str(plan.status) if plan else None,
-                leverage=plan.leverage if plan else None,
-                entry_quantity=entry_quantity,
-                average_entry=average_entry,
-                entry_fees=sum(
-                    (record.order.fee for record in entry_records),
-                    Decimal("0"),
-                ),
-                stop_loss=plan.exit.stop_loss if plan else None,
-                take_profits=(
-                    [target.model_dump(mode="json") for target in plan.exit.take_profits]
-                    if plan
-                    else []
-                ),
-                native_protection_status=protection_status,
-                protected_order_ids=protected_order_ids,
-                last_reconciled_at=last_reconciled_at,
+        if candidate is None:
+            raw_spec = payload.get("spec") if isinstance(payload.get("spec"), dict) else {}
+            legacy_fingerprint = str(
+                payload.get("spec_fingerprint") or stable_fingerprint(raw_spec or payload)
             )
+            fingerprint = strategy_review_fingerprint(
+                legacy_fingerprint,
+                entry_profile=str(context_payload.get("entry_profile") or entry_profile),
+                candidate_id=candidate_id,
+                symbol=str(context_payload.get("symbol") or "unknown"),
+                timeframe=str(context_payload.get("timeframe") or "unknown"),
+                policy_fingerprint=policy_fingerprint,
+                review_contract_version=contract_version,
+            )
+            if store.load_strategy_review_job_by_fingerprint(fingerprint):
+                existing += 1
+                continue
+            now = datetime.now(UTC)
+            store.save_strategy_review_job(
+                StrategyReviewJob(
+                    candidate_id=candidate_id,
+                    candidate_fingerprint=legacy_fingerprint,
+                    review_fingerprint=fingerprint,
+                    review_contract_version=contract_version,
+                    policy_fingerprint=policy_fingerprint,
+                    origin_symbol=str(context_payload.get("symbol") or "unknown"),
+                    origin_timeframe=str(context_payload.get("timeframe") or "unknown"),
+                    entry_profile=str(context_payload.get("entry_profile") or entry_profile),
+                    status=StrategyReviewJobStatus.REJECTED,
+                    stage="contract_validation",
+                    evidence_tier="rejected",
+                    progress_percent=100,
+                    rejection_reasons=["v2 候选无法通过当前 StrategySpec 合约校验"],
+                    evidence_refs=[candidate_id],
+                    completed_at=now,
+                    updated_at=now,
+                )
+            )
+            rejected += 1
+            continue
+
+        if candidate.status in {CandidateStatus.REJECTED, CandidateStatus.RETIRED}:
+            existing += 1
+            continue
+
+        context = candidate.research_context
+        assert context is not None
+
+        fingerprint = strategy_review_fingerprint(
+            candidate.spec_fingerprint,
+            entry_profile=context.entry_profile,
+            candidate_id=candidate.id,
+            symbol=context.symbol,
+            timeframe=context.timeframe,
+            policy_fingerprint=policy_fingerprint,
+            review_contract_version=contract_version,
         )
-    return views
+        if store.load_strategy_review_job_by_fingerprint(fingerprint):
+            existing += 1
+            continue
+        now = datetime.now(UTC)
+        status = StrategyReviewJobStatus.QUEUED
+        stage = "queued"
+        tier = "unreviewed"
+        progress = 0
+        reasons: list[str] = []
+        completed_at = None
+        if candidate.status in {CandidateStatus.CHALLENGER, CandidateStatus.CHAMPION}:
+            status = StrategyReviewJobStatus.ADMITTED
+            stage = "admitted"
+            tier = (
+                "sandbox_mature"
+                if candidate.status == CandidateStatus.CHAMPION
+                else "sandbox_canary"
+            )
+            progress = 100
+            completed_at = now
+        elif candidate.status in {CandidateStatus.REJECTED, CandidateStatus.RETIRED}:
+            status = StrategyReviewJobStatus.REJECTED
+            stage = "rejected"
+            tier = "rejected"
+            progress = 100
+            reasons = candidate.decision_reasons[-8:]
+            completed_at = now
+        job = StrategyReviewJob(
+            candidate_id=candidate.id,
+            candidate_fingerprint=candidate.spec_fingerprint,
+            review_fingerprint=fingerprint,
+            review_contract_version=contract_version,
+            policy_fingerprint=policy_fingerprint,
+            origin_symbol=context.symbol,
+            origin_timeframe=context.timeframe,
+            trial_count=context.trial_count,
+            entry_profile=context.entry_profile,
+            status=status,
+            stage=stage,
+            evidence_tier=tier,
+            progress_percent=progress,
+            dataset_id=candidate.dataset_id,
+            parent_candidate_id=candidate.parent_candidate_id,
+            rejection_reasons=reasons,
+            evidence_refs=[item for item in [candidate.dataset_id, candidate.id] if item],
+            completed_at=completed_at,
+            updated_at=now,
+        )
+        store.save_strategy_review_job(job)
+        queued += status == StrategyReviewJobStatus.QUEUED
+    if queued or migrated or rejected:
+        add_audit(
+            "review",
+            "审核 Agent 已协调全部历史候选并建立持久化队列",
+            queued=queued,
+            migrated=migrated,
+            contract_rejected=rejected,
+            existing=existing,
+        )
+    return {
+        "queued": queued,
+        "migrated": migrated,
+        "contract_rejected": rejected,
+        "existing": existing,
+        "legacy": legacy,
+        "total_candidates": len(payloads),
+    }
 
 
-@app.get("/api/agent/overview", response_model=AgentRuntimeOverview)
-async def agent_runtime_overview():
-    return await asyncio.to_thread(build_agent_runtime_overview)
+def missing_review_dataset_features(
+    dataset: ResearchDataset,
+    required_features: list[str],
+) -> list[str]:
+    counts = {
+        "funding_rate": dataset.funding_count,
+        "open_interest": dataset.open_interest_count,
+        "positioning": dataset.positioning_count,
+        "basis": dataset.basis_count,
+        "order_flow": dataset.order_flow_count,
+        "liquidation_flow": dataset.liquidation_flow_count,
+    }
+    return [feature for feature in required_features if feature != "ohlcv" and counts[feature] <= 0]
 
 
-@app.post("/api/agent/launch/preview", response_model=AgentLaunchPreview)
-async def preview_agent_launch(request: AgentLaunchRequest):
-    return await asyncio.to_thread(launch_preview_payload, request)
+async def ensure_strategy_review_dataset(
+    candidate: StrategyCandidate,
+    *,
+    symbol: str | None = None,
+) -> ResearchDataset:
+    context = candidate.research_context
+    if context is None:
+        raise RuntimeError("v1 候选只读保留，不能进入 v2 审核")
+    review_symbol = symbol or context.symbol
+    timeframe = context.timeframe
+    fetch_features = any(feature != "ohlcv" for feature in context.required_features)
+    existing = [
+        ResearchDataset.model_validate(item)
+        for item in await asyncio.to_thread(store.list_research_datasets, 1000)
+        if item.get("symbol") == review_symbol
+        and item.get("timeframe") == timeframe
+        and item.get("exchange") == context.exchange
+        and item.get("market_type") == context.market_type
+    ]
+    existing.sort(key=lambda item: item.candle_count, reverse=True)
+    suitable = [
+        item
+        for item in existing
+        if item.candle_count >= 20000
+        and not missing_review_dataset_features(item, context.required_features)
+    ]
+    if suitable:
+        return suitable[0]
+    try:
+        market, history = await runtime.market_context(
+            limit=20000,
+            symbol=review_symbol,
+            timeframe=timeframe,
+        )
+        candles = closed_candles(history, timeframe, market.timestamp)
+        if len(candles) < 500:
+            raise RuntimeError(f"{timeframe} 审核数据不足 500 根，当前 {len(candles)} 根")
+        dataset, *_ = await materialize_research_dataset(
+            candles,
+            exchange=context.exchange,
+            market_type=context.market_type,
+            symbol=review_symbol,
+            timeframe=timeframe,
+            quality=runtime.market_quality,
+            fetch_derivative_features=fetch_features,
+        )
+        return dataset
+    except Exception:
+        if existing and existing[0].candle_count >= 500:
+            return existing[0]
+        raise
 
 
-@app.post("/api/agent/launch", response_model=AgentLaunchResult)
-async def launch_agent(request: AgentLaunchRequest):
-    preview = await asyncio.to_thread(launch_preview_payload, request)
-    if preview.confirmation_required:
-        if not request.authorize:
-            raise HTTPException(409, "首次启动或权限范围变化，需要确认授权")
-        if request.preview_fingerprint != preview.grant_fingerprint:
-            raise HTTPException(409, "启动预览已变化，请重新核对授权摘要")
-    policy = launch_policy(request)
-    validate_agent_policy_against_platform(policy)
-    stored_payload = await asyncio.to_thread(
-        store.load_agent_launch_profile,
-        request.profile_id,
+def validate_strategy_review_inputs(
+    candle_payloads: list[dict],
+    funding_payloads: list[dict],
+    open_interest_payloads: list[dict],
+    positioning_payloads: list[dict],
+    basis_payloads: list[dict],
+) -> tuple[
+    list[Candle],
+    list[FundingRatePoint],
+    list[OpenInterestPoint],
+    list[PositioningPoint],
+    list[BasisPoint],
+]:
+    """Validate large immutable review inputs outside the API event loop."""
+
+    return (
+        [Candle.model_validate(item) for item in candle_payloads],
+        [FundingRatePoint.model_validate(item) for item in funding_payloads],
+        [OpenInterestPoint.model_validate(item) for item in open_interest_payloads],
+        [PositioningPoint.model_validate(item) for item in positioning_payloads],
+        [BasisPoint.model_validate(item) for item in basis_payloads],
     )
-    stored = AgentLaunchProfile.model_validate(stored_payload) if stored_payload else None
-    goal_id = (
-        stored.goal_id
-        if stored and stored.goal_id
-        else f"goal_launch_{stable_fingerprint({'profile_id': request.profile_id})[:16]}"
+
+
+def review_result_metrics(result: BacktestResult, dataset: ResearchDataset) -> dict:
+    raw_wins = Decimal("0")
+    raw_losses = Decimal("0")
+    for episode in result.trade_episodes:
+        raw_pnl = episode.pnl + episode.fees + episode.slippage_cost + episode.funding_cost
+        if raw_pnl > 0:
+            raw_wins += raw_pnl
+        elif raw_pnl < 0:
+            raw_losses += abs(raw_pnl)
+    raw_profit_factor = (
+        raw_wins / raw_losses
+        if raw_losses > 0
+        else Decimal("999.99")
+        if raw_wins > 0
+        else Decimal("0")
     )
-    existing_goal = await asyncio.to_thread(agent_store.load_goal, goal_id)
-    if existing_goal:
-        goal = existing_goal.model_copy(
+    return {
+        "return_percent": str(result.return_percent),
+        "max_drawdown_percent": str(result.max_drawdown_percent),
+        "profit_factor": str(result.profit_factor),
+        "raw_profit_factor": str(raw_profit_factor.quantize(Decimal("0.01"))),
+        "sharpe": str(result.sharpe),
+        "total_trades": result.total_trades,
+        "total_fees": str(result.total_fees),
+        "total_slippage": str(result.total_slippage),
+        "total_funding": str(result.total_funding),
+        "stress_return_percent": str(result.stress_return_percent or Decimal("0")),
+        "round_trip_cost_r": str(result.cost_model.get("round_trip_cost_r") or "0"),
+        "notional_cap_count": int(result.cost_model.get("notional_cap_count") or 0),
+        "gross_exposure_cap_count": int(result.cost_model.get("gross_exposure_cap_count") or 0),
+        "leverage_cap_count": int(result.cost_model.get("leverage_cap_count") or 0),
+        "volume_cap_count": int(result.cost_model.get("volume_cap_count") or 0),
+        "candle_count": dataset.candle_count,
+        "robustness_passed": result.robustness_passed,
+    }
+
+
+async def run_candidate_review_scope(
+    candidate: StrategyCandidate,
+    *,
+    symbol: str,
+    role: str,
+    trial_count: int,
+) -> tuple[BacktestResult | None, ReviewScopeResult]:
+    context = candidate.research_context
+    assert context is not None
+    dataset = await ensure_strategy_review_dataset(candidate, symbol=symbol)
+    missing = missing_review_dataset_features(dataset, context.required_features)
+    if missing:
+        reasons = [f"缺少审核所需历史特征：{', '.join(missing)}"]
+        return None, ReviewScopeResult(
+            symbol=symbol,
+            timeframe=context.timeframe,
+            role=role,
+            status="blocked",
+            stage="data_required",
+            dataset_id=dataset.id,
+            dataset_fingerprint=dataset.data_fingerprint,
+            reasons=reasons,
+            evidence_refs=[dataset.id, dataset.data_fingerprint],
+        )
+    (
+        candle_payloads,
+        funding_payloads,
+        open_interest_payloads,
+        positioning_payloads,
+        basis_payloads,
+        order_flow_payloads,
+        liquidation_flow_payloads,
+    ) = await asyncio.gather(
+        asyncio.to_thread(store.load_research_dataset_candles, dataset.id),
+        asyncio.to_thread(store.load_research_dataset_funding, dataset.id),
+        asyncio.to_thread(store.load_research_dataset_open_interest, dataset.id),
+        asyncio.to_thread(store.load_research_dataset_positioning, dataset.id),
+        asyncio.to_thread(store.load_research_dataset_basis, dataset.id),
+        asyncio.to_thread(store.load_research_dataset_order_flow, dataset.id),
+        asyncio.to_thread(store.load_research_dataset_liquidation_flow, dataset.id),
+    )
+    candles, funding, open_interest, positioning, basis = await to_process.run_sync(
+        partial(
+            validate_strategy_review_inputs,
+            candle_payloads,
+            funding_payloads,
+            open_interest_payloads,
+            positioning_payloads,
+            basis_payloads,
+        ),
+        cancellable=True,
+        limiter=research_process_limiter,
+    )
+    order_flow = [OrderFlowBar.model_validate(item) for item in order_flow_payloads]
+    liquidation_flow = [
+        LiquidationFlowPoint.model_validate(item) for item in liquidation_flow_payloads
+    ]
+    result = await backtest_candidate_on_dataset(
+        candidate,
+        dataset,
+        candles,
+        funding,
+        open_interest,
+        positioning=positioning,
+        basis=basis,
+        order_flow=order_flow,
+        liquidation_flow=liquidation_flow,
+        research_trial_count=trial_count,
+    )
+    return result, ReviewScopeResult(
+        symbol=symbol,
+        timeframe=context.timeframe,
+        role=role,
+        status="passed" if result.robustness_passed else "failed",
+        stage=("base_and_stress_passed" if result.robustness_passed else "base_or_stress_failed"),
+        dataset_id=dataset.id,
+        dataset_fingerprint=dataset.data_fingerprint,
+        metrics=review_result_metrics(result, dataset),
+        reasons=result.validation_reasons[:12],
+        evidence_refs=[dataset.id, dataset.data_fingerprint],
+    )
+
+
+def cross_market_review_passed(
+    results: list[BacktestResult],
+    *,
+    minimum_passes: int,
+    minimum_profit_factor: Decimal,
+    maximum_drawdown_percent: Decimal,
+) -> tuple[bool, dict, list[str]]:
+    wins = Decimal("0")
+    losses = Decimal("0")
+    for result in results:
+        for episode in result.trade_episodes:
+            if episode.pnl > 0:
+                wins += episode.pnl
+            elif episode.pnl < 0:
+                losses += abs(episode.pnl)
+    combined_pf = wins / losses if losses > 0 else Decimal("999.99") if wins > 0 else Decimal("0")
+    passed_count = sum(result.robustness_passed for result in results)
+    combined_stress = sum(
+        (result.stress_return_percent or Decimal("0") for result in results),
+        Decimal("0"),
+    )
+    maximum_drawdown = max(
+        (result.max_drawdown_percent for result in results),
+        default=Decimal("0"),
+    )
+    reasons: list[str] = []
+    if passed_count < minimum_passes:
+        reasons.append(f"跨市场仅 {passed_count}/{len(results)} 通过，要求至少 {minimum_passes}")
+    if combined_pf < minimum_profit_factor:
+        reasons.append(f"跨市场组合 PF {combined_pf:.2f} 低于 {minimum_profit_factor}")
+    if combined_stress <= 0:
+        reasons.append("跨市场组合压力收益不为正")
+    if maximum_drawdown > maximum_drawdown_percent:
+        reasons.append(f"跨市场最大回撤 {maximum_drawdown:.2f}% 超过 {maximum_drawdown_percent}%")
+    metrics = {
+        "cross_market_passed_count": passed_count,
+        "cross_market_scope_count": len(results),
+        "combined_profit_factor": str(combined_pf.quantize(Decimal("0.01"))),
+        "combined_stress_return_percent": str(combined_stress.quantize(Decimal("0.01"))),
+        "cross_market_max_drawdown_percent": str(maximum_drawdown),
+    }
+    return not reasons, metrics, reasons
+
+
+async def process_strategy_review_job(job: StrategyReviewJob) -> StrategyReviewJob:
+    now = datetime.now(UTC)
+    job.status = StrategyReviewJobStatus.RUNNING
+    job.stage = "binding_dataset"
+    job.progress_percent = 10
+    job.started_at = job.started_at or now
+    job.updated_at = now
+    job.attempt_count += 1
+    job.error = None
+    await asyncio.to_thread(store.save_strategy_review_job, job)
+    try:
+        candidate_payload = await asyncio.to_thread(
+            store.load_strategy_candidate,
+            job.candidate_id,
+        )
+        if not candidate_payload:
+            raise RuntimeError("候选记录不存在")
+        candidate = StrategyCandidate.model_validate(candidate_payload)
+        context = candidate.research_context
+        if context is None or job.review_contract_version <= 1:
+            raise RuntimeError("v1 审核记录只读保留，不允许进入 v2 worker")
+        job.trial_count = max(
+            job.trial_count,
+            await asyncio.to_thread(
+                current_candidate_trial_count,
+                trial_group=context.trial_group,
+            ),
+        )
+        job.stage = "origin_validation"
+        job.progress_percent = 20
+        job.updated_at = datetime.now(UTC)
+        await asyncio.to_thread(store.save_strategy_review_job, job)
+        origin_result, origin_scope = await run_candidate_review_scope(
+            candidate,
+            symbol=context.symbol,
+            role="origin",
+            trial_count=job.trial_count,
+        )
+        job.scope_results = [origin_scope]
+        job.dataset_id = origin_scope.dataset_id
+        job.dataset_fingerprint = origin_scope.dataset_fingerprint
+        if origin_result is None:
+            job.status = StrategyReviewJobStatus.BLOCKED
+            job.stage = "data_required"
+            job.evidence_tier = "unreviewed"
+            job.progress_percent = 20
+            job.error = origin_scope.reasons[0]
+            job.rejection_reasons = origin_scope.reasons
+            job.updated_at = datetime.now(UTC)
+            await asyncio.to_thread(store.save_strategy_review_job, job)
+            return job
+        candidate = attach_backtest(candidate, origin_scope.dataset_id or "", origin_result)
+        job.metrics = dict(origin_scope.metrics)
+        job.evidence_refs = [candidate.id, *origin_scope.evidence_refs]
+        if not origin_result.robustness_passed:
+            job.status = StrategyReviewJobStatus.REJECTED
+            job.stage = "origin_rejected"
+            job.evidence_tier = "rejected"
+            job.progress_percent = 100
+            job.rejection_reasons = origin_result.validation_reasons[:12]
+            job.completed_at = datetime.now(UTC)
+            job.updated_at = job.completed_at
+            await asyncio.to_thread(store.save_strategy_candidate, candidate)
+            await asyncio.to_thread(store.save_strategy_review_job, job)
+            return job
+
+        candidate = candidate.model_copy(
             deep=True,
             update={
-                "objective": request.objective,
-                "symbols": request.symbols,
-                "timeframes": request.timeframes,
-                "autonomy_mode": request.autonomy_mode,
-                "risk_policy_id": policy.id,
-                "poll_seconds": request.poll_seconds,
-                "status": AgentGoalStatus.ACTIVE,
+                "status": CandidateStatus.VALIDATED,
                 "updated_at": datetime.now(UTC),
             },
         )
-    else:
-        goal = AgentGoal(
-            id=goal_id,
-            objective=request.objective,
-            symbols=request.symbols,
-            timeframes=request.timeframes,
-            autonomy_mode=request.autonomy_mode,
-            risk_policy_id=policy.id,
-            poll_seconds=request.poll_seconds,
-            status=AgentGoalStatus.ACTIVE,
-        )
-    now = datetime.now(UTC)
-    profile = AgentLaunchProfile(
-        id=request.profile_id,
-        goal_id=goal.id,
-        policy_id=policy.id,
-        symbols=request.symbols,
-        timeframes=request.timeframes,
-        autonomy_mode=request.autonomy_mode,
-        risk_template=request.risk_template,
-        objective=request.objective,
-        poll_seconds=request.poll_seconds,
-        grant_fingerprint=preview.grant_fingerprint,
-        authorized_fingerprint=preview.grant_fingerprint,
-        created_at=stored.created_at if stored else now,
-        updated_at=now,
-    )
-    await asyncio.to_thread(agent_store.save_launch_bundle, policy, goal, profile)
-    add_audit(
-        "agent",
-        "自动交易 Agent 已通过快速启动配置启用",
-        severity="warning",
-        goal_id=goal.id,
-        profile_id=profile.id,
-        symbols=",".join(goal.symbols),
-        timeframes=",".join(goal.timeframes),
-        autonomy_mode=str(goal.autonomy_mode),
-        reused=bool(existing_goal),
-    )
-    return AgentLaunchResult(
-        profile=profile,
-        goal_id=goal.id,
-        reused=bool(existing_goal),
-        status=str(goal.status),
-    )
+        await asyncio.to_thread(store.save_strategy_candidate, candidate)
+        job.stage = "cross_market_validation"
+        job.evidence_tier = "paper_eligible"
+        job.progress_percent = 45
+        job.updated_at = datetime.now(UTC)
+        await asyncio.to_thread(store.save_strategy_review_job, job)
 
-
-@app.post("/api/agent/goals/{goal_id}/archive", response_model=AgentGoal)
-async def archive_agent_goal(goal_id: str):
-    goal = await asyncio.to_thread(agent_store.load_goal, goal_id)
-    if not goal:
-        raise HTTPException(404, "Agent goal not found")
-    goal.status = AgentGoalStatus.ARCHIVED
-    await asyncio.to_thread(agent_store.save_goal, goal)
-    add_audit("agent", "Agent 目标已归档", severity="warning", goal_id=goal.id)
-    return goal
-
-
-@app.post("/api/agent/goals/{goal_id}/restore", response_model=AgentGoal)
-async def restore_agent_goal(goal_id: str):
-    goal = await asyncio.to_thread(agent_store.load_goal, goal_id)
-    if not goal:
-        raise HTTPException(404, "Agent goal not found")
-    if goal.status != AgentGoalStatus.ARCHIVED:
-        raise HTTPException(409, "only an archived Agent goal can be restored")
-    goal.status = AgentGoalStatus.PAUSED
-    await asyncio.to_thread(agent_store.save_goal, goal)
-    add_audit("agent", "Agent 目标已恢复为暂停状态", goal_id=goal.id)
-    return goal
-
-
-@app.websocket("/ws/agent")
-async def agent_runtime_stream(websocket: WebSocket):
-    await websocket.accept()
-    last_payload = ""
-    try:
-        while True:
-            overview = await asyncio.to_thread(build_agent_runtime_overview)
-            payload = overview.model_dump_json()
-            if payload != last_payload:
-                await websocket.send_json(
-                    {"type": "agent_overview", "data": overview.model_dump(mode="json")}
-                )
-                last_payload = payload
-            await asyncio.sleep(1)
-    except WebSocketDisconnect:
-        pass
-    except Exception as exc:
-        with suppress(Exception):
-            await websocket.send_json({"type": "error", "message": str(exc)[:180]})
-            await websocket.close(code=1011)
-
-
-@app.get("/api/agent/state")
-async def agent_control_state():
-    goals, policies, runs, episodes, memories, shadow_trials = await asyncio.gather(
-        asyncio.to_thread(agent_store.list_goals, 50),
-        asyncio.to_thread(agent_store.list_policies, 50),
-        asyncio.to_thread(agent_store.list_runs, 50),
-        asyncio.to_thread(agent_store.list_episodes, 50),
-        asyncio.to_thread(agent_store.recent_memories, 50),
-        asyncio.to_thread(agent_store.list_shadow_trials, 500),
-    )
-    schedule_coverage = await asyncio.to_thread(
-        agent_store.schedule_market_coverage,
-        [goal.id for goal in goals],
-    )
-    goal_by_id = {goal.id: goal for goal in goals}
-    now = datetime.now(UTC)
-    for item in schedule_coverage:
-        goal = goal_by_id.get(item["goal_id"])
-        interval = max(
-            goal.poll_seconds if goal else 60,
-            timeframe_seconds(item["timeframe"]),
-        )
-        bucket = int(now.timestamp()) // interval
-        item["next_scheduled_at"] = datetime.fromtimestamp(
-            (bucket + 1) * interval,
-            UTC,
-        ).isoformat()
-        item["coverage_status"] = (
-            "paused"
-            if goal and goal.status != AgentGoalStatus.ACTIVE
-            else "healthy"
-            if (
-                item["event_status"] == str(AgentEventStatus.PROCESSED)
-                and item["last_run_status"]
-                in {
-                    str(AgentRunStatus.WAITING),
-                    str(AgentRunStatus.COMPLETED),
-                    str(AgentRunStatus.HALTED),
-                }
-            )
-            else "running"
-            if item["event_status"] == str(AgentEventStatus.CLAIMED)
-            else "queued"
-            if item["event_status"] == str(AgentEventStatus.PENDING)
-            else "degraded"
-        )
-    for trial in shadow_trials:
-        if trial.backtest_evidence:
-            continue
-        payload = await asyncio.to_thread(
-            store.load_latest_backtest,
-            trial.plan.id,
-        )
-        if not payload:
-            continue
-        artifact = BacktestResult.model_validate(payload)
-        if artifact.strategy_fingerprint != trial.plan.fingerprint or artifact.cost_model.get(
-            "direction_filter"
-        ) != str(trial.plan.side):
-            continue
-        trial.backtest_evidence = evidence_summary(artifact)
-        await asyncio.to_thread(agent_store.save_shadow_trial, trial)
-    return {
-        "goals": goals,
-        "policies": policies,
-        "runs": runs,
-        "episodes": episodes,
-        "episode_runtime": build_agent_episode_runtime_views(episodes),
-        "memories": memories,
-        "shadow_trials": shadow_trials[:100],
-        "shadow_calibration": summarize_shadow_trials(shadow_trials).model_dump(mode="json"),
-        "market_coverage": schedule_coverage,
-        "risk_state": risk_state_service.get(),
-    }
-
-
-@app.get("/api/agent/performance", response_model=AgentForwardPerformance)
-async def agent_forward_performance(
-    autonomy_mode: AgentAutonomyMode = AgentAutonomyMode.SANDBOX,
-    goal_id: str | None = None,
-):
-    policies, episodes = await asyncio.gather(
-        asyncio.to_thread(agent_store.list_policies, 500),
-        asyncio.to_thread(agent_store.list_episodes, 10000),
-    )
-    matching_policies = [
-        policy
-        for policy in policies
-        if policy.autonomy_mode == autonomy_mode and policy.allow_agent_entry
-    ]
-    policy_ids = {policy.id for policy in matching_policies}
-    scoped = [
-        episode
-        for episode in episodes
-        if episode.policy_id in policy_ids and (goal_id is None or episode.goal_id == goal_id)
-    ]
-    selected_goal = await asyncio.to_thread(agent_store.load_goal, goal_id) if goal_id else None
-    required_symbols = (
-        selected_goal.symbols
-        if selected_goal
-        else list(
-            dict.fromkeys(
-                symbol for policy in matching_policies for symbol in policy.allowed_symbols
-            )
-        )
-    )
-    configuration = configuration_service.current_configuration()
-    return build_forward_performance(
-        scoped,
-        configuration.agent_forward_validation,
-        scope_mode=autonomy_mode,
-        required_symbols=required_symbols,
-    )
-
-
-@app.get("/api/agent/runs/{run_id}")
-async def agent_run_trace(run_id: str):
-    run, decisions, observations = await asyncio.gather(
-        asyncio.to_thread(agent_store.load_run, run_id),
-        asyncio.to_thread(agent_store.decisions_for_run, run_id, 50),
-        asyncio.to_thread(agent_store.observations_for_run, run_id, 50),
-    )
-    if not run:
-        raise HTTPException(404, "Agent run not found")
-    return {
-        "run": run,
-        "decisions": decisions,
-        "observations": observations,
-    }
-
-
-@app.get("/api/agent/readiness", response_model=AgentReadiness)
-async def agent_trading_readiness() -> AgentReadiness:
-    configuration_view = configuration_service.get()
-    configuration = configuration_view.configuration
-    ai_view = ai_configuration_service.get()
-    risk_state = risk_state_service.get()
-    reconciliation_health = runtime.reconciliation_health
-    reconciliation_entry_allowed = (
-        configuration.trading_mode == TradingMode.PAPER or reconciliation_health.entry_allowed
-    )
-    goals, policies, episodes = await asyncio.gather(
-        asyncio.to_thread(agent_store.list_goals, 100),
-        asyncio.to_thread(agent_store.list_policies, 100),
-        asyncio.to_thread(agent_store.list_episodes, 200),
-    )
-    mode = {
-        TradingMode.PAPER: AgentAutonomyMode.PAPER,
-        TradingMode.SANDBOX: AgentAutonomyMode.SANDBOX,
-        TradingMode.LIVE: AgentAutonomyMode.LIVE_CAPPED,
-    }[configuration.trading_mode]
-
-    ready_ai_providers = []
-    for provider in ai_view.configuration.providers:
-        credential = ai_view.credentials[provider.provider]
-        provider_runtime = ai_view.runtime[provider.provider]
-        if (
-            provider.enabled
-            and credential.api_key_configured
-            and provider_runtime.status == "ready"
-            and provider_runtime.selected_model_available is not False
-        ):
-            ready_ai_providers.append(str(provider.provider))
-
-    commissioning = configuration_view.commissioning
-    position_management_ready = configuration.trading_mode == TradingMode.PAPER or bool(
-        commissioning and commissioning.agent_position_management_passed
-    )
-    entry_policies = [
-        policy
-        for policy in policies
-        if policy.autonomy_mode == mode
-        and policy.allow_agent_entry
-        and policy.max_risk_per_trade > 0
-        and policy.max_daily_drawdown > 0
-        and policy.max_open_positions > 0
-        and policy.max_trades_per_day > 0
-        and policy.allowed_symbols
-        and policy.allowed_timeframes
-        and (configuration.trading_mode == TradingMode.PAPER or policy.require_native_protection)
-    ]
-    entry_policy_ids = {policy.id for policy in entry_policies}
-    now = datetime.now(UTC)
-    active_goals = [
-        goal
-        for goal in goals
-        if goal.status == AgentGoalStatus.ACTIVE
-        and goal.autonomy_mode == mode
-        and goal.risk_policy_id in entry_policy_ids
-        and (goal.valid_until is None or goal.valid_until > now)
-    ]
-    uncertain_episodes = [
-        episode for episode in episodes if episode.status == TradeEpisodeStatus.UNCERTAIN
-    ]
-    checks = [
-        AgentReadinessCheck(
-            code="ai_reasoner",
-            passed=bool(ready_ai_providers),
-            message=(
-                f"可用推理提供商：{', '.join(ready_ai_providers)}"
-                if ready_ai_providers
-                else "没有同时启用、配置凭证并通过模型测试的 AI 提供商"
-            ),
-        ),
-        AgentReadinessCheck(
-            code="execution_gateway",
-            passed=configuration_view.execution_ready,
-            message=(
-                "交易网关已通过执行验收"
-                if configuration_view.execution_ready
-                else "交易网关尚未通过当前凭证对应的原子保护单验收"
-            ),
-        ),
-        AgentReadinessCheck(
-            code="position_management",
-            passed=position_management_ready,
-            message=(
-                "Agent 可验证减仓、保护单再平衡与完全退出"
-                if position_management_ready
-                else "尚未通过 Agent 减仓、保护单再平衡与完全退出验收"
-            ),
-        ),
-        AgentReadinessCheck(
-            code="risk_gate",
-            passed=not risk_state.halted and reconciliation_entry_allowed,
-            message=(
-                "全局风险闸允许交易，订单对账已同步"
-                if not risk_state.halted and reconciliation_entry_allowed
-                else (
-                    f"全局风险闸已停机：{risk_state.reason}"
-                    if risk_state.halted
-                    else "订单对账暂时不可用，系统正在自动重试，期间禁止新开仓"
-                )
-            ),
-        ),
-        AgentReadinessCheck(
-            code="entry_policy",
-            passed=bool(entry_policies),
-            message=(
-                f"{len(entry_policies)} 个 {mode} 自动入场授权有效"
-                if entry_policies
-                else f"没有有效的 {mode} 自动入场授权"
-            ),
-        ),
-        AgentReadinessCheck(
-            code="active_goal",
-            passed=bool(active_goals),
-            message=(
-                f"{len(active_goals)} 个活动交易目标已绑定有效授权"
-                if active_goals
-                else "没有活动交易目标绑定有效自动入场授权"
-            ),
-        ),
-        AgentReadinessCheck(
-            code="episode_reconciliation",
-            passed=not uncertain_episodes,
-            message=(
-                "没有待人工对账的不确定交易回合"
-                if not uncertain_episodes
-                else f"{len(uncertain_episodes)} 个不确定交易回合必须先完成对账"
-            ),
-        ),
-    ]
-    if configuration.trading_mode == TradingMode.LIVE:
-        sandbox_policy_ids = {
-            policy.id for policy in policies if policy.autonomy_mode == AgentAutonomyMode.SANDBOX
-        }
-        sandbox_symbols = list(
-            dict.fromkeys(
-                symbol
-                for policy in policies
-                if policy.autonomy_mode == AgentAutonomyMode.SANDBOX and policy.allow_agent_entry
-                for symbol in policy.allowed_symbols
-            )
-        )
-        sandbox_performance = build_forward_performance(
-            [episode for episode in episodes if episode.policy_id in sandbox_policy_ids],
-            configuration.agent_forward_validation,
-            scope_mode=AgentAutonomyMode.SANDBOX,
-            required_symbols=sandbox_symbols,
-        )
-        checks.append(
-            AgentReadinessCheck(
-                code="sandbox_forward_validation",
-                passed=sandbox_performance.qualified_for_live_review,
-                message=(
-                    "测试网前向收益、近期优势与回撤证据已达到实盘评审门槛"
-                    if sandbox_performance.qualified_for_live_review
-                    else (
-                        "测试网前向证据尚未通过："
-                        f"{sandbox_performance.attributable_episodes} 个完整回合，"
-                        f"{sandbox_performance.independent_runs} 个独立执行批次，"
-                        f"累计 {sandbox_performance.total_r:f}R"
-                    )
-                ),
-            )
-        )
-    return AgentReadiness(
-        ready_for_autonomous_trading=all(check.passed for check in checks),
-        mode=mode,
-        checks=checks,
-    )
-
-
-@app.put("/api/agent/policies/{policy_id}", response_model=AgentPolicy)
-async def save_agent_policy(policy_id: str, update: AgentPolicyUpdate):
-    if update.policy.id != policy_id:
-        raise HTTPException(422, "policy id does not match request path")
-    expected = f"AUTHORIZE AGENT {policy_id} {update.policy.autonomy_mode}"
-    if update.confirmation != expected:
-        raise HTTPException(400, f"confirmation must be exactly: {expected}")
-    validate_agent_policy_against_platform(update.policy)
-    await asyncio.to_thread(agent_store.save_policy, update.policy)
-    add_audit(
-        "agent",
-        "Agent 权限策略已由操作员保存",
-        severity="warning",
-        policy_id=policy_id,
-        autonomy_mode=str(update.policy.autonomy_mode),
-        allow_agent_entry=update.policy.allow_agent_entry,
-    )
-    return update.policy
-
-
-@app.post("/api/agent/goals", response_model=AgentGoal)
-async def create_agent_goal(goal: AgentGoal):
-    policy = await asyncio.to_thread(agent_store.load_policy, goal.risk_policy_id)
-    if not policy:
-        raise HTTPException(409, "Agent goal references an unknown policy")
-    if goal.autonomy_mode != policy.autonomy_mode:
-        raise HTTPException(409, "Agent goal and policy autonomy modes must match")
-    if not set(goal.symbols).issubset(policy.allowed_symbols):
-        raise HTTPException(409, "Agent goal symbols exceed the policy grant")
-    if not set(goal.timeframes).issubset(policy.allowed_timeframes):
-        raise HTTPException(409, "Agent goal timeframes exceed the policy grant")
-    await asyncio.to_thread(agent_store.save_goal, goal)
-    add_audit(
-        "agent",
-        "新的持久化 Agent 目标已创建",
-        goal_id=goal.id,
-        autonomy_mode=str(goal.autonomy_mode),
-    )
-    return goal
-
-
-@app.put("/api/agent/goals/{goal_id}", response_model=AgentGoal)
-async def update_agent_goal_scope(goal_id: str, update: AgentGoalScopeUpdate):
-    goal = await asyncio.to_thread(agent_store.load_goal, goal_id)
-    if not goal:
-        raise HTTPException(404, "Agent goal not found")
-    expected = f"UPDATE AGENT GOAL {goal.id}"
-    if update.confirmation != expected:
-        raise HTTPException(400, f"confirmation must be exactly: {expected}")
-    policy = await asyncio.to_thread(agent_store.load_policy, goal.risk_policy_id)
-    if not policy:
-        raise HTTPException(409, "Agent policy not found")
-    candidate = AgentGoal.model_validate(
-        {
-            **goal.model_dump(),
-            "objective": update.objective,
-            "symbols": update.symbols,
-            "timeframes": update.timeframes,
-            "poll_seconds": update.poll_seconds,
-        }
-    )
-    if not set(candidate.symbols).issubset(policy.allowed_symbols):
-        raise HTTPException(409, "Agent goal symbols exceed the policy grant")
-    if not set(candidate.timeframes).issubset(policy.allowed_timeframes):
-        raise HTTPException(409, "Agent goal timeframes exceed the policy grant")
-    await asyncio.to_thread(agent_store.save_goal, candidate)
-    add_audit(
-        "agent",
-        "Operator updated Agent goal scope",
-        severity="warning",
-        goal_id=goal.id,
-        symbols=",".join(candidate.symbols),
-        timeframes=",".join(candidate.timeframes),
-        poll_seconds=candidate.poll_seconds,
-    )
-    return candidate
-
-
-@app.put("/api/agent/goals/{goal_id}/status", response_model=AgentGoal)
-async def update_agent_goal_status(goal_id: str, update: AgentGoalStatusUpdate):
-    goal = await asyncio.to_thread(agent_store.load_goal, goal_id)
-    if not goal:
-        raise HTTPException(404, "Agent goal not found")
-    if update.status not in {AgentGoalStatus.ACTIVE, AgentGoalStatus.PAUSED}:
-        raise HTTPException(422, "this endpoint only supports active or paused")
-    verb = "RESUME" if update.status == AgentGoalStatus.ACTIVE else "PAUSE"
-    expected = f"{verb} AGENT {goal.id}"
-    if update.confirmation != expected:
-        raise HTTPException(400, f"confirmation must be exactly: {expected}")
-    if update.status == AgentGoalStatus.ACTIVE:
-        policy = await asyncio.to_thread(agent_store.load_policy, goal.risk_policy_id)
-        if not policy:
-            raise HTTPException(409, "Agent policy not found")
-        validate_agent_policy_against_platform(policy)
-        if goal.valid_until and goal.valid_until <= datetime.now(UTC):
-            raise HTTPException(409, "expired Agent goal cannot be resumed")
-    goal.status = update.status
-    await asyncio.to_thread(agent_store.save_goal, goal)
-    add_audit(
-        "agent",
-        f"Operator changed Agent goal status to {update.status}",
-        severity="warning",
-        goal_id=goal.id,
-        status=str(update.status),
-    )
-    return goal
-
-
-@app.post("/api/agent/goals/{goal_id}/trigger", response_model=AgentEvent)
-async def trigger_agent_goal(goal_id: str, request: AgentTriggerRequest):
-    goal = await asyncio.to_thread(agent_store.load_goal, goal_id)
-    if not goal:
-        raise HTTPException(404, "Agent goal not found")
-    event = AgentEvent(
-        event_type=request.event_type,
-        source="operator",
-        goal_id=goal.id,
-        dedupe_key=request.dedupe_key or f"manual:{goal.id}:{uuid4().hex}",
-        payload=request.payload,
-    )
-    return await asyncio.to_thread(agent_store.append_event, event)
-
-
-def build_agent_market_state(
-    market,
-    candles: list[Candle],
-    *,
-    symbol: str,
-    timeframe: str,
-    trigger: AgentEvent,
-) -> dict:
-    """Separate immutable signal bars from the currently forming bar.
-
-    Exchange OHLCV timestamps identify the start of a candle. The Agent
-    reasoner may use the live snapshot and a labelled forming candle as
-    context, but only completed bars may be presented as signal evidence.
-    """
-
-    as_of = market.timestamp
-    if as_of.tzinfo is None:
-        as_of = as_of.replace(tzinfo=UTC)
-    completed = closed_candles(candles, timeframe, as_of)
-    forming = next(
-        (candle for candle in reversed(candles) if candle_close_time(candle, timeframe) > as_of),
-        None,
-    )
-    return {
-        "snapshot": market.model_dump(mode="json"),
-        "recent_closed_candles": [candle.model_dump(mode="json") for candle in completed[-3:]],
-        "closed_candle_count": len(completed),
-        "signal_data_end": (completed[-1].timestamp.isoformat() if completed else None),
-        "forming_candle": (
-            {
-                **forming.model_dump(mode="json"),
-                "is_closed": False,
-                "close_time": candle_close_time(
-                    forming,
-                    timeframe,
-                ).isoformat(),
-                "role": "live_context_only_not_signal_evidence",
-            }
-            if forming
-            else None
-        ),
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "trigger": trigger.model_dump(mode="json"),
-    }
-
-
-def memory_relevant_to_market(
-    memory: AgentMemory,
-    *,
-    symbol: str,
-    timeframe: str,
-) -> bool:
-    """Match every market dimension declared by a durable memory.
-
-    Episodic memories currently carry symbol, timeframe, direction and
-    strategy-family tags. At state-build time direction and family may not yet
-    be known, but symbol and timeframe are. Matching either dimension with OR
-    leaks an ETH 1h outcome into BTC/SOL 1h decisions, so each declared market
-    dimension must match independently. Memories without market-dimensional
-    tags remain global (for example operational reconciliation lessons).
-    """
-
-    tags = set(memory.tags)
-    symbol_tags = {tag for tag in tags if "/" in tag}
-    timeframe_tags = {tag for tag in tags if tag in TIMEFRAME_SECONDS}
-    return (not symbol_tags or symbol in symbol_tags) and (
-        not timeframe_tags or timeframe in timeframe_tags
-    )
-
-
-async def settle_agent_shadow_trials(
-    *,
-    goal_id: str,
-    symbol: str,
-    timeframe: str,
-    candles: list[Candle],
-    as_of: datetime,
-) -> list[ShadowValidationTrial]:
-    """Advance pending counterfactuals without ever touching execution APIs."""
-
-    trials = await asyncio.to_thread(
-        agent_store.list_shadow_trials,
-        10000,
-        goal_id=goal_id,
-        symbol=symbol,
-        timeframe=timeframe,
-        terminal=False,
-    )
-    if not trials:
-        return []
-    configuration = configuration_service.current_configuration()
-    funding_rates: list[FundingRatePoint] = []
-    if configuration.market_type == "swap":
-        earliest = min(trial.decision_at for trial in trials)
-        with suppress(Exception):
-            funding_rates = await runtime.funding_history(
-                symbol,
-                earliest,
-                as_of,
-            )
-    updated: list[ShadowValidationTrial] = []
-    for trial in trials:
-        evaluation_as_of = min(as_of, trial.horizon_at)
-        trial.outcome = evaluate_shadow_plan(
-            trial.plan,
-            candles,
-            decision_at=trial.decision_at,
-            as_of=evaluation_as_of,
-            fee_bps=configuration.fee_bps,
-            slippage_bps=configuration.slippage_bps,
-            funding_rates=funding_rates,
-            force_close=as_of >= trial.horizon_at,
-        )
-        await asyncio.to_thread(agent_store.save_shadow_trial, trial)
-        updated.append(trial)
-    return updated
-
-
-def unified_research_strategy_library(family: str | None = None) -> dict:
-    """Return every public prior without pretending research-only specs are executable."""
-
-    normalized_family = family.strip().lower() if family else None
-    single_leg_families = {item.value for item in StrategyKind}
-    research_families = {"relative_value", "relative_momentum", "carry"}
-    if normalized_family not in {None, *single_leg_families, *research_families}:
-        raise ValueError(
-            "strategy family must be trend, mean_reversion, breakout, "
-            "relative_value, relative_momentum, or carry"
-        )
-    selected_single_family = (
-        StrategyKind(normalized_family) if normalized_family in single_leg_families else None
-    )
-    single_entries = (
-        list_strategy_library(selected_single_family)
-        if normalized_family is None or selected_single_family is not None
-        else []
-    )
-    pair_entries = []
-    if normalized_family in {None, "relative_value", "relative_momentum"}:
-        for spec in PAIR_STRATEGY_LIBRARY:
-            pair_family = (
-                "relative_momentum"
-                if spec.model == "relative_momentum_equal_dollar"
-                else "relative_value"
-            )
-            if normalized_family is not None and normalized_family != pair_family:
+        target_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+        cross_results: list[BacktestResult] = []
+        blocked_scopes: list[ReviewScopeResult] = []
+        for index, target_symbol in enumerate(target_symbols, start=1):
+            if target_symbol == context.symbol:
+                cross_results.append(origin_result)
                 continue
-            pair_entries.append(
-                {
-                    "id": pair_strategy_id(spec),
-                    "scope": "pair_research_only",
-                    "family": pair_family,
-                    "archetype": spec.model,
-                    "version": spec.version,
-                    "source_urls": [spec.source_url],
-                    "hypothesis": spec.hypothesis,
-                    "strategy_spec": spec.model_dump(mode="json"),
-                    "execution_eligible": False,
-                }
+            result, scope = await run_candidate_review_scope(
+                candidate,
+                symbol=target_symbol,
+                role="cross_market",
+                trial_count=job.trial_count,
             )
-    carry_entries = []
-    if normalized_family in {None, "carry"}:
-        carry_entries = [
-            {
-                "id": carry_strategy_id(spec),
-                "scope": "spot_perpetual_research_only",
-                "family": "carry",
-                "archetype": spec.model,
-                "version": spec.version,
-                "source_urls": [spec.source_url],
-                "hypothesis": spec.hypothesis,
-                "strategy_spec": spec.model_dump(mode="json"),
-                "execution_eligible": False,
-            }
-            for spec in CARRY_STRATEGY_LIBRARY
-        ]
-    single_payloads = [
-        {
-            **entry.model_dump(mode="json"),
-            "scope": "single_leg_executable_after_certification",
-        }
-        for entry in single_entries
-    ]
-    all_entries = [*single_payloads, *pair_entries, *carry_entries]
-    family_counts: dict[str, int] = {}
-    for entry in all_entries:
-        entry_family = str(entry["family"])
-        family_counts[entry_family] = family_counts.get(entry_family, 0) + 1
-    archetypes = sorted({str(entry["archetype"]) for entry in all_entries})
-    return {
-        "version": 3,
-        "non_empty": bool(all_entries),
-        "entry_count": len(all_entries),
-        "family_counts": family_counts,
-        "archetype_count": len(archetypes),
-        "archetypes": archetypes,
-        "counts": {
-            "single_leg": len(single_payloads),
-            "pair_research": len(pair_entries),
-            "carry_research": len(carry_entries),
-        },
-        "entries": all_entries,
-        "indicator_catalog": INDICATOR_CATALOG,
-        "profitability_claim": False,
-    }
-
-
-def causal_data_eligible_library_entries(
-    entries,
-    datasets: list[ResearchDataset],
-    features_by_dataset: dict[str, tuple[list, list, list, list, list, list]],
-) -> tuple[list[str], dict[str, str]]:
-    """Preselect hypotheses using causal data availability, never returns."""
-
-    selected: list[str] = []
-    excluded: dict[str, str] = {}
-    for entry in entries:
-        supported_markets = []
-        for dataset in datasets:
-            (
-                funding,
-                open_interest,
-                positioning,
-                basis,
-                order_flow,
-                liquidation_flow,
-            ) = features_by_dataset[dataset.id]
-            reasons = historical_feature_eligibility(
-                dataset=dataset,
-                required_data=entry.required_data,
-                funding=funding,
-                open_interest=open_interest,
-                positioning=positioning,
-                basis=basis,
-                order_flow=order_flow,
-                liquidation_flow=liquidation_flow,
-            )
-            if not reasons:
-                supported_markets.append(dataset)
-        unique_exchanges = {item.exchange for item in supported_markets}
-        unique_symbols = {item.symbol for item in supported_markets}
-        if len(supported_markets) >= 3 and len(unique_exchanges) >= 2 and len(unique_symbols) >= 3:
-            selected.append(entry.id)
-        else:
-            excluded[entry.id] = (
-                f"causal feature coverage supports {len(supported_markets)} markets, "
-                f"{len(unique_exchanges)} exchanges and {len(unique_symbols)} symbols"
-            )
-    return selected, excluded
-
-
-def build_agent_coordinator(goal: AgentGoal, policy: AgentPolicy) -> AgentCoordinator:
-    ai_gateway.service = ai_configuration_service
-    ai_gateway.proxy_url = configuration_service.current_configuration().network_proxy_url
-    registry = build_core_tool_registry(runtime, risk_state_service, agent_store)
-
-    async def build_state(selected_goal: AgentGoal, event: AgentEvent, run: AgentRun) -> AgentState:
-        symbol = str(event.payload.get("symbol") or selected_goal.symbols[0])
-        timeframe = str(event.payload.get("timeframe") or selected_goal.timeframes[0])
-        market, candles = await runtime.market_context(
-            limit=120, symbol=symbol, timeframe=timeframe
-        )
-        await settle_agent_shadow_trials(
-            goal_id=selected_goal.id,
-            symbol=symbol,
-            timeframe=timeframe,
-            candles=candles,
-            as_of=datetime.now(UTC),
-        )
-        portfolio = await runtime.portfolio()
-        assert runtime.execution is not None
-        open_orders = await runtime.execution.open_orders()
-        active_episodes = [
-            episode
-            for episode in await asyncio.to_thread(
-                agent_store.list_episodes,
-                500,
-            )
-            if episode.goal_id == selected_goal.id
-            and episode.status
-            in {
-                TradeEpisodeStatus.RESERVED,
-                TradeEpisodeStatus.PENDING_ENTRY,
-                TradeEpisodeStatus.OPEN,
-                TradeEpisodeStatus.UNCERTAIN,
-                TradeEpisodeStatus.AWAITING_REVIEW,
-            }
-        ]
-        memories = await asyncio.to_thread(agent_store.recent_memories, 50)
-        relevant_memories = [
-            memory
-            for memory in memories
-            if memory_relevant_to_market(
-                memory,
-                symbol=symbol,
-                timeframe=timeframe,
-            )
-        ][:10]
-        return AgentState(
-            goal_id=selected_goal.id,
-            run_id=run.id,
-            phase="observing",
-            market=build_agent_market_state(
-                market,
-                candles,
-                symbol=symbol,
-                timeframe=timeframe,
-                trigger=event,
-            ),
-            portfolio=portfolio.model_dump(mode="json"),
-            risk=risk_state_service.get().model_dump(mode="json"),
-            grant=policy.model_dump(mode="json"),
-            open_order_ids=[order.id for order in open_orders],
-            position_symbols=[position.symbol for position in portfolio.open_positions],
-            active_episodes=[
-                {
-                    "episode_id": episode.id,
-                    "plan_id": episode.plan_id,
-                    "symbol": episode.symbol,
-                    "side": episode.side,
-                    "status": str(episode.status),
-                    "planned_risk": str(episode.planned_risk),
-                }
-                for episode in active_episodes
-            ],
-            memories=[
-                {
-                    "id": memory.id,
-                    "type": str(memory.memory_type),
-                    "content": memory.content,
-                    "tags": memory.tags,
-                    "confidence": str(memory.confidence),
-                    "evidence_refs": memory.evidence_refs,
-                }
-                for memory in relevant_memories
-            ],
-            memory_refs=[memory.id for memory in relevant_memories],
-        )
-
-    def owned_plan(
-        plan_id: str,
-        *,
-        require_current_policy: bool = True,
-    ) -> StrategyPlan:
-        plan = plans.get(plan_id)
-        if not plan:
-            raise LookupError("Agent trade plan not found")
-        if plan.decision_origin != "agent" or plan.agent_goal_id != goal.id:
-            raise PermissionError("trade plan does not belong to this Agent goal")
-        if require_current_policy and (
-            plan.agent_policy_id != policy.id or plan.agent_policy_fingerprint != policy.fingerprint
-        ):
-            raise PermissionError("trade plan is not bound to the current Agent policy")
-        return plan
-
-    async def episode_execution_evidence(
-        plan: StrategyPlan, episode: TradeEpisode
-    ) -> tuple[list[Order], list[Fill]]:
-        return await collect_agent_episode_evidence(plan, episode)
-
-    async def assess_owned_position(
-        plan_id: str,
-        symbol: str,
-    ) -> dict:
-        plan = owned_plan(plan_id, require_current_policy=False)
-        if symbol != plan.symbol:
-            raise ValueError("position assessment symbol does not match the owned plan")
-        episode = next(
-            (
-                item
-                for item in agent_store.list_episodes(500)
-                if item.goal_id == goal.id
-                and item.plan_id == plan.id
-                and item.status == TradeEpisodeStatus.OPEN
-            ),
-            None,
-        )
-        if not episode:
-            return {
-                "recommendation": "wait",
-                "reason": "计划当前没有开放交易回合，不执行持仓动作",
-                "execution_arguments": {},
-            }
-        (market, history), portfolio = await asyncio.gather(
-            runtime.market_context(
-                limit=300,
-                symbol=plan.symbol,
-                timeframe=plan.timeframe,
-            ),
-            runtime.portfolio(),
-        )
-        entry_orders, plan_fills = await episode_execution_evidence(plan, episode)
-        entry_side = OrderSide.BUY if plan.side == Side.LONG else OrderSide.SELL
-        entered = sum(
-            (fill.quantity for fill in plan_fills if fill.side == entry_side),
-            Decimal("0"),
-        )
-        entry_fills = [fill for fill in plan_fills if fill.side == entry_side and fill.quantity > 0]
-        entry_time = min(
-            (fill.timestamp for fill in entry_fills),
-            default=episode.opened_at,
-        )
-        average_entry = (
-            sum((fill.price * fill.quantity for fill in entry_fills), Decimal("0")) / entered
-            if entered > 0
-            else (plan.entry.zone.lower + plan.entry.zone.upper) / Decimal("2")
-        )
-        exited = sum(
-            (fill.quantity for fill in plan_fills if fill.side != entry_side),
-            Decimal("0"),
-        )
-        attributable = max(entered - exited, Decimal("0"))
-        position = next(
-            (
-                item
-                for item in portfolio.open_positions
-                if item.symbol == plan.symbol and item.side == plan.side
-            ),
-            None,
-        )
-        aligned_quantity = position.quantity if position else Decimal("0")
-        expected = min(attributable, aligned_quantity)
-        protected = bool(
-            expected > 0
-            and await runtime.execution.verify_position_protection(
-                plan,
-                entry_orders,
-                expected,
-            )
-        )
-        signal = evaluate_current_plan_signal(plan, history, market)
-        opposite_signal = bool(signal.actionable and str(signal.direction) != str(plan.side))
-        stop_breached = (plan.side == Side.LONG and market.last <= plan.exit.stop_loss) or (
-            plan.side == Side.SHORT and market.last >= plan.exit.stop_loss
-        )
-        trailing = agent_trailing_state(
-            plan,
-            history,
-            market.timestamp,
-            market.last,
-            entry_time,
-            average_entry,
-        )
-        time_exit = agent_time_exit_state(
-            plan,
-            history,
-            market.timestamp,
-            entry_time,
-        )
-        if (
-            attributable <= 0
-            or aligned_quantity <= 0
-            or attributable != aligned_quantity
-            or not protected
-        ):
-            recommendation = "halt"
-            reason = "Agent 归因仓位、交易所净仓位或原生保护覆盖不一致，禁止继续自主增加风险"
-            execution_arguments = {"reason": reason}
-        elif opposite_signal or stop_breached or trailing["breached"] or time_exit["due"]:
-            recommendation = "exit"
-            if opposite_signal:
-                reason = "最新已收盘策略信号形成明确反向证据"
-            elif stop_breached:
-                reason = "市场价格已越过计划止损但仓位仍存在，执行防御性退出"
-            elif trailing["breached"]:
-                reason = "追踪止损已在声明的激活条件满足后触发，退出剩余仓位"
+            job.scope_results.append(scope)
+            job.evidence_refs.extend(scope.evidence_refs)
+            if result is None:
+                blocked_scopes.append(scope)
             else:
-                reason = "已达到策略声明的最大持仓 K 线数，退出剩余仓位"
-            execution_arguments = {
-                "plan_id": plan.id,
-                "symbol": plan.symbol,
-            }
-        else:
-            recommendation = "hold"
-            reason = "仓位归因与原生保护一致，最新已收盘信号未形成反向证据"
-            execution_arguments = {}
-        return {
-            "episode_id": episode.id,
-            "plan_id": plan.id,
-            "symbol": plan.symbol,
-            "recommendation": recommendation,
-            "reason": reason,
-            "execution_arguments": execution_arguments,
-            "position": (position.model_dump(mode="json") if position else None),
-            "attributable_quantity": str(attributable),
-            "protection_verified": protected,
-            "stop_breached": stop_breached,
-            "trailing": trailing,
-            "time_exit": time_exit,
-            "signal": signal.model_dump(mode="json"),
-            "market": {
-                "last": str(market.last),
-                "timestamp": market.timestamp.isoformat(),
-                "funding_rate": (
-                    str(market.funding_rate) if market.funding_rate is not None else None
-                ),
-            },
-        }
+                cross_results.append(result)
+            job.progress_percent = min(90, 45 + index * 15)
+            job.updated_at = datetime.now(UTC)
+            await asyncio.to_thread(store.save_strategy_review_job, job)
 
-    async def matching_champion(
-        strategy_kind: str,
-        symbol: str,
-        timeframe: str,
-    ) -> StrategyCandidate | None:
-        candidate_payloads = await asyncio.to_thread(
-            store.list_strategy_candidates,
-            200,
-        )
-        for payload in candidate_payloads:
-            candidate = parse_strategy_candidate_payload(
-                payload,
-                audit_context="agent_matching_champion",
-            )
-            if candidate is None:
-                continue
-            if (
-                candidate.status != CandidateStatus.CHAMPION
-                or candidate.spec.get("family") != strategy_kind
-                or not candidate.dataset_id
-            ):
-                continue
-            dataset_payload = await asyncio.to_thread(
-                store.load_research_dataset,
-                candidate.dataset_id,
-            )
-            if not dataset_payload:
-                continue
-            dataset = ResearchDataset.model_validate(dataset_payload)
-            if dataset.symbol == symbol and dataset.timeframe == timeframe:
-                return candidate
-        return None
+        if blocked_scopes:
+            job.status = StrategyReviewJobStatus.BLOCKED
+            job.stage = "data_required"
+            job.error = "；".join(scope.reasons[0] for scope in blocked_scopes)
+            job.rejection_reasons = [reason for scope in blocked_scopes for reason in scope.reasons]
+            job.updated_at = datetime.now(UTC)
+            await asyncio.to_thread(store.save_strategy_review_job, job)
+            return job
 
-    async def _build_trade_plan(
-        prompt: str,
-        strategy_kind: str,
-        symbol: str,
-        timeframe: str,
-        risk_fraction: str | None = None,
-        adaptive_candidate: AdaptiveStrategyCandidate | None = None,
-        *,
-        _agent_run_id: str,
-    ) -> StrategyPlan:
-        if symbol not in goal.symbols or timeframe not in goal.timeframes:
-            raise PermissionError("requested market is outside the Agent goal")
-        selected_champion = (
-            None
-            if adaptive_candidate is not None
-            else await matching_champion(strategy_kind, symbol, timeframe)
+        validation = configuration_service.current_configuration().strategy.validation
+        cross_passed, cross_metrics, cross_reasons = cross_market_review_passed(
+            cross_results,
+            minimum_passes=validation.cross_market_minimum_passes,
+            minimum_profit_factor=validation.minimum_profit_factor,
+            maximum_drawdown_percent=validation.maximum_drawdown_percent,
         )
-        plan = await generate_strategy(
-            GenerateRequest(
-                symbol=symbol,
-                timeframe=timeframe,
-                risk_fraction=(
-                    Decimal(risk_fraction)
-                    if risk_fraction
-                    else policy.max_risk_per_trade
-                    if policy.allow_agent_entry
-                    else None
-                ),
-                prompt=prompt,
-                strategy_kind=StrategyKind(strategy_kind),
-                strategy_spec=(
-                    adaptive_candidate.spec
-                    if adaptive_candidate is not None
-                    else selected_champion.spec
-                    if selected_champion
-                    else None
-                ),
-                research_candidate_id=(selected_champion.id if selected_champion else None),
-            )
-        )
-        plan.decision_origin = "agent"
-        plan.agent_goal_id = goal.id
-        plan.agent_run_id = _agent_run_id
-        plan.agent_policy_id = policy.id
-        plan.agent_policy_fingerprint = policy.fingerprint
-        if selected_champion:
-            plan.reasons.append(
-                "采用同品种、同周期研究 Champion "
-                f"{selected_champion.id} 的不可变 StrategySpec；"
-                "该计划仍必须重新通过最新数据回测"
-            )
-        if adaptive_candidate is not None:
-            plan.reasons.extend(
-                [
-                    f"当前市场自适应规格：{adaptive_candidate.label}；"
-                    "selection_basis=current_market_only，backtest_tuned=false",
-                    *adaptive_candidate.rationale,
-                ]
-            )
-        store.save_strategy(plan)
-        audit_data = {
-            "goal_id": goal.id,
-            "run_id": _agent_run_id,
-            "plan_id": plan.id,
-        }
-        if selected_champion:
-            audit_data["research_champion_id"] = selected_champion.id
-        if adaptive_candidate is not None:
-            audit_data.update(
-                {
-                    "adaptive_label": adaptive_candidate.label,
-                    "adaptive_spec_fingerprint": (adaptive_candidate.spec_fingerprint),
-                }
-            )
-        add_audit(
-            "agent",
-            "Agent 已生成绑定权限指纹的确定性交易计划",
-            **audit_data,
-        )
-        return plan
-
-    async def build_trade_plan(
-        prompt: str,
-        strategy_kind: str,
-        symbol: str,
-        timeframe: str,
-        risk_fraction: str | None = None,
-        *,
-        _agent_run_id: str,
-        _agent_tool_call_id: str,
-    ) -> dict:
-        del _agent_tool_call_id
-        plan = await _build_trade_plan(
-            prompt=prompt,
-            strategy_kind=strategy_kind,
-            symbol=symbol,
-            timeframe=timeframe,
-            risk_fraction=risk_fraction,
-            _agent_run_id=_agent_run_id,
-        )
-        return plan.model_dump(mode="json")
-
-    async def run_plan_backtest(plan_id: str) -> dict:
-        owned_plan(plan_id)
-        result = await backtest_strategy(plan_id)
-        return result.model_dump(mode="json")
-
-    async def screen_trade_candidates(
-        symbol: str,
-        timeframe: str,
-        prompt: str = "",
-        risk_fraction: str | None = None,
-        *,
-        _agent_run_id: str,
-        _agent_tool_call_id: str,
-    ) -> dict:
-        del _agent_tool_call_id
-        if symbol not in goal.symbols or timeframe not in goal.timeframes:
-            raise PermissionError("requested market is outside the Agent goal")
-        analysis_tool = registry.get("analyze_market_regime")
-        analysis = await analysis_tool.handler(symbol=symbol, timeframe=timeframe)
-        recommendation = analysis["recommendation"]
-        actionable, candidate_pool = stratified_actionable_candidates(
-            analysis["actionable_candidates"],
-            max_total=9,
-            max_per_family=4,
-        )
-        execution_context_eligible = recommendation["action"] == "consider_plan"
-        data_quality_acceptable = bool(recommendation.get("data_quality_acceptable"))
-        if not actionable or not data_quality_acceptable:
-            wait_category = (
-                "market_data_unavailable" if not data_quality_acceptable else "no_actionable_signal"
-            )
-            return {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "selection_status": "wait",
-                "wait_category": wait_category,
-                "blocking_layer": (
-                    "market_data" if wait_category == "market_data_unavailable" else "signal"
-                ),
-                "selected_plan_id": None,
-                "reason": recommendation["reason"],
-                "market_evidence": {
-                    "assessment": analysis["assessment"],
-                    "confirmation": analysis["confirmation"],
-                    "recommendation": recommendation,
-                    "actionable_candidates": actionable,
-                    "candidate_pool": candidate_pool,
-                    "execution_context": {
-                        "eligible": False,
-                        "role": "execution_gate_not_research_gate",
-                        "blocking_reason": recommendation["reason"],
-                    },
-                },
-                "candidates": [],
-            }
-
-        screened: list[dict] = []
-        failures: list[dict] = []
-        base_prompt = prompt.strip() or (
-            "依据当前已收盘行情与多周期确定性证据生成计划；不追价，证据退化时保持等待。"
-        )
-        assessment = MarketStateAssessment.model_validate(analysis["assessment"])
-        market_evidence = MarketEvidenceSnapshot.model_validate(analysis["market_evidence"])
-        current_available_data = {"ohlcv"}
-        if market_evidence.funding_rate is not None:
-            current_available_data.add("funding_rate")
-        if (
-            market_evidence.open_interest is not None
-            or market_evidence.open_interest_value is not None
-        ):
-            current_available_data.add("open_interest")
-        if market_evidence.long_short_ratio is not None:
-            current_available_data.add("positioning")
-        if market_evidence.basis_rate is not None:
-            current_available_data.add("basis")
-        requested_risk_fraction = (
-            Decimal(risk_fraction) if risk_fraction is not None else policy.max_risk_per_trade
-        )
-        if requested_risk_fraction <= 0:
-            raise ValueError("candidate risk fraction must be positive")
-        policy_capped_risk_fraction = min(
-            requested_risk_fraction,
-            policy.max_risk_per_trade,
-        )
-        execution_risk_multiplier = Decimal(
-            str(recommendation.get("execution_risk_multiplier") or "1")
-        )
-        # A hard execution conflict may still be researched, but cannot be
-        # executed. A soft single-source headwind produces a smaller plan
-        # rather than an arbitrary rejection.
-        planning_risk_multiplier = (
-            execution_risk_multiplier
-            if execution_context_eligible and execution_risk_multiplier > 0
-            else Decimal("1")
-        )
-        effective_risk_fraction = policy_capped_risk_fraction * planning_risk_multiplier
-        risk_adjustment = {
-            "requested_risk_fraction": requested_risk_fraction,
-            "policy_max_risk_fraction": policy.max_risk_per_trade,
-            "policy_cap_applied": (requested_risk_fraction > policy.max_risk_per_trade),
-            "execution_context_class": recommendation.get(
-                "execution_context_class",
-                "aligned_or_neutral",
-            ),
-            "execution_risk_multiplier": execution_risk_multiplier,
-            "effective_risk_fraction": effective_risk_fraction,
-            "reason": recommendation.get("execution_context_reason", ""),
-        }
-        proposal_inputs: list[tuple[dict, AdaptiveStrategyCandidate | None, dict]] = []
-        seen_specs: set[tuple[str, str]] = set()
-        champion_families: set[str] = set()
-        for signal in sorted(
-            actionable,
-            key=lambda item: Decimal(str(item.get("confidence") or "0")),
-            reverse=True,
-        ):
-            strategy_kind = StrategyKind(str(signal["strategy_kind"]))
-            if strategy_kind.value not in champion_families:
-                champion = await matching_champion(
-                    strategy_kind.value,
-                    symbol,
-                    timeframe,
-                )
-                champion_families.add(strategy_kind.value)
-            else:
-                champion = None
-            if (
-                champion is not None
-                and (
-                    strategy_kind.value,
-                    champion.spec_fingerprint,
-                )
-                not in seen_specs
-            ):
-                proposal_inputs.append(
-                    (
-                        signal,
-                        None,
-                        {
-                            "label": "champion",
-                            "selection_basis": "validated_research_champion",
-                            "backtest_tuned": False,
-                            "rationale": [
-                                f"使用已编译 Champion {champion.id} 作为基准",
-                                "仍须使用最新行情重新通过完整回测",
-                            ],
-                            "spec_fingerprint": champion.spec_fingerprint,
-                        },
-                    )
-                )
-                seen_specs.add((strategy_kind.value, champion.spec_fingerprint))
-            ranked_library_templates = rank_strategy_library(
-                list_strategy_library(strategy_kind),
-                assessment,
-                current_available_data,
-            )
-            for library_template, regime_fit in ranked_library_templates[:4]:
-                library_spec = library_template.validated_spec
-                library_identity = (
-                    strategy_kind.value,
-                    library_spec.fingerprint,
-                )
-                if library_identity in seen_specs:
-                    continue
-                library_candidate = AdaptiveStrategyCandidate(
-                    label="published_library",
-                    selection_basis="public_strategy_prior",
-                    backtest_tuned=False,
-                    rationale=[
-                        f"公开策略库模板：{library_template.name}",
-                        f"来源：{library_template.origin}",
-                        f"参考：{library_template.source_url}",
-                        "公开规则仅作为先验假设，未读取本次回测结果",
+        job.metrics.update(cross_metrics)
+        job.progress_percent = 100
+        job.completed_at = datetime.now(UTC)
+        job.updated_at = job.completed_at
+        job.status = StrategyReviewJobStatus.ADMITTED
+        if cross_passed:
+            job.status = StrategyReviewJobStatus.ADMITTED
+            job.stage = "cross_market_admitted"
+            job.evidence_tier = "sandbox_canary"
+            candidate = candidate.model_copy(
+                deep=True,
+                update={
+                    "status": CandidateStatus.CHALLENGER,
+                    "decision_reasons": [
+                        *candidate.decision_reasons,
+                        "来源市场及跨市场净优势审核通过",
                     ],
-                    spec=library_template.spec,
-                    spec_fingerprint=library_spec.fingerprint,
-                )
-                proposal_inputs.append(
-                    (
-                        signal,
-                        library_candidate,
-                        {
-                            **library_candidate.model_dump(
-                                mode="json",
-                                exclude={"spec"},
-                            ),
-                            "library_entry_id": library_template.id,
-                            "library_name": library_template.name,
-                            "expected_profile": (library_template.expected_profile),
-                            "regime_fit": regime_fit,
-                        },
-                    )
-                )
-                seen_specs.add(library_identity)
-            raw_spec = signal.get("strategy_spec")
-            if raw_spec:
-                adaptive = [
-                    AdaptiveStrategyCandidate(
-                        label=str(signal.get("adaptive_label") or "adaptive"),
-                        selection_basis=str(signal.get("selection_basis") or "current_market_only"),
-                        backtest_tuned=bool(signal.get("backtest_tuned", False)),
-                        rationale=[str(item) for item in signal.get("rationale", [])],
-                        spec=raw_spec,
-                        spec_fingerprint=str(signal["spec_fingerprint"]),
-                    )
-                ]
-            else:
-                adaptive = build_adaptive_strategy_candidates(
-                    strategy_kind,
-                    assessment,
-                    market_evidence,
-                )
-            for candidate in adaptive:
-                identity = (
-                    strategy_kind.value,
-                    candidate.spec_fingerprint,
-                )
-                if identity in seen_specs:
-                    continue
-                seen_specs.add(identity)
-                proposal_inputs.append(
-                    (
-                        signal,
-                        candidate,
-                        candidate.model_dump(
-                            mode="json",
-                            exclude={"spec"},
-                        ),
-                    )
-                )
-        family_order = list(
-            dict.fromkeys(str(item[0]["strategy_kind"]) for item in proposal_inputs)
-        )
-        prioritized_inputs: list[tuple[dict, AdaptiveStrategyCandidate | None, dict]] = []
-        selected_input_ids: set[int] = set()
-        for preferred_label in (
-            "champion",
-            "published_library",
-            "baseline",
-            "cost_resilient",
-        ):
-            for family in family_order:
-                match = next(
-                    (
-                        item
-                        for item in proposal_inputs
-                        if id(item) not in selected_input_ids
-                        and str(item[0]["strategy_kind"]) == family
-                        and str(item[2].get("label")) == preferred_label
-                    ),
-                    None,
-                )
-                if match is None:
-                    continue
-                prioritized_inputs.append(match)
-                selected_input_ids.add(id(match))
-        prioritized_inputs.extend(
-            item for item in proposal_inputs if id(item) not in selected_input_ids
-        )
-        proposal_inputs = prioritized_inputs[:9]
-        historical_episodes = await asyncio.to_thread(
-            agent_store.list_episodes,
-            10000,
-        )
-
-        async def evaluate_proposal(
-            signal: dict,
-            adaptive_candidate: AdaptiveStrategyCandidate | None,
-            adaptation: dict,
-        ) -> tuple[str, dict]:
-            strategy_kind = str(signal["strategy_kind"])
-            plan: StrategyPlan | None = None
-            try:
-                plan = await _build_trade_plan(
-                    prompt=base_prompt,
-                    strategy_kind=strategy_kind,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    risk_fraction=str(effective_risk_fraction),
-                    adaptive_candidate=adaptive_candidate,
-                    _agent_run_id=_agent_run_id,
-                )
-                current_configuration = configuration_service.current_configuration()
-                portfolio_admission = admit_strategy_risk(
-                    family=plan.algorithm,
-                    symbol=plan.symbol,
-                    side=plan.side,
-                    strategy_fingerprint=plan.strategy_spec_fingerprint,
-                    requested_risk_fraction=plan.sizing.risk_fraction,
-                    active_plans=list(plans.values()),
-                    maximum_portfolio_risk=(current_configuration.risk.max_portfolio_risk),
-                )
-                if (
-                    portfolio_admission.allowed
-                    and portfolio_admission.admitted_risk_fraction < plan.sizing.risk_fraction
-                ):
-                    plan = rescale_plan_risk(
-                        plan,
-                        portfolio_admission.admitted_risk_fraction,
-                    )
-                    plans[plan.id] = plan
-                    store.save_strategy(plan)
-                result = await backtest_strategy(
-                    plan.id,
-                    research_trial_count=len(proposal_inputs),
-                )
-                validation = configuration_service.current_configuration().strategy.validation
-                probe_evidence = sandbox_probe_evidence(result, validation)
-                if (
-                    policy.autonomy_mode == AgentAutonomyMode.SANDBOX
-                    and not result.robustness_passed
-                    and probe_evidence["eligible"]
-                ):
-                    probe_cap = sandbox_probe_risk_cap(policy)
-                    if plan.sizing.risk_fraction > probe_cap:
-                        plan = rescale_plan_risk(plan, probe_cap)
-                        plans[plan.id] = plan
-                        store.save_strategy(plan)
-                        result = await backtest_strategy(
-                            plan.id,
-                            research_trial_count=len(proposal_inputs),
-                        )
-                        probe_evidence = sandbox_probe_evidence(
-                            result,
-                            validation,
-                        )
-                signal_confidence = Decimal(str(signal.get("confidence") or "0"))
-                regime_scores = analysis["assessment"].get("scores", {})
-                regime_score = Decimal(str(regime_scores.get(strategy_kind) or "0"))
-                forward_evidence = build_plan_forward_outcome_evidence(
-                    plan,
-                    historical_episodes,
-                    plans,
-                )
-                return (
-                    "screened",
-                    {
-                        "plan": plan,
-                        "signal": signal,
-                        "backtest": result,
-                        "adaptation": adaptation,
-                        "signal_confidence": signal_confidence,
-                        "regime_score": regime_score,
-                        "selection_score": candidate_selection_score(
-                            result,
-                            signal_confidence=signal_confidence,
-                            regime_score=regime_score,
-                            forward_expectancy_r=forward_evidence["expectancy_r"],
-                            forward_sample=forward_evidence["sample"],
-                        ),
-                        "forward_outcome_evidence": forward_evidence,
-                        "sandbox_probe_evidence": probe_evidence,
-                        "portfolio_admission": portfolio_admission,
-                    },
-                )
-            except Exception as exc:
-                archived_plan_ids = (
-                    archive_unselected_agent_candidate_plans([plan], None)
-                    if plan is not None
-                    else []
-                )
-                return (
-                    "failure",
-                    {
-                        "plan_id": plan.id if plan is not None else None,
-                        "plan_archived": bool(archived_plan_ids),
-                        "strategy_kind": strategy_kind,
-                        "adaptive_label": adaptation.get("label", "unknown"),
-                        "spec_fingerprint": adaptation.get(
-                            "spec_fingerprint",
-                            "",
-                        ),
-                        "signal": signal,
-                        "error": str(exc)[:500],
-                    },
-                )
-
-        evaluated = await asyncio.gather(
-            *(
-                evaluate_proposal(signal, adaptive_candidate, adaptation)
-                for signal, adaptive_candidate, adaptation in proposal_inputs
-            )
-        )
-        for kind, payload in evaluated:
-            if kind == "screened":
-                screened.append(payload)
-            else:
-                failures.append(payload)
-
-        parameter_reports: dict[str, dict] = {}
-        parameter_groups: dict[str, list[dict]] = {}
-        for item in screened:
-            plan = item["plan"]
-            group_key = f"{plan.algorithm}:{plan.side}"
-            parameter_groups.setdefault(group_key, []).append(item)
-        for group_key, items in parameter_groups.items():
-            fold_evidence = [
-                ParameterFoldEvidence(
-                    label=str(item["adaptation"].get("label") or "unknown"),
-                    spec_fingerprint=str(
-                        item["adaptation"].get("spec_fingerprint")
-                        or item["plan"].strategy_spec_fingerprint
-                        or ""
-                    ),
-                    windows=item["backtest"].temporal_stability.windows,
-                )
-                for item in items
-                if item["backtest"].temporal_stability is not None
-            ]
-            report = build_rolling_parameter_report(fold_evidence)
-            serialized_report = report.model_dump(mode="json")
-            parameter_reports[group_key] = serialized_report
-            for item in items:
-                item["parameter_walk_forward"] = serialized_report
-                item["backtest"] = item["backtest"].model_copy(
-                    update={
-                        "parameter_walk_forward": serialized_report,
-                    }
-                )
-                store.save_backtest(
-                    item["plan"].id,
-                    item["backtest"],
-                )
-
-        screened.sort(
-            key=lambda item: evidence_rank_key(
-                item["backtest"],
-                signal_confidence=item["signal_confidence"],
-                regime_score=item["regime_score"],
-                forward_expectancy_r=item["forward_outcome_evidence"]["expectancy_r"],
-                forward_sample=item["forward_outcome_evidence"]["sample"],
-            ),
-            reverse=True,
-        )
-        campaign_payloads = (
-            await asyncio.to_thread(store.list_research_campaigns, 100)
-            if policy.autonomy_mode in {AgentAutonomyMode.SANDBOX, AgentAutonomyMode.LIVE_CAPPED}
-            else []
-        )
-        current_policy_actionable_evidence = [
-            {
-                "library_entry_id": str(item["adaptation"]["library_entry_id"]),
-                "strategy_fingerprint": item["plan"].strategy_spec_fingerprint,
-                "side": str(item["plan"].side),
-                "confidence": str(item["plan"].confidence),
-                "signal_candle_at": item["plan"].signal_candle_at.isoformat(),
-                "data_as_of": item["plan"].data_as_of.isoformat(),
-            }
-            for item in screened
-            if item["adaptation"].get("library_entry_id")
-            and item["plan"].signal_candle_at is not None
-            and item["plan"].data_as_of is not None
-        ]
-        candidates: list[dict] = []
-        for rank, item in enumerate(screened, start=1):
-            plan = item["plan"]
-            result = item["backtest"]
-            parameter_report = item.get("parameter_walk_forward") or {}
-            robust_eligible = bool(
-                result.robustness_passed
-                and result.win_loss_quality_passed
-                and parameter_report.get("passed") is True
-            )
-            probe_evidence = item["sandbox_probe_evidence"]
-            sandbox_probe_eligible = bool(
-                policy.autonomy_mode == AgentAutonomyMode.SANDBOX
-                and not result.robustness_passed
-                and probe_evidence["eligible"]
-                and parameter_report.get("passed") is True
-                and plan.sizing.risk_fraction <= sandbox_probe_risk_cap(policy)
-            )
-            backtest_eligible = robust_eligible or sandbox_probe_eligible
-            evidence_tier = (
-                "robust"
-                if robust_eligible
-                else "sandbox_probe"
-                if sandbox_probe_eligible
-                else "insufficient"
-            )
-            selected_library_entry_id = item["adaptation"].get("library_entry_id")
-            matching_campaign = (
-                matching_execution_campaign(
-                    plan,
-                    campaign_payloads,
-                    require_plan_binding=False,
-                    causal_policy_assessment=(assessment if selected_library_entry_id else None),
-                    causal_policy_available_data=(
-                        current_available_data if selected_library_entry_id else None
-                    ),
-                    causal_policy_selected_library_entry_id=(
-                        str(selected_library_entry_id) if selected_library_entry_id else None
-                    ),
-                    causal_policy_actionable_evidence=(
-                        current_policy_actionable_evidence if selected_library_entry_id else None
-                    ),
-                )
-                if policy.autonomy_mode
-                in {AgentAutonomyMode.SANDBOX, AgentAutonomyMode.LIVE_CAPPED}
-                else None
-            )
-            if matching_campaign is not None:
-                certificate = matching_campaign.execution_certificate
-                assert certificate is not None
-                if selected_causal_policy_definition(matching_campaign) is not None:
-                    assert selected_library_entry_id
-                    selection_evidence = build_plan_causal_policy_selection_evidence(
-                        plan,
-                        matching_campaign,
-                        assessment=assessment,
-                        available_data=current_available_data,
-                        selected_library_entry_id=str(selected_library_entry_id),
-                        actionable_library_evidence=(current_policy_actionable_evidence),
-                    )
-                    plan.causal_policy_fingerprint = certificate.strategy_fingerprint
-                    plan.causal_policy_selected_library_entry_id = str(selected_library_entry_id)
-                    plan.causal_policy_selection_evidence = selection_evidence
-                plan.research_campaign_id = matching_campaign.id
-                plan.campaign_certificate_fingerprint = certificate.fingerprint
-                store.save_strategy(plan)
-                evidence_tier = "campaign_certified"
-            campaign_certified = bool(
-                policy.autonomy_mode == AgentAutonomyMode.PAPER or matching_campaign is not None
-            )
-            strategy_admitted = (
-                backtest_eligible
-                if policy.autonomy_mode == AgentAutonomyMode.PAPER
-                else campaign_certified
-            )
-            execution_eligible = bool(
-                strategy_admitted and execution_context_eligible and policy.allow_agent_entry
-            )
-            execution_eligible = bool(execution_eligible and item["portfolio_admission"].allowed)
-            stress_return = (
-                result.stress_return_percent if result.stress_return_percent is not None else "N/A"
-            )
-            candidates.append(
-                {
-                    "rank": rank,
-                    "plan_id": plan.id,
-                    "strategy_kind": plan.algorithm,
-                    "side": str(plan.side),
-                    "confidence": plan.confidence,
-                    "backtest_eligible": backtest_eligible,
-                    "evidence_tier": evidence_tier,
-                    "sandbox_probe_eligible": sandbox_probe_eligible,
-                    "sandbox_probe_evidence": probe_evidence,
-                    "execution_eligible": execution_eligible,
-                    "execution_context_eligible": (execution_context_eligible),
-                    "campaign_certified": campaign_certified,
-                    "strategy_admitted": strategy_admitted,
-                    "risk_adjustment": risk_adjustment,
-                    "portfolio_admission": item["portfolio_admission"].model_dump(mode="json"),
-                    "execution_blocking_reasons": (
-                        ([] if execution_context_eligible else [recommendation["reason"]])
-                        + item["portfolio_admission"].hard_conflicts
-                    ),
-                    "authorization_arguments": {
-                        "plan_id": plan.id,
-                        "symbol": plan.symbol,
-                        "timeframe": plan.timeframe,
-                        "risk_fraction": plan.sizing.risk_fraction,
-                        "leverage": plan.leverage,
-                        "protected": True,
-                    },
-                    "screening_summary": (
-                        f"排名 {rank}/{len(screened)}；"
-                        f"稳健性={'通过' if result.robustness_passed else '未通过'}，"
-                        f"证据层级={evidence_tier}，"
-                        f"PF {result.profit_factor:f}，压力收益 {stress_return}%，"
-                        f"综合排序 {item['selection_score']['total']}/100；"
-                        f"执行上下文="
-                        f"{'允许' if execution_context_eligible else '等待'}"
-                    ),
-                    "adaptation": item["adaptation"],
-                    "strategy_spec_fingerprint": (plan.strategy_spec_fingerprint),
-                    "strategy_parameters": (
-                        plan.strategy_spec.get("parameters", {}) if plan.strategy_spec else {}
-                    ),
-                    "parameter_walk_forward": item.get("parameter_walk_forward"),
-                    "selection_score": item["selection_score"],
-                    "forward_outcome_evidence": item["forward_outcome_evidence"],
-                    "entry": plan.entry.model_dump(mode="json"),
-                    "sizing": plan.sizing.model_dump(mode="json"),
-                    "signal": item["signal"],
-                    "backtest": evidence_summary(result),
-                }
-            )
-        selected = next(
-            (item for item in candidates if item["execution_eligible"]),
-            None,
-        )
-        best_research_candidate = next(
-            (item for item in candidates if item["backtest_eligible"]),
-            None,
-        )
-        decision_at = datetime.now(UTC)
-        decision_batch_id = f"{_agent_run_id}:{symbol}:{timeframe}:candidate-screen"
-        shadow_trials: list[ShadowValidationTrial] = []
-        for item in screened:
-            plan = item["plan"]
-            candidate = next(
-                candidate for candidate in candidates if candidate["plan_id"] == plan.id
-            )
-            trial = ShadowValidationTrial(
-                id=f"shadow_{plan.id}",
-                goal_id=goal.id,
-                run_id=_agent_run_id,
-                decision_batch_id=decision_batch_id,
-                plan=plan.model_copy(deep=True),
-                decision_at=decision_at,
-                horizon_at=decision_at + timeframe_delta(timeframe, 48),
-                selected_for_execution=bool(selected and selected["plan_id"] == plan.id),
-                execution_eligible=bool(candidate["execution_eligible"]),
-                screening_rank=int(candidate["rank"]),
-                screening_summary=str(candidate["screening_summary"]),
-                selection_score=dict(candidate["selection_score"]),
-                adaptation_evidence=dict(candidate["adaptation"]),
-                signal_evidence=dict(candidate["signal"]),
-                backtest_evidence=dict(candidate["backtest"]),
-                outcome=ShadowPlanOutcome(
-                    status=ShadowOutcomeStatus.PENDING_ENTRY,
-                    plan_id=plan.id,
-                    symbol=plan.symbol,
-                    timeframe=plan.timeframe,
-                    side=plan.side,
-                    decision_at=decision_at,
-                    original_quantity=plan.sizing.suggested_quantity,
-                ),
-            )
-            await asyncio.to_thread(agent_store.save_shadow_trial, trial)
-            shadow_trials.append(trial)
-        archived_candidate_plan_ids = archive_unselected_agent_candidate_plans(
-            [item["plan"] for item in screened],
-            selected["plan_id"] if selected else None,
-        )
-        selection_status = (
-            (
-                "sandbox_probe_candidate"
-                if selected["evidence_tier"] == "sandbox_probe"
-                else "robust_candidate"
-            )
-            if selected
-            else "context_wait"
-            if best_research_candidate and not execution_context_eligible
-            else "evidence_unavailable"
-            if not candidates and failures
-            else "wait"
-        )
-        wait_category = (
-            None
-            if selected
-            else "execution_context_wait"
-            if selection_status == "context_wait"
-            else "external_evidence_unavailable"
-            if selection_status == "evidence_unavailable"
-            else "backtest_evidence_insufficient"
-        )
-        blocking_layer = (
-            None
-            if selected
-            else "execution_context"
-            if selection_status == "context_wait"
-            else "external"
-            if selection_status == "evidence_unavailable"
-            else "evidence"
-        )
-        reason = (
-            "同一市场时点的多策略与受约束参数候选已完成公平筛选；"
-            + (
-                "排名首位候选通过测试网低风险前向证据层，仅以缩小后的风险收集真实成交样本"
-                if selected and selected["evidence_tier"] == "sandbox_probe"
-                else "排名首位且通过全部稳健性门槛"
-            )
-            if selected
-            else (
-                "候选已完成回测研究且存在稳健证据，但当前执行上下文不允许入场："
-                f"{recommendation['reason']}"
-                if selection_status == "context_wait"
-                else (
-                    "交易所或账户证据不可用，候选计划未能完成生成和回测，保持等待"
-                    if selection_status == "evidence_unavailable"
-                    else (
-                        "当前存在方向信号，但所有受约束参数候选均未通过完整样本、"
-                        "时间稳定性、近期窗口与成本压力证据，保持等待"
-                    )
-                )
-            )
-        )
-        add_audit(
-            "agent",
-            "Agent 已完成同市场多策略候选证据筛选",
-            goal_id=goal.id,
-            run_id=_agent_run_id,
-            symbol=symbol,
-            timeframe=timeframe,
-            screened=len(candidates),
-            parameter_hypotheses=len(proposal_inputs),
-            actionable_input_count=candidate_pool["input_count"],
-            actionable_selected_count=candidate_pool["selected_count"],
-            actionable_selected_family_counts=json.dumps(
-                candidate_pool["selected_family_counts"],
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-            archived_candidate_plans=len(archived_candidate_plan_ids),
-            selected_plan_id=selected["plan_id"] if selected else "",
-            failed_families=len(failures),
-            shadow_trials=len(shadow_trials),
-            shadow_batch_id=decision_batch_id,
-            execution_context_eligible=execution_context_eligible,
-            best_research_plan_id=(
-                best_research_candidate["plan_id"] if best_research_candidate else ""
-            ),
-        )
-        campaign_scope = await latest_sealed_campaign_scope()
-        suggested_library_entry_ids = list(
-            dict.fromkeys(
-                str(item["adaptation"].get("library_entry_id"))
-                for item in candidates
-                if item["adaptation"].get("library_entry_id")
-            )
-        )[:12]
-        return {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "selection_status": selection_status,
-            "wait_category": wait_category,
-            "blocking_layer": blocking_layer,
-            "selected_plan_id": selected["plan_id"] if selected else None,
-            "best_research_plan_id": (
-                best_research_candidate["plan_id"] if best_research_candidate else None
-            ),
-            "reason": reason,
-            "market_evidence": {
-                "assessment": analysis["assessment"],
-                "confirmation": analysis["confirmation"],
-                "recommendation": recommendation,
-                "actionable_candidates": actionable,
-                "candidate_pool": candidate_pool,
-                "execution_context": {
-                    "eligible": execution_context_eligible,
-                    "role": "execution_gate_not_research_gate",
-                    "risk_adjustment": risk_adjustment,
-                    "blocking_reason": (
-                        None if execution_context_eligible else recommendation["reason"]
-                    ),
+                    "updated_at": datetime.now(UTC),
                 },
-            },
-            "candidates": candidates,
-            "parameter_walk_forward": parameter_reports,
-            "generation_failures": failures,
-            "archived_candidate_plan_ids": archived_candidate_plan_ids,
-            "shadow_validation": {
-                "batch_id": decision_batch_id,
-                "trial_count": len(shadow_trials),
-                "horizon_bars": 48,
-                "causal": True,
-                "executable": False,
-            },
-            "campaign_scope": campaign_scope,
-            "suggested_library_entry_ids": suggested_library_entry_ids,
-            "next_action": (
-                "call execute_validated_trade_plan with selected_authorization exactly"
-                if selected and policy.allow_agent_entry
-                else "wait"
-            ),
-            "selected_authorization": (selected["authorization_arguments"] if selected else None),
-        }
-
-    async def authorize_trade_plan(
-        plan_id: str,
-        symbol: str,
-        timeframe: str,
-        risk_fraction: str,
-        leverage: str,
-        protected: bool,
-    ) -> dict:
-        plan = owned_plan(plan_id)
-        validate_plan_research_provenance(plan)
-        if not policy.allow_agent_entry:
-            raise PermissionError("Agent entry permission is disabled")
-        if not protected or not policy.require_native_protection:
-            raise PermissionError("Agent plans require native exchange protection")
-        if symbol != plan.symbol or timeframe != plan.timeframe:
-            raise ValueError("authorization arguments do not match the trade plan")
-        if Decimal(risk_fraction) != plan.sizing.risk_fraction:
-            raise ValueError("authorization risk does not match the trade plan")
-        if Decimal(leverage) != plan.leverage:
-            raise ValueError("authorization leverage does not match the trade plan")
-        artifact_data = store.load_latest_backtest(plan.id)
-        if not artifact_data:
-            raise RuntimeError("Agent plan has no bound backtest artifact")
-        artifact = BacktestResult.model_validate(artifact_data)
-        if artifact.strategy_fingerprint != plan.fingerprint:
-            raise RuntimeError("Agent plan changed after its latest backtest")
-        if artifact.cost_model.get("direction_filter") != str(plan.side):
-            raise RuntimeError("Agent plan backtest is not bound to the plan trade direction")
-        if artifact.integrity_checks.get("immutable_dataset_binding") is not True:
-            raise RuntimeError(
-                "Agent plan backtest predates immutable integrity admission; rerun it"
             )
-        matching_campaign = None
-        if policy.autonomy_mode in {
-            AgentAutonomyMode.SANDBOX,
-            AgentAutonomyMode.LIVE_CAPPED,
-        }:
-            campaign_payloads = await asyncio.to_thread(
-                store.list_research_campaigns,
-                50,
-            )
-            matching_campaign = matching_execution_campaign(
-                plan,
-                campaign_payloads,
-            )
-            if matching_campaign is None:
-                raise RuntimeError(
-                    "exchange Agent execution requires an exact-spec immutable Campaign "
-                    "certificate that passes cumulative multiple-testing correction, "
-                    "cross-market validation, PBO and the single-use blind holdout"
-                )
+            await asyncio.to_thread(store.save_strategy_candidate, candidate)
         else:
-            if not artifact.robustness_passed or not artifact.win_loss_quality_passed:
-                raise RuntimeError(
-                    "paper Agent plan lacks robust combined win-rate and payoff evidence"
-                )
-            if not (
-                artifact.parameter_walk_forward
-                and artifact.parameter_walk_forward.get("passed") is True
-            ):
-                raise RuntimeError(
-                    "paper Agent execution requires a passed prior-fold "
-                    "parameter walk-forward report"
-                )
-        current_configuration = configuration_service.current_configuration()
-        portfolio_admission = admit_strategy_risk(
-            family=plan.algorithm,
-            symbol=plan.symbol,
-            side=plan.side,
-            strategy_fingerprint=plan.strategy_spec_fingerprint,
-            requested_risk_fraction=plan.sizing.risk_fraction,
-            active_plans=list(plans.values()),
-            maximum_portfolio_risk=(current_configuration.risk.max_portfolio_risk),
+            job.stage = "cross_market_hold"
+            job.evidence_tier = "paper_eligible"
+            job.rejection_reasons = cross_reasons
+    except asyncio.CancelledError:
+        job.status = StrategyReviewJobStatus.QUEUED
+        job.stage = "queued"
+        job.error = "审核进程重启，作业已安全回队"
+        job.updated_at = datetime.now(UTC)
+        await asyncio.to_thread(store.save_strategy_review_job, job)
+        raise
+    except Exception as exc:
+        job.status = StrategyReviewJobStatus.BLOCKED
+        job.stage = "infrastructure_blocked"
+        job.error = review_failure_detail(exc)
+        job.updated_at = datetime.now(UTC)
+        logger.exception(
+            "strategy review job %s blocked at stage %s",
+            job.id,
+            job.stage,
         )
-        if (
-            not portfolio_admission.allowed
-            or portfolio_admission.admitted_risk_fraction < plan.sizing.risk_fraction
-        ):
-            raise RuntimeError(
-                "strategy portfolio changed after screening; rerun candidate "
-                f"selection: {portfolio_admission.model_dump(mode='json')}"
-            )
-        plan.approved_at = datetime.now(UTC)
-        plan.approved_fingerprint = plan.fingerprint
-        plan.status = PlanStatus.APPROVED
-        store.save_strategy(plan)
-        add_audit(
-            "agent",
-            "Agent 计划通过不可变策略证书与当前执行上下文授权",
-            goal_id=goal.id,
-            plan_id=plan.id,
-            policy_fingerprint=policy.fingerprint,
-            evidence_tier=(
-                "campaign_certified" if matching_campaign is not None else "paper_robust"
-            ),
-            research_campaign_id=(matching_campaign.id if matching_campaign is not None else ""),
-        )
-        return plan.model_dump(mode="json")
+    await asyncio.to_thread(store.save_strategy_review_job, job)
+    return job
 
-    async def activate_trade_plan(
-        plan_id: str,
-        symbol: str,
-        timeframe: str,
-        risk_fraction: str,
-        leverage: str,
-        protected: bool,
-    ) -> dict:
-        plan = owned_plan(plan_id)
-        if (
-            symbol != plan.symbol
-            or timeframe != plan.timeframe
-            or Decimal(risk_fraction) != plan.sizing.risk_fraction
-            or Decimal(leverage) != plan.leverage
-            or not protected
-        ):
-            raise ValueError("activation arguments do not match the authorized plan")
-        activated = await activate_strategy(
-            plan.id, ActivateRequest(confirmation=f"ACTIVATE {plan.symbol}")
-        )
-        return activated.model_dump(mode="json")
 
-    async def submit_trade_plan(
-        plan_id: str,
-        symbol: str,
-        timeframe: str,
-        risk_fraction: str,
-        leverage: str,
-        protected: bool,
-        *,
-        _agent_run_id: str,
-        _agent_tool_call_id: str,
-    ) -> dict:
-        del _agent_tool_call_id
-        plan = owned_plan(plan_id)
-        if (
-            symbol != plan.symbol
-            or timeframe != plan.timeframe
-            or Decimal(risk_fraction) != plan.sizing.risk_fraction
-            or Decimal(leverage) != plan.leverage
-            or not protected
-        ):
-            raise ValueError("execution arguments do not match the authorized plan")
-        require_agent_position_management_commissioning()
-        portfolio = await runtime.portfolio()
-        if portfolio.daily_drawdown_fraction >= policy.max_daily_drawdown:
-            state = risk_state_service.halt(
-                "Agent policy daily drawdown budget reached",
-                source="agent_daily_drawdown",
-            )
-            raise PermissionError(state.reason)
-        open_symbols = {position.symbol for position in portfolio.open_positions}
-        if plan.symbol not in open_symbols and len(open_symbols) >= policy.max_open_positions:
-            raise PermissionError("Agent account-level open-position cap is reached")
-        episode = TradeEpisode(
-            goal_id=goal.id,
-            policy_id=policy.id,
-            run_id=_agent_run_id,
-            plan_id=plan.id,
-            symbol=plan.symbol,
-            side=str(plan.side),
-            status=TradeEpisodeStatus.RESERVED,
-            planned_risk=plan.sizing.risk_amount,
-            opened_at=datetime.now(UTC),
-        )
-        episode = await asyncio.to_thread(
-            agent_store.reserve_episode,
-            episode,
-            max_trades_per_day=policy.max_trades_per_day,
-            max_open_positions=policy.max_open_positions,
-        )
+async def strategy_review_worker_loop() -> None:
+    review_worker_health.update(status="running", activity="starting")
+    while True:
+        review_worker_health["heartbeat_at"] = datetime.now(UTC)
         try:
-            result = await execute_strategy(plan.id)
-        except Exception as exc:
-            settle_agent_entry_exception(plan, episode, exc)
-            raise
-        if result.order:
-            plan.status = PlanStatus.PAUSED
-            store.save_strategy(plan)
-            episode.status = (
-                TradeEpisodeStatus.OPEN
-                if any(order.status == OrderStatus.FILLED for order in result.orders)
-                else TradeEpisodeStatus.PENDING_ENTRY
+            await asyncio.to_thread(
+                reconcile_strategy_review_backlog,
+                DEFAULT_ENTRY_PROFILE_ID,
             )
-            episode.entry_order_ids = [order.id for order in result.orders]
-            episode.opened_at = min(order.created_at for order in result.orders)
-            agent_store.save_episode(episode)
-        else:
-            failed_checks = [
-                check for check in result.decision.checks if check.blocking and not check.passed
+            queued_jobs = [
+                StrategyReviewJob.model_validate(item)
+                for item in await asyncio.to_thread(store.list_strategy_review_jobs, 1000)
+                if item.get("status") == str(StrategyReviewJobStatus.QUEUED)
+                and int(item.get("review_contract_version") or 1) > 1
             ]
-            plan.status = PlanStatus.ARCHIVED
-            store.save_strategy(plan)
-            episode.status = TradeEpisodeStatus.CANCELED
-            episode.summary = (
-                "entry rejected by hard risk checks: "
-                + "; ".join(f"{check.code}: {check.message}" for check in failed_checks)
-                if failed_checks
-                else "entry produced no order; the stale plan was archived"
-            )
-            agent_store.save_episode(episode)
-        return result.model_dump(mode="json")
-
-    async def cancel_entry_order(order_id: str, symbol: str) -> dict:
-        if symbol not in goal.symbols:
-            raise PermissionError("order symbol is outside the Agent goal")
-        order = await cancel_order(order_id)
-        return order.model_dump(mode="json")
-
-    async def decrease_agent_position(
-        plan_id: str,
-        symbol: str,
-        fraction: str,
-        *,
-        _agent_run_id: str,
-        _agent_tool_call_id: str,
-    ) -> dict:
-        del _agent_run_id
-        plan = owned_plan(plan_id, require_current_policy=False)
-        if symbol != plan.symbol:
-            raise ValueError("position symbol does not match the owned plan")
-        requested_fraction = Decimal(fraction)
-        if requested_fraction <= 0 or requested_fraction > 1:
-            raise ValueError("position reduction fraction must be in (0, 1]")
-        await runtime.initialize()
-        assert runtime.execution is not None
-        episode = next(
-            (
-                item
-                for item in agent_store.list_episodes(200)
-                if item.plan_id == plan.id and item.goal_id == goal.id
-            ),
-            None,
-        )
-        if not episode or episode.status != TradeEpisodeStatus.OPEN:
-            raise RuntimeError("owned Agent position is not in an open episode")
-        require_agent_position_management_commissioning()
-        entry_orders, plan_fills = await episode_execution_evidence(plan, episode)
-        entry_side = OrderSide.BUY if plan.side == Side.LONG else OrderSide.SELL
-        entry_quantity = sum(
-            (fill.quantity for fill in plan_fills if fill.side == entry_side),
-            Decimal("0"),
-        )
-        exit_quantity = sum(
-            (fill.quantity for fill in plan_fills if fill.side != entry_side),
-            Decimal("0"),
-        )
-        attributable = max(entry_quantity - exit_quantity, Decimal("0"))
-        portfolio = await runtime.portfolio()
-        aligned_quantity = sum(
-            (
-                position.quantity
-                for position in portfolio.open_positions
-                if position.symbol == plan.symbol and position.side == plan.side
-            ),
-            Decimal("0"),
-        )
-        if aligned_quantity <= 0 or attributable <= 0:
-            raise RuntimeError("no aligned Agent-attributable position remains")
-        attributable = min(attributable, aligned_quantity)
-        quantity = attributable * requested_fraction
-        quantity = quantity.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-        if quantity <= 0:
-            raise RuntimeError("position reduction rounded to zero")
-        raw_key = f"{plan.id}:{_agent_tool_call_id}:reduce:{quantity:f}"
-        intent = OrderIntent(
-            idempotency_key=f"cx{sha256(raw_key.encode()).hexdigest()[:20]}",
-            plan_id=plan.id,
-            plan_fingerprint=plan.fingerprint,
-            symbol=plan.symbol,
-            side=OrderSide.SELL if plan.side == Side.LONG else OrderSide.BUY,
-            order_type=OrderType.MARKET,
-            quantity=quantity,
-            reduce_only=True,
-        )
-        episode.exit_client_order_ids = list(
-            dict.fromkeys([*episode.exit_client_order_ids, intent.idempotency_key])
-        )
-        agent_store.save_episode(episode)
-        try:
-            order = await runtime.execution.reduce_position_safely(
-                plan, entry_orders, intent, attributable
-            )
+            if queued_jobs:
+                review_worker_health.update(
+                    activity="validating",
+                    current_job_id=queued_jobs[0].id,
+                    last_error=None,
+                )
+                await process_strategy_review_job(queued_jobs[0])
+            else:
+                review_worker_health.update(
+                    activity="backlog_idle",
+                    current_job_id=None,
+                    last_error=None,
+                )
         except asyncio.CancelledError:
-            episode.status = TradeEpisodeStatus.UNCERTAIN
-            episode.summary = (
-                "Agent position reduction timed out or was interrupted after intent "
-                "persistence; exchange reconciliation is required"
-            )
-            agent_store.save_episode(episode)
-            risk_state_service.halt(episode.summary, source="protection_rebalance")
-            agent_store.append_event(
-                AgentEvent(
-                    event_type=AgentEventType.ORDER_UNCERTAIN,
-                    source="agent-position-tool",
-                    goal_id=goal.id,
-                    dedupe_key=f"episode:{episode.id}:reduction_interrupted",
-                    payload={
-                        "episode_id": episode.id,
-                        "plan_id": plan.id,
-                        "symbol": plan.symbol,
-                        "client_order_id": intent.idempotency_key,
-                    },
-                )
-            )
             raise
-        except PositionProtectionError as exc:
-            if exc.order and runtime.order_ledger:
-                runtime.order_ledger.record(exc.order, protection_verified=False)
-            if exc.order:
-                episode.status = TradeEpisodeStatus.UNCERTAIN
-                episode.exit_order_ids = list(
-                    dict.fromkeys([*episode.exit_order_ids, exc.order.id])
-                )
-                agent_store.save_episode(episode)
-            state = risk_state_service.halt(
-                f"Agent position protection is uncertain: {str(exc)[:180]}",
-                source="protection_rebalance",
+        except Exception as exc:
+            review_worker_health.update(
+                activity="degraded",
+                current_job_id=None,
+                last_error=str(exc)[:1000],
             )
             add_audit(
-                "agent",
-                "Agent position reduction failed protection verification",
-                severity="critical",
-                goal_id=goal.id,
-                plan_id=plan.id,
-                reason=state.reason,
+                "review",
+                "离线审核后台循环发生可恢复错误，将自动重试",
+                severity="warning",
+                error=str(exc)[:500],
             )
-            raise RuntimeError(state.reason) from exc
-        if runtime.order_ledger:
-            runtime.order_ledger.record(order, protection_verified=True)
-        episode.exit_order_ids = list(dict.fromkeys([*episode.exit_order_ids, order.id]))
-        remaining = attributable - order.filled_quantity
-        if remaining <= 0:
-            episode.status = TradeEpisodeStatus.AWAITING_REVIEW
-            event_type = AgentEventType.POSITION_CLOSED
-            event_suffix = "position_closed"
-        else:
-            event_type = AgentEventType.POSITION_UPDATED
-            event_suffix = f"position_reduced:{order.id}"
-        agent_store.save_episode(episode)
-        agent_store.append_event(
-            AgentEvent(
-                event_type=event_type,
-                source="agent-position-tool",
-                goal_id=goal.id,
-                dedupe_key=f"episode:{episode.id}:{event_suffix}",
-                payload={
-                    "episode_id": episode.id,
-                    "plan_id": plan.id,
-                    "symbol": plan.symbol,
-                    "order_id": order.id,
-                    "reduced_quantity": str(order.filled_quantity),
-                    "remaining_quantity": str(max(remaining, Decimal("0"))),
-                },
-            )
-        )
-        return {
-            "order": order.model_dump(mode="json"),
-            "episode": episode.model_dump(mode="json"),
-        }
+        try:
+            await asyncio.wait_for(review_worker_wakeup.wait(), timeout=5)
+            review_worker_wakeup.clear()
+        except TimeoutError:
+            pass
 
-    async def reduce_position(
-        plan_id: str,
-        symbol: str,
-        fraction: str,
-        *,
-        _agent_run_id: str,
-        _agent_tool_call_id: str,
-    ) -> dict:
-        return await decrease_agent_position(
-            plan_id,
-            symbol,
-            fraction,
-            _agent_run_id=_agent_run_id,
-            _agent_tool_call_id=_agent_tool_call_id,
-        )
 
-    async def exit_position(
-        plan_id: str,
-        symbol: str,
-        *,
-        _agent_run_id: str,
-        _agent_tool_call_id: str,
-    ) -> dict:
-        return await decrease_agent_position(
-            plan_id,
-            symbol,
-            "1",
-            _agent_run_id=_agent_run_id,
-            _agent_tool_call_id=_agent_tool_call_id,
-        )
-
-    async def review_closed_trade(
-        plan_id: str,
-        *,
-        _agent_run_id: str,
-        _agent_tool_call_id: str,
-    ) -> dict:
-        del _agent_run_id, _agent_tool_call_id
-        plan = owned_plan(plan_id, require_current_policy=False)
-        existing = next(
-            (item for item in agent_store.list_episodes(200) if item.plan_id == plan.id),
-            None,
-        )
-        if existing and existing.status == TradeEpisodeStatus.CLOSED:
-            return existing.model_dump(mode="json")
-        if not existing:
-            raise RuntimeError("Agent trade episode is missing")
-        _, plan_fills = await episode_execution_evidence(plan, existing)
-        entry_side = OrderSide.BUY if plan.side == Side.LONG else OrderSide.SELL
-        entries = [fill for fill in plan_fills if fill.side == entry_side]
-        exits = [fill for fill in plan_fills if fill.side != entry_side]
-        portfolio = await runtime.portfolio()
-        position = next(
-            (item for item in portfolio.open_positions if item.symbol == plan.symbol),
-            None,
-        )
-        aligned = position and position.side == plan.side and position.quantity > 0
-        if not entries or not exits or aligned:
-            raise RuntimeError("trade is not fully closed; deterministic review is unavailable")
-        entry_quantity = sum((fill.quantity for fill in entries), Decimal("0"))
-        exit_quantity = sum((fill.quantity for fill in exits), Decimal("0"))
-        if entry_quantity <= 0:
-            raise RuntimeError("closed trade has no verified entry quantity")
-        if exit_quantity < entry_quantity:
-            raise RuntimeError("attributed exit fills do not fully cover the Agent entry")
-        average_entry = (
-            sum(
-                (fill.price * fill.quantity for fill in entries),
-                Decimal("0"),
-            )
-            / entry_quantity
-        )
-        average_exit = (
-            sum(
-                (fill.price * fill.quantity for fill in exits),
-                Decimal("0"),
-            )
-            / exit_quantity
-        )
-        direction = Decimal("1") if plan.side == Side.LONG else Decimal("-1")
-        gross = sum(
-            ((fill.price - average_entry) * fill.quantity * direction for fill in exits),
-            Decimal("0"),
-        )
-        quote_currency = plan.symbol.split("/", 1)[1].split(":", 1)[0]
-        unsupported_fees = {
-            fill.fee_currency
-            for fill in plan_fills
-            if fill.fee and fill.fee_currency not in {"", quote_currency}
-        }
-        if unsupported_fees:
-            raise RuntimeError(
-                "cannot normalize non-quote fee currencies: " + ",".join(sorted(unsupported_fees))
-            )
-        fees = sum((fill.fee for fill in plan_fills), Decimal("0"))
-        realized = (gross - fees).quantize(Decimal("0.01"))
-        return_on_risk = (
-            realized / plan.sizing.risk_amount if plan.sizing.risk_amount > 0 else Decimal("0")
-        ).quantize(Decimal("0.001"))
-        episode = existing
-        episode.status = TradeEpisodeStatus.CLOSED
-        episode.entry_order_ids = list(
-            dict.fromkeys([*episode.entry_order_ids, *(fill.order_id for fill in entries)])
-        )
-        episode.exit_order_ids = list(
-            dict.fromkeys([*episode.exit_order_ids, *(fill.order_id for fill in exits)])
-        )
-        episode.realized_pnl = realized
-        episode.fees = fees
-        episode.return_on_risk = return_on_risk
-        episode.closed_at = max(fill.timestamp for fill in exits)
-        episode.summary = (
-            f"{plan.symbol} {plan.side} 已平仓；净收益 {realized:f} USDT，"
-            f"风险收益倍数 {return_on_risk:f}R，费用 {fees:f} USDT"
-        )
-        agent_store.save_episode(episode)
-        outcome = "win" if realized > 0 else "loss" if realized < 0 else "breakeven"
-        memory_content = (
-            f"{episode.summary}；outcome={outcome}；"
-            f"strategy_family={plan.algorithm}；timeframe={plan.timeframe}；"
-            f"entry_regime={plan.regime}；plan_confidence={plan.confidence:f}；"
-            f"average_entry={average_entry:f}；average_exit={average_exit:f}；"
-            f"planned_risk={plan.sizing.risk_amount:f} USDT；"
-            f"strategy_spec={plan.strategy_spec_fingerprint or 'system-default'}。"
-            "该记忆仅可作为同品种、同周期、同方向和同策略家族的前向结果证据，"
-            "不能绕过最新行情、回测、成本压力或硬风险闸。"
-        )
-        memory = AgentMemory(
-            memory_type=MemoryType.EPISODIC,
-            content=memory_content,
-            tags=[plan.symbol, plan.timeframe, str(plan.side), plan.algorithm],
-            source_episode_id=episode.id,
-            confidence=Decimal("1"),
-            evidence_refs=[*episode.entry_order_ids, *episode.exit_order_ids],
-        )
-        agent_store.save_memory(memory)
-        add_audit(
-            "agent",
-            "Agent 已完成确定性平仓复盘并写入 Episode 记忆",
-            goal_id=goal.id,
-            plan_id=plan.id,
-            episode_id=episode.id,
-            realized_pnl=float(realized),
-        )
-        return {
-            "episode": episode.model_dump(mode="json"),
-            "memory": memory.model_dump(mode="json"),
-        }
-
-    async def latest_sealed_campaign_scope() -> dict | None:
-        payloads = await asyncio.to_thread(store.list_research_datasets, 500)
-        groups: dict[str, list[ResearchDataset]] = {}
-        for payload in payloads:
-            dataset = ResearchDataset.model_validate(payload)
-            if (
-                dataset.blind_set_id
-                and dataset.research_role in {"development", "blind"}
-                and dataset.symbol in goal.symbols
-                and dataset.timeframe in goal.timeframes
-            ):
-                groups.setdefault(dataset.blind_set_id, []).append(dataset)
-        ordered_groups = sorted(
-            groups.items(),
-            key=lambda item: max(dataset.created_at for dataset in item[1]),
-            reverse=True,
-        )
-        for blind_set_id, datasets in ordered_groups:
-            consumption = await asyncio.to_thread(
-                store.load_blind_set_consumption,
-                blind_set_id,
-            )
-            if consumption is not None:
-                continue
-            development = [
-                dataset for dataset in datasets if dataset.research_role == "development"
-            ]
-            blind = [dataset for dataset in datasets if dataset.research_role == "blind"]
-            development_sources = {dataset.source_dataset_id for dataset in development}
-            blind_sources = {dataset.source_dataset_id for dataset in blind}
-            if len(development) < 3 or len(blind) < 3 or development_sources != blind_sources:
-                continue
-            return {
-                "blind_set_id": blind_set_id,
-                "dataset_ids": [dataset.id for dataset in development],
-                "blind_dataset_ids": [dataset.id for dataset in blind],
-                "market_count": len(development),
-                "sealed": True,
-                "consumed": False,
-                "policy": "single-use-chronological-purged-holdout",
-            }
-        return None
-
-    async def inspect_strategy_library(
-        family: str | None = None,
-    ) -> dict:
-        payload = unified_research_strategy_library(family)
-        payload.update(
-            {
-                "campaign_scope": await latest_sealed_campaign_scope(),
-                "next_step": (
-                    "select templates by current market fit, then backtest on a fresh "
-                    "immutable dataset before any execution"
-                ),
-            }
-        )
-        return payload
-
-    async def prepare_goal_research_data(
-        symbols: list[str] | None = None,
-        timeframes: list[str] | None = None,
-        exchange_ids: list[str] | None = None,
-        bars: int = 5000,
-        max_markets: int = 12,
-        selection_mode: str = "explicit",
-        universe_snapshot_id: str | None = None,
-        market_type: str | None = None,
-        feature_mode: Literal["full", "ohlcv_only"] = "full",
-        minimum_listing_age_days: int = 90,
-        minimum_quote_volume_24h: Decimal = Decimal("0"),
-        minimum_history_coverage_ratio: Decimal = Decimal("0.90"),
-        maximum_symbols_per_exchange: int = 10,
-    ) -> dict:
-        requested_symbols = symbols or goal.symbols
-        requested_timeframes = timeframes or goal.timeframes
-        normalized_symbols = [item.strip().upper().replace("-", "/") for item in requested_symbols]
-        normalized_timeframes = [item.strip().lower() for item in requested_timeframes]
-        if not set(normalized_symbols).issubset(set(goal.symbols)):
-            raise PermissionError("research symbol is outside the Agent goal")
-        if not set(normalized_timeframes).issubset(set(goal.timeframes)):
-            raise PermissionError("research timeframe is outside the Agent goal")
-        request = ResearchUniverseRequest(
-            symbols=normalized_symbols,
-            timeframes=normalized_timeframes,
-            exchange_ids=exchange_ids or [],
-            bars=bars,
-            max_markets=max_markets,
-            selection_mode=selection_mode,
-            universe_snapshot_id=universe_snapshot_id,
-            market_type=market_type,
-            feature_mode=feature_mode,
-            minimum_listing_age_days=minimum_listing_age_days,
-            minimum_quote_volume_24h=minimum_quote_volume_24h,
-            minimum_history_coverage_ratio=minimum_history_coverage_ratio,
-            minimum_symbols_per_exchange=min(3, len(normalized_symbols)),
-            maximum_symbols_per_exchange=maximum_symbols_per_exchange,
-        )
-        normalized_request = request.model_dump(mode="json")
-        job = ResearchUniverseJob(
-            request=normalized_request,
-            request_fingerprint=research_universe_request_fingerprint(normalized_request),
-            total_markets=min(
-                len(normalized_symbols)
-                * len(normalized_timeframes)
-                * max(len(exchange_ids or []), 1),
-                max_markets,
-            ),
-        )
-        await asyncio.to_thread(store.save_research_universe_job, job)
-        await run_research_universe_job(job)
-        if job.status != ResearchJobStatus.COMPLETED or job.report is None:
-            raise RuntimeError(job.error or "durable research data acquisition failed")
-        return {
-            **job.report.model_dump(mode="json"),
-            "durable_job": {
-                "id": job.id,
-                "request_fingerprint": job.request_fingerprint,
-                "status": str(job.status),
-            },
-        }
-
-    async def seal_goal_research_holdout(
-        dataset_ids: list[str],
-        universe_snapshot_id: str,
-        development_ratio: float = 0.80,
-        embargo_days: float = 7.0,
-        minimum_development_bars: int = 500,
-        minimum_blind_bars: int = 300,
-        common_window: bool = True,
-        window_start: datetime | None = None,
-        window_end_exclusive: datetime | None = None,
-    ) -> dict:
-        for dataset_id in dataset_ids:
-            payload = await asyncio.to_thread(store.load_research_dataset, dataset_id)
-            if payload is None:
-                raise LookupError(f"research dataset not found: {dataset_id}")
-            dataset = ResearchDataset.model_validate(payload)
-            if dataset.symbol not in goal.symbols or dataset.timeframe not in goal.timeframes:
-                raise PermissionError(f"dataset {dataset_id} is outside the Agent goal")
-        request = SealedHoldoutRequest(
-            dataset_ids=dataset_ids,
-            universe_snapshot_id=universe_snapshot_id,
-            development_ratio=development_ratio,
-            embargo_days=embargo_days,
-            minimum_development_bars=minimum_development_bars,
-            minimum_blind_bars=minimum_blind_bars,
-            common_window=common_window,
-            window_start=window_start,
-            window_end_exclusive=window_end_exclusive,
-        )
-        report = await asyncio.to_thread(seal_research_holdout, store, request)
-        return report.model_dump(mode="json")
-
-    async def backtest_goal_causal_strategy_policy(
-        dataset_id: str,
-        library_entry_ids: list[str],
-        maximum_candidates_per_bar: int = 3,
-        abstain_on_ambiguous_regime: bool = True,
-        minimum_regime_confidence: str = "0",
-        minimum_signal_confidence: str = "0",
-        minimum_directional_consensus: int = 1,
-        research_trial_count: int = 1,
-    ) -> dict:
-        payload = await asyncio.to_thread(store.load_research_dataset, dataset_id)
-        if payload is None:
-            raise LookupError(f"research dataset not found: {dataset_id}")
-        dataset = ResearchDataset.model_validate(payload)
-        if dataset.symbol not in goal.symbols or dataset.timeframe not in goal.timeframes:
-            raise PermissionError(f"dataset {dataset_id} is outside the Agent goal")
-        result = await backtest_causal_strategy_policy(
-            CausalPolicyBacktestRequest(
-                dataset_id=dataset_id,
-                library_entry_ids=library_entry_ids,
-                maximum_candidates_per_bar=maximum_candidates_per_bar,
-                abstain_on_ambiguous_regime=abstain_on_ambiguous_regime,
-                minimum_regime_confidence=Decimal(minimum_regime_confidence),
-                minimum_signal_confidence=Decimal(minimum_signal_confidence),
-                minimum_directional_consensus=minimum_directional_consensus,
-                research_trial_count=research_trial_count,
-            )
-        )
-        return result.model_dump(mode="json")
-
-    async def run_goal_research_campaign(
-        dataset_ids: list[str],
-        blind_dataset_ids: list[str] | None = None,
-        universe_snapshot_id: str | None = None,
-        library_entry_ids: list[str] | None = None,
-        candidate_ids: list[str] | None = None,
-        causal_policy_specs: list[dict] | None = None,
-        max_backtests: int = 240,
-        parent_campaign_id: str | None = None,
-    ) -> dict:
-        if not dataset_ids:
-            raise ValueError("research campaign requires dataset_ids")
-        blind_ids = blind_dataset_ids or []
-        development_metadata: dict[str, ResearchDataset] = {}
-        for dataset_id in [*dataset_ids, *blind_ids]:
-            payload = await asyncio.to_thread(
-                store.load_research_dataset,
-                dataset_id,
-            )
-            if not payload:
-                raise LookupError(f"research dataset not found: {dataset_id}")
-            dataset = ResearchDataset.model_validate(payload)
-            if dataset.symbol not in goal.symbols or dataset.timeframe not in goal.timeframes:
-                raise PermissionError(f"dataset {dataset_id} is outside the Agent goal")
-            if dataset_id in dataset_ids:
-                development_metadata[dataset_id] = dataset
-        selected_library_entry_ids = list(library_entry_ids or [])
-        selected_causal_policy_specs = [
-            CausalPolicyCampaignSpec.model_validate(item) for item in (causal_policy_specs or [])
-        ]
-        data_preflight: dict = {
-            "applied": False,
-            "selection_basis": "explicit",
-        }
-        if (
-            not selected_library_entry_ids
-            and not candidate_ids
-            and not selected_causal_policy_specs
-        ):
-
-            async def load_development_features(dataset_id: str):
-                payloads = await asyncio.gather(
-                    asyncio.to_thread(store.load_research_dataset_funding, dataset_id),
-                    asyncio.to_thread(
-                        store.load_research_dataset_open_interest,
-                        dataset_id,
+def build_review_jobs(
+    limit: int = 100,
+    *,
+    candidate_payloads: list[dict] | None = None,
+    candidate_summaries: list[dict] | None = None,
+    campaign_payloads: list[dict] | None = None,
+) -> list[ReviewJobView]:
+    views: list[ReviewJobView] = []
+    if candidate_summaries is None:
+        if candidate_payloads is not None:
+            candidate_summaries = [
+                {
+                    "candidate_id": str(payload.get("id") or ""),
+                    "status": str(payload.get("status") or ""),
+                    "display_name": str(
+                        (payload.get("spec") or {}).get("name")
+                        or (payload.get("spec") or {}).get("label")
+                        or payload.get("id")
+                        or ""
                     ),
-                    asyncio.to_thread(
-                        store.load_research_dataset_positioning,
-                        dataset_id,
-                    ),
-                    asyncio.to_thread(store.load_research_dataset_basis, dataset_id),
-                    asyncio.to_thread(
-                        store.load_research_dataset_order_flow,
-                        dataset_id,
-                    ),
-                    asyncio.to_thread(
-                        store.load_research_dataset_liquidation_flow,
-                        dataset_id,
-                    ),
-                )
-                return (
-                    [FundingRatePoint.model_validate(item) for item in payloads[0]],
-                    [OpenInterestPoint.model_validate(item) for item in payloads[1]],
-                    [PositioningPoint.model_validate(item) for item in payloads[2]],
-                    [BasisPoint.model_validate(item) for item in payloads[3]],
-                    [OrderFlowBar.model_validate(item) for item in payloads[4]],
-                    [LiquidationFlowPoint.model_validate(item) for item in payloads[5]],
-                )
-
-            feature_rows = await asyncio.gather(
-                *(load_development_features(dataset_id) for dataset_id in dataset_ids)
-            )
-            features_by_dataset = dict(zip(dataset_ids, feature_rows, strict=True))
-            selected_library_entry_ids, excluded = causal_data_eligible_library_entries(
-                list_strategy_library(),
-                [development_metadata[dataset_id] for dataset_id in dataset_ids],
-                features_by_dataset,
-            )
-            if not selected_library_entry_ids:
-                raise RuntimeError(
-                    "no public strategy has causal feature coverage across three symbols "
-                    "and two exchanges; acquire missing development data first"
-                )
-            data_preflight = {
-                "applied": True,
-                "selection_basis": "development_data_availability_only",
-                "selected_strategy_count": len(selected_library_entry_ids),
-                "excluded_strategy_count": len(excluded),
-                "excluded": excluded,
-                "blind_data_inspected": False,
-            }
-        report = await run_research_campaign(
-            ResearchCampaignRequest(
-                dataset_ids=dataset_ids,
-                blind_dataset_ids=blind_ids,
-                universe_snapshot_id=universe_snapshot_id,
-                library_entry_ids=selected_library_entry_ids,
-                candidate_ids=candidate_ids or [],
-                causal_policy_specs=selected_causal_policy_specs,
-                max_backtests=max_backtests,
-                parent_campaign_id=parent_campaign_id,
-            )
-        )
-        result = redact_campaign_for_research_agent(report)
-        result["causal_data_preflight"] = data_preflight
-        result["blind_disclosure_policy"] = (
-            "Research Agents receive only PASS, FAIL or SHADOW_REQUIRED with coarse codes; "
-            "blind scope and metrics are sealed."
-        )
-        return result
-
-    async def run_relative_value_research(
-        dataset_a_id: str,
-        dataset_b_id: str,
-    ) -> dict:
-        for dataset_id in {dataset_a_id, dataset_b_id}:
-            payload = await asyncio.to_thread(
-                store.load_research_dataset,
-                dataset_id,
-            )
-            if not payload:
-                raise LookupError(f"research dataset not found: {dataset_id}")
-            dataset = ResearchDataset.model_validate(payload)
-            if dataset.symbol not in goal.symbols or dataset.timeframe not in goal.timeframes:
-                raise PermissionError(
-                    f"relative-value dataset {dataset_id} is outside the Agent goal"
-                )
-        reports = await run_relative_value_backtests(
-            RelativeValueResearchRequest(
-                dataset_a_id=dataset_a_id,
-                dataset_b_id=dataset_b_id,
-            )
-        )
-        return {
-            "execution_enabled": False,
-            "reports": [report.model_dump(mode="json") for report in reports],
-        }
-
-    async def run_relative_value_campaign_matrix(
-        dataset_ids: list[str],
-        blind_dataset_ids: list[str] | None = None,
-        fold_count: int = 6,
-        formation_fraction: Decimal = Decimal("0.25"),
-        strategy_specs: list[dict] | None = None,
-        parent_campaign_id: str | None = None,
-        generate_failure_revisions: bool = True,
-    ) -> dict:
-        blind_ids = blind_dataset_ids or []
-        for dataset_id in set([*dataset_ids, *blind_ids]):
-            payload = await asyncio.to_thread(
-                store.load_research_dataset,
-                dataset_id,
-            )
-            if not payload:
-                raise LookupError(f"research dataset not found: {dataset_id}")
-            dataset = ResearchDataset.model_validate(payload)
-            if dataset.symbol not in goal.symbols or dataset.timeframe not in goal.timeframes:
-                raise PermissionError(
-                    f"relative-value dataset {dataset_id} is outside the Agent goal"
-                )
-        report = await run_relative_value_campaign(
-            RelativeValueCampaignRequest(
-                dataset_ids=dataset_ids,
-                blind_dataset_ids=blind_ids,
-                fold_count=fold_count,
-                formation_fraction=formation_fraction,
-                strategy_specs=strategy_specs or [],
-                parent_campaign_id=parent_campaign_id,
-                generate_failure_revisions=generate_failure_revisions,
-            )
-        )
-        return report.model_dump(mode="json")
-
-    async def run_carry_campaign_matrix(
-        dataset_ids: list[str],
-        blind_dataset_ids: list[str] | None = None,
-        fold_count: int = 6,
-        formation_fraction: Decimal = Decimal("0.25"),
-        strategy_specs: list[dict] | None = None,
-        parent_campaign_id: str | None = None,
-        generate_failure_revisions: bool = True,
-    ) -> dict:
-        blind_ids = blind_dataset_ids or []
-        for dataset_id in set([*dataset_ids, *blind_ids]):
-            payload = await asyncio.to_thread(
-                store.load_research_dataset,
-                dataset_id,
-            )
-            if not payload:
-                raise LookupError(f"research dataset not found: {dataset_id}")
-            dataset = ResearchDataset.model_validate(payload)
-            if dataset.symbol not in goal.symbols or dataset.timeframe not in goal.timeframes:
-                raise PermissionError(f"carry dataset {dataset_id} is outside the Agent goal")
-        report = await run_carry_campaign(
-            CarryCampaignRequest(
-                dataset_ids=dataset_ids,
-                blind_dataset_ids=blind_ids,
-                fold_count=fold_count,
-                formation_fraction=formation_fraction,
-                strategy_specs=strategy_specs or [],
-                parent_campaign_id=parent_campaign_id,
-                generate_failure_revisions=generate_failure_revisions,
-            )
-        )
-        return report.model_dump(mode="json")
-
-    async def revise_failed_candidate(
-        candidate_id: str = "",
-        campaign_id: str = "",
-        library_entry_id: str = "",
-        max_revisions: int = 3,
-    ) -> dict:
-        if campaign_id:
-            campaign_payload = await asyncio.to_thread(
-                store.load_research_campaign,
-                campaign_id,
-            )
-            if not campaign_payload:
-                raise LookupError("research campaign not found")
-            campaign = ResearchCampaignReport.model_validate(campaign_payload)
-            for dataset_id in campaign.dataset_ids:
-                dataset_payload = await asyncio.to_thread(
-                    store.load_research_dataset,
-                    dataset_id,
-                )
-                if not dataset_payload:
-                    raise LookupError(f"research dataset not found: {dataset_id}")
-                dataset = ResearchDataset.model_validate(dataset_payload)
-                if dataset.symbol not in goal.symbols or dataset.timeframe not in goal.timeframes:
-                    raise PermissionError("campaign research dataset is outside the Agent goal")
-            if campaign.causal_policy_definitions:
-                response = await revise_campaign_causal_policy(
-                    campaign_id,
-                    CausalPolicyRevisionRequest(
-                        campaign_entry_id=library_entry_id or None,
-                        max_revisions=max_revisions,
-                    ),
-                )
-            else:
-                response = await revise_campaign_strategy(
-                    campaign_id,
-                    CampaignRevisionRequest(
-                        library_entry_id=library_entry_id or None,
-                        max_revisions=max_revisions,
-                    ),
-                )
-            return response.model_dump(mode="json")
-        if not candidate_id:
-            raise ValueError("candidate_id or campaign_id is required")
-        payload = await asyncio.to_thread(
-            store.load_strategy_candidate,
-            candidate_id,
-        )
-        if not payload:
-            raise LookupError("strategy candidate not found")
-        candidate = StrategyCandidate.model_validate(payload)
-        if candidate.dataset_id:
-            dataset_payload = await asyncio.to_thread(
-                store.load_research_dataset,
-                candidate.dataset_id,
-            )
-            if dataset_payload:
-                dataset = ResearchDataset.model_validate(dataset_payload)
-                if dataset.symbol not in goal.symbols or dataset.timeframe not in goal.timeframes:
-                    raise PermissionError("candidate research dataset is outside the Agent goal")
-        response = await revise_strategy_candidate(
-            candidate_id,
-            CandidateRevisionRequest(max_revisions=max_revisions),
-        )
-        return response.model_dump(mode="json")
-
-    async def detect_research_opportunity(symbol: str, timeframe: str) -> dict:
-        market, history = await runtime.market_context(
-            limit=300, symbol=symbol, timeframe=timeframe
-        )
-        candles = closed_candles(history, timeframe, market.timestamp)
-        assessment = score_market_state(candles)
-        return {
-            "snapshot_time": market.timestamp.isoformat(),
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "closed_bar_count": len(candles),
-            "market_state": assessment.model_dump(mode="json"),
-            "permitted_next_tools": ["propose_hypothesis"],
-        }
-
-    def propose_hypothesis(hypothesis: dict) -> dict:
-        validated = ResearchHypothesisV2.model_validate(hypothesis)
-        return {
-            "hypothesis": validated.model_dump(mode="json"),
-            "status": "SEMANTIC_PROPOSAL_ONLY",
-            "notice": "Certification Service must persist this before empirical evaluation",
-        }
-
-    def propose_strategy_dsl(dsl: dict) -> dict:
-        validated = StrategyDSLV2.model_validate(dsl)
-        ir = compile_strategy_dsl(validated)
-        return {
-            "dsl": validated.model_dump(mode="json"),
-            "canonical_ir_hash": ir.fingerprint,
-            "required_features": list(ir.required_features),
-            "status": "SHADOW_REQUIRED_UNLESS_CERTIFIED_GENERATOR_PROVENANCE_EXISTS",
-        }
-
-    def propose_mutation(
-        operation: EvolutionOperation,
-        parent_ir_hash: str,
-        changed_nodes: list[str],
-        reason: str,
-    ) -> dict:
-        if not changed_nodes or len(changed_nodes) > 8:
-            raise ValueError("mutation must name between one and eight changed nodes")
-        return {
-            "operation": str(operation),
-            "parent_ir_hash": parent_ir_hash,
-            "changed_nodes": changed_nodes,
-            "reason": reason[:500],
-            "status": "STRUCTURAL_PROPOSAL_ONLY",
-        }
-
-    def review_candidate(dsl: dict) -> dict:
-        ir = compile_strategy_dsl(StrategyDSLV2.model_validate(dsl))
-        return {
-            "canonical_ir_hash": ir.fingerprint,
-            "node_count": len(ir.nodes),
-            "maximum_warmup": max(node.warmup for node in ir.nodes),
-            "required_features": list(ir.required_features),
-            "review": "SEMANTICALLY_VALID",
-        }
-
-    def summarize_failure(reason_codes: list[str]) -> dict:
-        bounded = sorted(set(reason_codes))[:32]
-        return {
-            "reason_codes": bounded,
-            "summary": "Candidate did not advance through one or more coarse research gates.",
-            "blind_metrics_disclosed": False,
-        }
-
-    async def review_strategy_health() -> dict:
-        report = await review_strategy_governance()
-        return report.model_dump(mode="json")
-
-    async def execute_validated_trade_plan(
-        plan_id: str,
-        symbol: str,
-        timeframe: str,
-        risk_fraction: str,
-        leverage: str,
-        protected: bool,
-        *,
-        _agent_run_id: str,
-        _agent_tool_call_id: str,
-    ) -> dict:
-        """Move one admitted plan to protected submission in one resumable call."""
-
-        plan = owned_plan(plan_id)
-        arguments = {
-            "plan_id": plan_id,
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "risk_fraction": risk_fraction,
-            "leverage": leverage,
-            "protected": protected,
-        }
-        stages: list[str] = []
-        if plan.status == PlanStatus.PAUSED:
-            episode = next(
-                (
-                    item
-                    for item in agent_store.list_episodes(500)
-                    if item.goal_id == goal.id and item.plan_id == plan.id
-                ),
-                None,
-            )
-            if episode is not None:
-                return {
-                    "plan_id": plan.id,
-                    "status": "already_submitted",
-                    "stages": ["submission_previously_completed"],
-                    "episode": episode.model_dump(mode="json"),
                 }
-        if plan.status == PlanStatus.DRAFT:
-            await authorize_trade_plan(**arguments)
-            stages.append("strategy_quality_admitted")
-            plan = owned_plan(plan_id)
-        if plan.status == PlanStatus.APPROVED:
-            await activate_trade_plan(**arguments)
-            stages.append("latest_signal_and_risk_revalidated")
-            plan = owned_plan(plan_id)
-        if plan.status != PlanStatus.ACTIVE:
-            raise RuntimeError(f"validated plan state {plan.status} cannot be submitted")
-        result = await submit_trade_plan(
-            **arguments,
-            _agent_run_id=_agent_run_id,
-            _agent_tool_call_id=_agent_tool_call_id,
-        )
-        stages.append("protected_order_submitted")
-        return {
-            "plan_id": plan.id,
-            "status": "submitted",
-            "stages": stages,
-            "execution": result,
-        }
-
-    for tool in (
-        AgentTool(
-            name="detect_research_opportunity",
-            description=(
-                "Read a bounded point-in-time market snapshot and identify whether a "
-                "research hypothesis is warranted. Returns no database or execution handle"
-            ),
-            risk_class=ToolRiskClass.READ_ONLY,
-            handler=detect_research_opportunity,
-        ),
-        AgentTool(
-            name="propose_hypothesis",
-            description=(
-                "Validate one ResearchHypothesisV2 semantic proposal. This tool does not "
-                "persist, backtest, certify, adjust risk, or place orders"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=propose_hypothesis,
-        ),
-        AgentTool(
-            name="propose_strategy_dsl",
-            description=(
-                "Parse and semantically compile versioned JSON Strategy DSL v2. Free DSL "
-                "remains Shadow-only and this tool cannot issue provenance or certificates"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=propose_strategy_dsl,
-        ),
-        AgentTool(
-            name="propose_mutation",
-            description=(
-                "Propose exactly one bounded structural evolution operation and changed "
-                "node set; budget enforcement remains outside the LLM capability"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=propose_mutation,
-        ),
-        AgentTool(
-            name="review_candidate",
-            description=(
-                "Review DSL semantic validity and complexity without return or blind metrics"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=review_candidate,
-        ),
-        AgentTool(
-            name="summarize_failure",
-            description=(
-                "Summarize fixed coarse failure reason codes without sealed blind attribution"
-            ),
-            risk_class=ToolRiskClass.READ_ONLY,
-            handler=summarize_failure,
-        ),
-        AgentTool(
-            name="inspect_strategy_library",
-            description=(
-                "Read the non-empty, versioned public strategy template library and "
-                "indicator catalog. Includes single-leg, pair and true spot-perpetual "
-                "carry priors. Optionally filter family by trend|mean_reversion|breakout|"
-                "relative_value|relative_momentum|carry. Templates are hypotheses and never "
-                "bypass fresh causal backtesting"
-            ),
-            risk_class=ToolRiskClass.READ_ONLY,
-            handler=inspect_strategy_library,
-        ),
-        AgentTool(
-            name="prepare_research_universe",
-            description=(
-                "Paginate and persist immutable historical datasets across a bounded "
-                "exchange x symbol x timeframe matrix inside the Agent goal. Public "
-                "research adapters are isolated from the trading account. Returns "
-                "coverage, quality, gaps, funding and open-interest history plus "
-                "positioning, basis and order-flow provenance plus dataset ids. "
-                "selection_mode=point_in_time first freezes the complete current "
-                "venue catalog, listing age, active status, liquidity, exclusions and "
-                "the exact in-goal market selection before downloading candles. It "
-                "labels historical survivorship as unproven instead of inferring it. "
-                "selection_mode=frozen_snapshot plus universe_snapshot_id replays an "
-                "already sealed current or archived scope and rejects any mismatched "
-                "exchange, symbol, timeframe, or market type. "
-                "The acquisition job is durable and resumes after process restart. "
-                "Optional exchange_ids (okx|binance|bybit), symbols, timeframes, "
-                "market_type (spot|swap|future), "
-                "feature_mode (full|ohlcv_only), bars (500-50000), max_markets, "
-                "minimum_listing_age_days, "
-                "minimum_quote_volume_24h, minimum_history_coverage_ratio, "
-                "maximum_symbols_per_exchange. Every frozen market must meet the "
-                "same immutable history-coverage contract before Campaign use. "
-                "ohlcv_only seals candles first for fast causal screening; derivative "
-                "features can be enriched independently after a candidate advances"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=prepare_goal_research_data,
-            timeout_seconds=1800,
-        ),
-        AgentTool(
-            name="seal_research_holdout",
-            description=(
-                "Seal an exact frozen universe into fingerprint-bound development and "
-                "single-use blind datasets. Requires general source dataset_ids and "
-                "universe_snapshot_id; rejects cherry-picked scope, pre-snapshot data, "
-                "non-identical common timestamps, overlapping split windows, and unsafe "
-                "time boundaries. Supports development_ratio, embargo_days, inclusive "
-                "window_start, and exclusive window_end_exclusive. Returns development "
-                "ids for strategy selection and blind ids that remain unopened until the "
-                "development gate selects exactly one candidate"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=seal_goal_research_holdout,
-        ),
-        AgentTool(
-            name="backtest_causal_strategy_policy",
-            description=(
-                "Backtest one pre-registered Agent meta-policy on an immutable non-blind "
-                "dataset. At every closed bar it ranks supplied public library_entry_ids "
-                "using only the current causal regime and latest-known feature availability, "
-                "then evaluates at most maximum_candidates_per_bar strategies. The policy, "
-                "selector version, ambiguity-abstention rule and StrategySpec fingerprints "
-                "are bound into one fingerprint. Realised and future returns are forbidden "
-                "selector inputs; sealed blind datasets are rejected"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=backtest_goal_causal_strategy_policy,
-            timeout_seconds=1800,
-        ),
-        AgentTool(
-            name="run_research_campaign",
-            description=(
-                "Run a complete public-strategy × immutable-dataset backtest "
-                "matrix inside the Agent goal. Applies cost stress, temporal "
-                "folds, Deflated Sharpe, multiple-testing correction, Monte "
-                "Carlo path risk, cross-market gates and PBO. Requires "
-                "development dataset_ids and disjoint independent "
-                "blind_dataset_ids. Development data ranks candidates; blind "
-                "data only accepts or rejects the single selected candidate. "
-                "A universe_snapshot_id binds the exact pre-frozen market scope and "
-                "is mandatory for any future execution certificate; historical "
-                "survivorship must also be proven. Optional library_entry_ids, "
-                "candidate_ids, causal_policy_specs and max_backtests. Each causal "
-                "policy pre-registers a unique id, public library_entry_ids, maximum "
-                "candidates evaluated per closed bar, and ambiguity abstention. Policy "
-                "Campaigns require at least two structurally unique hypotheses and cannot "
-                "inspect blind data during selection. A parent_campaign_id is mandatory "
-                "for the one permitted sealed-lineage successor, which must retain every "
-                "parent hypothesis and add only one to three parent-authorized, "
-                "single-variable children"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=run_goal_research_campaign,
-            timeout_seconds=3600,
-        ),
-        AgentTool(
-            name="run_relative_value_research",
-            description=(
-                "Run public equal-dollar log-spread and causal rolling-beta residual "
-                "pair hypotheses on "
-                "two synchronized immutable datasets inside the Agent goal. "
-                "Uses next-bar dual-leg fills, fees, slippage, funding and "
-                "statistical gates. Research only: multi-leg execution is "
-                "explicitly disabled"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=run_relative_value_research,
-            timeout_seconds=600,
-        ),
-        AgentTool(
-            name="run_relative_value_campaign",
-            description=(
-                "Build every same-exchange pair from at least three synchronized symbols "
-                "on at least two exchanges, then run the bounded relative-value library "
-                "through dual-leg costs, temporal folds, cross-pair quality gates, FDR "
-                "and PBO. A frozen formation_fraction is excluded from every trading "
-                "metric before the remaining out-of-sample period is evaluated. Accepts "
-                "development dataset_ids and optional source-matched blind_dataset_ids, "
-                "even fold_count and formation_fraction. A development winner alone may "
-                "atomically consume the blind set once; only PASS/HOLD is disclosed. "
-                "Optional strategy_specs can rerun only explicitly returned bounded "
-                "child revisions, each counted as a new hypothesis. "
-                "Research only: multi-leg execution remains disabled"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=run_relative_value_campaign_matrix,
-            timeout_seconds=1800,
-        ),
-        AgentTool(
-            name="run_carry_campaign",
-            description=(
-                "Run true same-exchange spot-perpetual cash-and-carry hypotheses over "
-                "exact matched immutable legs for at least three symbols on each of two "
-                "exchanges. Uses a frozen formation period, already-published funding, "
-                "actual historical funding cashflows, synchronized next-bar dual-leg "
-                "fills, capital cost, base and stressed fees/slippage, temporal folds, "
-                "cross-market gates, FDR and PBO. Accepts development dataset_ids, optional "
-                "source-matched blind_dataset_ids, even fold_count, formation_fraction and "
-                "bounded strategy_specs. A development winner alone may atomically consume "
-                "the blind set once; only PASS/HOLD is disclosed. "
-                "A parent_campaign_id may run the one permitted successor containing only "
-                "the parent's frozen hypotheses plus its returned one-variable children. "
-                "Research only: multi-leg execution and profitability claims are disabled"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=run_carry_campaign_matrix,
-            timeout_seconds=1800,
-        ),
-        AgentTool(
-            name="revise_failed_strategy",
-            description=(
-                "Attribute why a complete Campaign aggregate or one backtested "
-                "candidate failed, then create up to five bounded, model-aware "
-                "single-hypothesis child revisions. Prefer campaign_id with an "
-                "optional library_entry_id; otherwise use candidate_id. "
-                "For a causal policy Campaign, freezes at most three one-control "
-                "meta-policy children and permits exactly one successor. Revisions "
-                "never inherit validation"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=revise_failed_candidate,
-        ),
-        AgentTool(
-            name="review_strategy_health",
-            description=(
-                "Re-evaluate Challenger and Champion health from latest "
-                "immutable backtests and Campaign evidence. Automatically "
-                "retires a Champion only after at least two independent "
-                "evidence layers fail"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=review_strategy_health,
-        ),
-        AgentTool(
-            name="assess_owned_position",
-            description=(
-                "Deterministically assess one owned open position using attributed "
-                "fills, current exchange position, exact native protection coverage "
-                "and the latest closed strategy signal. Returns hold, exit or halt "
-                "with exact execution arguments. Requires plan_id and symbol"
-            ),
-            risk_class=ToolRiskClass.READ_ONLY,
-            handler=assess_owned_position,
-            timeout_seconds=45,
-        ),
-        AgentTool(
-            name="screen_trade_candidates",
-            description=(
-                "Generate a bounded current-market parameter mini-ensemble for every "
-                "actionable trend, mean-reversion, and breakout family, then backtest all "
-                "hypotheses on equivalent fresh evidence. Parameters are selected before "
-                "and without reading backtest results. Rank full-sample, chronological "
-                "stability, recent-window and cost-stress evidence. Returns selected_plan_id "
-                "only when a candidate passes every robustness gate. Arguments: symbol, "
-                "timeframe, optional prompt and risk_fraction"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=screen_trade_candidates,
-            timeout_seconds=240,
-            include_context=True,
-        ),
-        AgentTool(
-            name="build_trade_plan",
-            description=(
-                "Build a deterministic StrategyPlan. Arguments: prompt, strategy_kind "
-                "(trend|mean_reversion|breakout), symbol, timeframe, optional risk_fraction. "
-                "A matching same-market research Champion is applied automatically; "
-                "the resulting plan still requires a fresh backtest"
-            ),
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=build_trade_plan,
-            include_context=True,
-        ),
-        AgentTool(
-            name="run_plan_backtest",
-            description="Run walk-forward and cost-stress validation for an owned plan_id",
-            risk_class=ToolRiskClass.RESEARCH,
-            handler=run_plan_backtest,
-        ),
-        AgentTool(
-            name="execute_validated_trade_plan",
-            description=(
-                "The only Agent entry transition for an already selected robust plan. "
-                "Atomically resumes strategy-quality admission, latest closed-signal "
-                "activation and protected order submission. Requires the exact "
-                "selected_authorization object: plan_id, symbol, timeframe, "
-                "risk_fraction, leverage, protected=true"
-            ),
-            risk_class=ToolRiskClass.INCREASE_RISK,
-            handler=execute_validated_trade_plan,
-            timeout_seconds=120,
-            include_context=True,
-        ),
-        AgentTool(
-            name="cancel_entry_order",
-            description="Cancel a tracked unfilled entry using order_id and symbol",
-            risk_class=ToolRiskClass.DECREASE_RISK,
-            handler=cancel_entry_order,
-        ),
-        AgentTool(
-            name="reduce_position",
-            description=(
-                "Reduce an owned open Agent position while preserving exact protection "
-                "coverage. Exchange modes require passed position-management commissioning"
-            ),
-            risk_class=ToolRiskClass.DECREASE_RISK,
-            handler=reduce_position,
-            include_context=True,
-        ),
-        AgentTool(
-            name="exit_position",
-            description=(
-                "Fully close an owned open Agent position and verify protection cleanup. "
-                "Exchange modes require passed position-management commissioning"
-            ),
-            risk_class=ToolRiskClass.DECREASE_RISK,
-            handler=exit_position,
-            include_context=True,
-        ),
-        AgentTool(
-            name="review_closed_trade",
-            description=(
-                "Review a fully closed owned trade from attributed fills by plan_id "
-                "and write an Episode memory"
-            ),
-            risk_class=ToolRiskClass.READ_ONLY,
-            handler=review_closed_trade,
-            include_context=True,
-        ),
-    ):
-        registry.register(tool)
-    executor = AgentToolExecutor(registry, agent_store)
-    return AgentCoordinator(
-        store=agent_store,
-        registry=registry,
-        executor=executor,
-        reasoner=GatewayAgentReasoner(ai_gateway),
-        state_builder=build_state,
-    )
-
-
-@app.post("/api/agent/goals/{goal_id}/run-once", response_model=AgentRun)
-async def run_agent_goal_once(goal_id: str):
-    goal = await asyncio.to_thread(agent_store.load_goal, goal_id)
-    if not goal:
-        raise HTTPException(404, "Agent goal not found")
-    policy = await asyncio.to_thread(agent_store.load_policy, goal.risk_policy_id)
-    if not policy:
-        raise HTTPException(409, "Agent policy not found")
-    coordinator = build_agent_coordinator(goal, policy)
-    run = await coordinator.process_next(
-        worker_id=f"api-{uuid4().hex[:10]}", goal=goal, policy=policy
-    )
-    if not run:
-        raise HTTPException(409, "Agent goal has no pending event")
-    add_audit(
-        "agent",
-        "Agent 已完成一次有界 Observe-Reason-Act 运行",
-        goal_id=goal.id,
-        run_id=run.id,
-        status=str(run.status),
-        steps=run.step_count,
-    )
-    return run
-
-
-class PreparedLiveAgentPromotion(BaseModel):
-    source_goal_id: str
-    live_policy: AgentPolicy
-    live_goal: AgentGoal
-
-
-def prepare_live_agent_promotion(
-    update: ConfigurationUpdate,
-    previous: UserConfiguration,
-) -> PreparedLiveAgentPromotion | None:
-    source_goal_id = update.promote_agent_goal_id
-    if not source_goal_id:
-        return None
-    if (
-        previous.trading_mode != TradingMode.SANDBOX
-        or update.configuration.trading_mode != TradingMode.LIVE
-    ):
-        raise HTTPException(
-            409,
-            "Agent 实盘升级只能与 sandbox → live 环境切换在同一次保存中执行",
-        )
-    source_goal = agent_store.load_goal(source_goal_id)
-    if (
-        not source_goal
-        or source_goal.status != AgentGoalStatus.ACTIVE
-        or source_goal.autonomy_mode != AgentAutonomyMode.SANDBOX
-    ):
-        raise HTTPException(409, "请选择一个仍处于 active 的 sandbox Agent 目标")
-    source_policy = agent_store.load_policy(source_goal.risk_policy_id)
-    if (
-        not source_policy
-        or source_policy.autonomy_mode != AgentAutonomyMode.SANDBOX
-        or not source_policy.allow_agent_entry
-    ):
-        raise HTTPException(409, "sandbox 目标没有有效的自动入场授权")
-    if not set(source_goal.symbols).issubset(update.configuration.strategy.watchlist):
-        raise HTTPException(409, "实盘关注列表不再覆盖 sandbox Agent 目标品种")
-    if not set(source_goal.timeframes).issubset(update.configuration.strategy.timeframes):
-        raise HTTPException(409, "实盘策略周期不再覆盖 sandbox Agent 目标周期")
-    nonterminal = {
-        TradeEpisodeStatus.RESERVED,
-        TradeEpisodeStatus.PENDING_ENTRY,
-        TradeEpisodeStatus.OPEN,
-        TradeEpisodeStatus.AWAITING_REVIEW,
-        TradeEpisodeStatus.UNCERTAIN,
+                for payload in candidate_payloads
+            ]
+        else:
+            candidate_summaries = store.list_strategy_candidate_summaries(max(500, limit))
+    candidate_summary_by_id = {
+        str(summary.get("candidate_id") or ""): summary for summary in candidate_summaries
     }
-    active_episodes = [
-        episode
-        for episode in agent_store.list_episodes(10000)
-        if episode.goal_id == source_goal.id and episode.status in nonterminal
+    for payload in store.list_strategy_review_jobs(limit):
+        job = StrategyReviewJob.model_validate(payload)
+        candidate_summary = candidate_summary_by_id.get(job.candidate_id)
+        views.append(
+            ReviewJobView(
+                id=job.id,
+                candidate_id=job.candidate_id,
+                candidate_name=str(
+                    (candidate_summary or {}).get("display_name") or job.candidate_id
+                ),
+                candidate_fingerprint=job.candidate_fingerprint,
+                review_contract_version=job.review_contract_version,
+                policy_fingerprint=job.policy_fingerprint,
+                origin_scope={
+                    key: value
+                    for key, value in {
+                        "symbol": job.origin_symbol,
+                        "timeframe": job.origin_timeframe,
+                    }.items()
+                    if value
+                },
+                scope_results=[result.model_dump(mode="json") for result in job.scope_results],
+                status=str(job.status),
+                stage=job.stage,
+                evidence_tier=job.evidence_tier,
+                progress_percent=job.progress_percent,
+                rejection_reasons=job.rejection_reasons,
+                evidence_refs=job.evidence_refs,
+                metrics=job.metrics,
+                dataset_id=job.dataset_id,
+                attempt_count=job.attempt_count,
+                error=job.error,
+                updated_at=job.updated_at,
+            )
+        )
+    remaining = max(0, limit - len(views))
+    if remaining == 0:
+        return views[:limit]
+    if campaign_payloads is None:
+        campaign_payloads = store.list_research_campaigns(remaining)
+    campaign_payload_by_id = {
+        str(payload.get("id") or ""): payload for payload in campaign_payloads
+    }
+    for payload in store.list_research_campaign_jobs(remaining):
+        job = ResearchCampaignJob.model_validate(payload)
+        report = None
+        if job.report_id:
+            report_payload = campaign_payload_by_id.get(job.report_id)
+            if report_payload:
+                report = ResearchCampaignReport.model_validate(report_payload)
+        if job.status == ResearchCampaignJobStatus.QUEUED:
+            stage = "queued"
+            tier = "unreviewed"
+        elif job.status == ResearchCampaignJobStatus.RUNNING:
+            stage = "validation"
+            tier = "unreviewed"
+        elif job.status == ResearchCampaignJobStatus.FAILED:
+            stage = "rejected"
+            tier = "rejected"
+        elif report and report.execution_certificate:
+            stage = "admitted"
+            tier = "sandbox_mature"
+        elif report and any(candidate.cross_market_passed for candidate in report.candidates):
+            stage = "canary"
+            tier = "sandbox_canary"
+        else:
+            stage = "rejected"
+            tier = "rejected"
+        total = max(job.total_cells, 1)
+        views.append(
+            ReviewJobView(
+                id=job.id,
+                status=str(job.status),
+                stage=stage,
+                evidence_tier=tier,
+                progress_percent=min(100, int(job.completed_cells * 100 / total)),
+                report_id=job.report_id,
+                candidate_count=len(report.candidates) if report else 0,
+                selected_strategy_id=(report.selected_library_entry_id if report else None),
+                rejection_reasons=(
+                    report.selection_reasons[:8]
+                    if report and not report.execution_certificate
+                    else []
+                ),
+                error=job.error,
+                updated_at=job.updated_at,
+            )
+        )
+    return views[:limit]
+
+
+def build_review_overview() -> ReviewOverview:
+    all_strategy_jobs = [
+        StrategyReviewJob.model_validate(item) for item in store.list_strategy_review_jobs(1000)
     ]
-    if active_episodes:
+    strategy_jobs = [job for job in all_strategy_jobs if job.review_contract_version >= 2]
+    candidate_payloads = store.list_strategy_candidates(500)
+    candidate_summaries = [
+        {
+            "candidate_id": str(payload.get("id") or ""),
+            "status": str(payload.get("status") or ""),
+            "display_name": str(
+                (payload.get("spec") or {}).get("name")
+                or (payload.get("spec") or {}).get("label")
+                or payload.get("id")
+                or ""
+            ),
+        }
+        for payload in candidate_payloads
+    ]
+    v2_candidate_payloads = [
+        payload
+        for payload in candidate_payloads
+        if isinstance(payload.get("research_context"), dict)
+    ]
+    active_job_candidate_ids = {job.candidate_id for job in strategy_jobs}
+    jobs = build_review_jobs(
+        candidate_payloads=candidate_payloads,
+        candidate_summaries=candidate_summaries,
+    )
+    return ReviewOverview(
+        queued=sum(job.status == StrategyReviewJobStatus.QUEUED for job in strategy_jobs),
+        unreviewed=sum(
+            str(candidate.get("status") or "") == str(CandidateStatus.PROPOSED)
+            and str(candidate.get("id") or "") not in active_job_candidate_ids
+            for candidate in v2_candidate_payloads
+        ),
+        running=sum(job.status == StrategyReviewJobStatus.RUNNING for job in strategy_jobs),
+        blocked=sum(job.status == StrategyReviewJobStatus.BLOCKED for job in strategy_jobs),
+        paper_eligible=sum(
+            str(candidate.get("status") or "")
+            in {
+                str(CandidateStatus.VALIDATED),
+                str(CandidateStatus.CHALLENGER),
+                str(CandidateStatus.CHAMPION),
+            }
+            for candidate in v2_candidate_payloads
+        ),
+        sandbox_canary=sum(job.evidence_tier == "sandbox_canary" for job in strategy_jobs),
+        sandbox_mature=sum(job.evidence_tier == "sandbox_mature" for job in strategy_jobs),
+        live_capped=0,
+        rejected=sum(job.status == StrategyReviewJobStatus.REJECTED for job in strategy_jobs)
+        + sum(
+            str(candidate.get("status") or "") == str(CandidateStatus.REJECTED)
+            and str(candidate.get("id") or "") not in active_job_candidate_ids
+            for candidate in v2_candidate_payloads
+        ),
+        legacy=sum(
+            not isinstance(candidate.get("research_context"), dict)
+            for candidate in candidate_payloads
+        ),
+        data_blocked=sum(
+            job.status == StrategyReviewJobStatus.BLOCKED and job.stage == "data_required"
+            for job in strategy_jobs
+        ),
+        jobs=jobs,
+        pipeline={
+            "compiler": "deterministic",
+            "backtest": "deterministic",
+            "comparison": "deterministic",
+            "execution_llm_calls": 0,
+            "worker_status": str(review_worker_health.get("status") or "stopped"),
+            "worker_activity": str(review_worker_health.get("activity") or "unknown"),
+            "worker_current_job_id": str(review_worker_health.get("current_job_id") or ""),
+            "worker_last_error": str(review_worker_health.get("last_error") or ""),
+        },
+    )
+
+
+def build_review_evidence(
+    *,
+    status: str | None = None,
+    search: str = "",
+    limit: int = 200,
+) -> list[ReviewEvidenceItem]:
+    items: list[ReviewEvidenceItem] = []
+    normalized_status = (status or "").strip().lower()
+    normalized_search = search.strip().lower()
+    tier_by_status = {
+        str(CandidateStatus.PROPOSED): "unreviewed",
+        str(CandidateStatus.VALIDATED): "paper_eligible",
+        str(CandidateStatus.CHALLENGER): "sandbox_canary",
+        str(CandidateStatus.CHAMPION): "sandbox_mature",
+        str(CandidateStatus.REJECTED): "rejected",
+        str(CandidateStatus.RETIRED): "retired",
+    }
+    review_jobs_by_candidate: dict[str, StrategyReviewJob] = {}
+    for payload in store.list_strategy_review_jobs(1000):
+        job = StrategyReviewJob.model_validate(payload)
+        review_jobs_by_candidate.setdefault(job.candidate_id, job)
+    for payload in store.list_strategy_candidates(min(max(limit, 1), 500)):
+        try:
+            candidate = StrategyCandidate.model_validate(payload)
+        except ValidationError as exc:
+            candidate_id = str(payload.get("id") or "legacy-invalid-candidate")
+            spec = payload.get("spec") if isinstance(payload.get("spec"), dict) else {}
+            item = ReviewEvidenceItem(
+                id=candidate_id,
+                name=str(spec.get("name") or spec.get("label") or candidate_id),
+                status="invalid",
+                evidence_tier="rejected",
+                source=str(payload.get("source") or spec.get("source") or "legacy"),
+                family=str(spec.get("family") or spec.get("strategy_kind") or "unknown"),
+                summary="候选与当前 StrategySpec 合约不兼容，已隔离且不可交易。",
+                reasons=[
+                    "候选结构、字段范围或指纹无法通过当前 StrategySpec 校验",
+                    "历史记录继续保留，但不会进入策略库、审核队列或执行层",
+                ],
+                evidence_refs=[candidate_id],
+                technical_details=str(exc)[:2000],
+                review_contract_version=1,
+                updated_at=datetime.fromisoformat(str(payload.get("updated_at")))
+                if payload.get("updated_at")
+                else datetime.now(UTC),
+            )
+        else:
+            candidate_status = str(candidate.status)
+            review_job = review_jobs_by_candidate.get(candidate.id)
+            is_legacy = candidate.research_context is None
+            backtest = candidate.backtest
+            reasons = list(candidate.decision_reasons)
+            if backtest:
+                reasons.extend(backtest.validation_reasons)
+            metrics: dict[str, str | int | float | bool | None] = {}
+            if backtest:
+                metrics = {
+                    "return_percent": str(backtest.return_percent),
+                    "max_drawdown_percent": str(backtest.max_drawdown_percent),
+                    "profit_factor": str(backtest.profit_factor),
+                    "win_rate_percent": str(backtest.win_rate_percent),
+                    "total_trades": backtest.total_trades,
+                    "robustness_passed": backtest.robustness_passed,
+                }
+            if review_job:
+                metrics.update(review_job.metrics)
+                reasons.extend(review_job.rejection_reasons)
+            evidence_tier = tier_by_status.get(candidate_status, "unreviewed")
+            display_status = candidate_status
+            if is_legacy and candidate.status == CandidateStatus.PROPOSED:
+                display_status = "legacy"
+                evidence_tier = "legacy"
+                reasons.insert(
+                    0,
+                    "历史审核 v1：只读保留，不进入活动审核队列，也不会自动重审。",
+                )
+            elif review_job:
+                evidence_tier = review_job.evidence_tier
+            context = candidate.research_context
+            item = ReviewEvidenceItem(
+                id=candidate.id,
+                name=str(candidate.spec.get("name") or candidate.spec.get("label") or candidate.id),
+                status=display_status,
+                evidence_tier=evidence_tier,
+                source=candidate.source,
+                family=str(candidate.spec.get("family") or "unknown"),
+                summary=(reasons[0] if reasons else "候选已登记，等待确定性审核证据。"),
+                reasons=list(dict.fromkeys(reasons))[:40],
+                metrics=metrics,
+                evidence_refs=[
+                    reference
+                    for reference in (
+                        candidate.id,
+                        candidate.dataset_id,
+                        candidate.spec_fingerprint,
+                        review_job.id if review_job else None,
+                    )
+                    if reference
+                ],
+                review_contract_version=(
+                    review_job.review_contract_version if review_job else (1 if is_legacy else 2)
+                ),
+                origin_scope=(
+                    {
+                        "symbol": context.symbol,
+                        "timeframe": context.timeframe,
+                    }
+                    if context
+                    else {}
+                ),
+                scope_results=(
+                    [result.model_dump(mode="json") for result in review_job.scope_results]
+                    if review_job
+                    else []
+                ),
+                updated_at=candidate.updated_at,
+            )
+        if normalized_status and normalized_status not in {
+            item.status.lower(),
+            item.evidence_tier.lower(),
+        }:
+            continue
+        if (
+            normalized_search
+            and normalized_search
+            not in " ".join(
+                [item.id, item.name, item.family, item.source, item.summary, *item.reasons]
+            ).lower()
+        ):
+            continue
+        items.append(item)
+    return sorted(items, key=lambda item: item.updated_at, reverse=True)
+
+
+@app.get("/api/review/overview", response_model=ReviewOverview)
+async def review_agent_overview():
+    return await asyncio.to_thread(build_review_overview)
+
+
+@app.get("/api/review/jobs", response_model=list[ReviewJobView])
+async def review_agent_jobs(limit: int = Query(default=100, ge=1, le=500)):
+    return await asyncio.to_thread(build_review_jobs, limit)
+
+
+@app.get("/api/review/jobs/{job_id}", response_model=ReviewJobView)
+async def review_agent_job(job_id: str):
+    item = next((job for job in build_review_jobs(500) if job.id == job_id), None)
+    if item is None:
+        raise HTTPException(404, "review job not found")
+    return item
+
+
+@app.post("/api/review/backlog/reconcile")
+async def reconcile_review_backlog():
+    result = await asyncio.to_thread(reconcile_strategy_review_backlog)
+    review_worker_wakeup.set()
+    return {
+        **result,
+        "worker_status": review_worker_health.get("status"),
+        "worker_activity": review_worker_health.get("activity"),
+    }
+
+
+@app.get("/api/review/evidence", response_model=list[ReviewEvidenceItem])
+async def review_evidence(
+    status: str | None = None,
+    search: str = "",
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    return await asyncio.to_thread(
+        build_review_evidence,
+        status=status,
+        search=search,
+        limit=limit,
+    )
+
+
+@app.post("/api/review/jobs/{job_id}/retry", response_model=ReviewJobView)
+async def retry_review_job(job_id: str):
+    strategy_payload = await asyncio.to_thread(store.load_strategy_review_job, job_id)
+    if strategy_payload:
+        strategy_job = StrategyReviewJob.model_validate(strategy_payload)
+        if strategy_job.review_contract_version <= 1:
+            raise HTTPException(409, "v1 review evidence is read-only")
+        if strategy_job.status != StrategyReviewJobStatus.BLOCKED:
+            raise HTTPException(409, "only a blocked v2 review can be retried")
+        strategy_job.status = StrategyReviewJobStatus.QUEUED
+        strategy_job.stage = "queued"
+        strategy_job.error = None
+        strategy_job.completed_at = None
+        strategy_job.updated_at = datetime.now(UTC)
+        await asyncio.to_thread(store.save_strategy_review_job, strategy_job)
+        review_worker_wakeup.set()
+        return next(item for item in build_review_jobs(500) if item.id == strategy_job.id)
+    payload = await asyncio.to_thread(store.load_research_campaign_job, job_id)
+    if not payload:
+        raise HTTPException(404, "review job not found")
+    job = ResearchCampaignJob.model_validate(payload)
+    if job.status != ResearchCampaignJobStatus.FAILED:
+        raise HTTPException(409, "only a failed review job can be retried")
+    job.status = ResearchCampaignJobStatus.QUEUED
+    job.error = None
+    job.started_at = None
+    job.completed_at = None
+    job.completed_cells = 0
+    job.failed_cells = 0
+    job.updated_at = datetime.now(UTC)
+    await asyncio.to_thread(store.save_research_campaign_job, job)
+    schedule_research_campaign_job(job)
+    return next(item for item in build_review_jobs() if item.id == job.id)
+
+
+def sandbox_maturity_snapshot(certificate: SandboxAdmissionCertificateV1) -> dict:
+    episodes = [
+        item
+        for item in agent_store.list_episodes(10_000)
+        if item.strategy_certificate_id == certificate.id
+    ]
+    performance = build_forward_performance(
+        episodes,
+        configuration_service.current_configuration().agent_forward_validation,
+        scope_mode=AgentAutonomyMode.SANDBOX,
+    )
+    execution_payloads = store.list_sandbox_execution_evidence(certificate.id)
+    execution = [
+        SandboxExecutionRoundEvidenceV1.model_validate(item) for item in execution_payloads
+    ]
+    attributable_ids = {
+        item.id
+        for item in episodes
+        if item.status == TradeEpisodeStatus.CLOSED
+        and item.realized_pnl is not None
+        and item.return_on_risk is not None
+    }
+    aligned_ids = {item.episode_id for item in execution if item.aligned}
+    aligned = bool(attributable_ids) and attributable_ids.issubset(aligned_ids)
+    profit_factor = performance.profit_factor
+    if profit_factor is None and performance.wins > 0 and performance.losses == 0:
+        profit_factor = Decimal("999.99")
+    maturity = SandboxMaturityEvidenceV1(
+        completed_episodes=performance.attributable_episodes,
+        independent_runs=performance.independent_runs,
+        recent_episodes=performance.recent_episodes,
+        profit_factor=profit_factor or Decimal("0"),
+        expected_r=performance.expectancy_r,
+        maximum_drawdown_r=performance.max_drawdown_r,
+        maximum_consecutive_losses=performance.max_consecutive_losses,
+        execution_cost_aligned=aligned,
+        slippage_aligned=aligned,
+        native_protection_aligned=aligned,
+    )
+    return {
+        "maturity": maturity,
+        "performance": performance,
+        "execution_evidence_count": len(execution),
+        "aligned_episode_count": len(attributable_ids & aligned_ids),
+    }
+
+
+def maybe_issue_full_strategy_certificate_v2(
+    certificate_id: str,
+) -> FullStrategyCertificateV2 | None:
+    status = store.load_research_certificate_status(certificate_id)
+    if not status or status["certificate_type"] != "sandbox_admission_v1" or status["revoked"]:
+        return None
+    admission = SandboxAdmissionCertificateV1.model_validate(status["certificate"])
+    try:
+        _development_audit_for_admission(admission)
+    except RuntimeError:
+        return None
+    existing = [
+        item
+        for item in store.list_full_strategy_certificates_v2()
+        if item["certificate"].get("sandbox_admission_certificate_id") == admission.id
+        and not item["revoked"]
+    ]
+    if existing:
+        return FullStrategyCertificateV2.model_validate(existing[0]["certificate"])
+    blind = store.find_completed_blind_consumption(admission.strategy_ir_hash)
+    if blind is None:
+        blind = store.find_completed_blind_consumption(admission.artifact_fingerprint)
+    if blind and not bool(blind.get("passed")):
+        store.revoke_research_certificate(
+            CertificateRevocationEvent(
+                certificate_id=admission.id,
+                reason_code="sealed_blind_test_failed",
+                evidence_reference=str(blind.get("evaluation_id") or "sealed_blind"),
+            )
+        )
+        return None
+    if not blind:
+        return None
+    snapshot = sandbox_maturity_snapshot(admission)
+    maturity = snapshot["maturity"]
+    if not maturity.passed:
+        return None
+    configuration = configuration_service.current_configuration()
+    certificate = FullStrategyCertificateV2(
+        sandbox_admission_certificate_id=admission.id,
+        strategy_ir_hash=admission.strategy_ir_hash,
+        artifact_fingerprint=admission.artifact_fingerprint,
+        sealed_blind_evidence_reference=str(blind["evaluation_id"]),
+        sandbox_maturity=maturity,
+        configuration_fingerprint=strategy_certificate_configuration_fingerprint(configuration),
+    )
+    store.save_research_certificate(certificate, "full_strategy_v2")
+    return certificate
+
+
+@app.post("/api/research/development-audits")
+async def issue_development_audit(request: DevelopmentAuditIssueRequest):
+    """Derive admission metrics from immutable server-side campaign cells."""
+
+    datasets = await asyncio.to_thread(store.list_research_datasets, 2_000)
+    contract = assess_crypto_5m_contract(datasets)
+    if contract.status != "READY":
+        raise HTTPException(409, "crypto_5m_v1 is not READY")
+    artifacts: list[AlphaModelArtifactV1] = []
+    for model_id in request.model_artifact_ids:
+        payload = await asyncio.to_thread(store.load_alpha_model_artifact, model_id)
+        if not payload:
+            raise HTTPException(409, f"model artifact not found: {model_id}")
+        artifacts.append(AlphaModelArtifactV1.model_validate(payload))
+    ensemble = next(
+        (
+            item
+            for item in artifacts
+            if item.id == request.ensemble_model_id and item.model_family == "ensemble_50_50"
+        ),
+        None,
+    )
+    families = {item.model_family for item in artifacts}
+    if ensemble is None or not (
+        families & {"elastic_net_regression", "logistic_classification"}
+        and families & {"lightgbm_regression", "lightgbm_classification"}
+    ):
+        raise HTTPException(409, "a bound linear, LightGBM, and ensemble trio is required")
+    if any(
+        item.ir_fingerprint != request.strategy_ir_hash or not item.walk_forward_passed
+        for item in artifacts
+    ):
+        raise HTTPException(409, "model trio IR or walk-forward evidence is invalid")
+    report_payload = await asyncio.to_thread(store.load_research_campaign, request.campaign_id)
+    if report_payload is None:
+        raise HTTPException(409, "persisted development campaign not found")
+    report = ResearchCampaignReport.model_validate(report_payload)
+    candidate = next(
+        (
+            item
+            for item in report.candidates
+            if item.strategy_fingerprint == request.strategy_ir_hash
+        ),
+        None,
+    )
+    if candidate is None:
+        raise HTTPException(409, "campaign does not contain the frozen strategy IR")
+    cells = [
+        item
+        for item in report.cells
+        if item.dataset_role == "research"
+        and item.strategy_fingerprint == request.strategy_ir_hash
+        and item.timeframe == "5m"
+    ]
+    by_market: dict[str, ResearchCampaignCell] = {}
+    for cell in cells:
+        market = f"{cell.exchange.lower()}:{cell.symbol.upper()}"
+        if market in by_market:
+            raise HTTPException(409, f"duplicate development evaluation for {market}")
+        by_market[market] = cell
+    if set(by_market) != set(ALPHA_MARKETS):
+        raise HTTPException(409, "campaign must evaluate the exact six crypto_5m_v1 markets")
+    selected_dataset_by_market = {
+        item.market: item.dataset_id for item in contract.markets if item.dataset_id
+    }
+    if any(
+        by_market[market].dataset_id != selected_dataset_by_market.get(market)
+        for market in ALPHA_MARKETS
+    ):
+        raise HTTPException(409, "campaign cells do not bind the current frozen data contract")
+    passing = tuple(
+        market
+        for market in ALPHA_MARKETS
+        if (
+            by_market[market].data_eligible
+            and by_market[market].robustness_passed
+            and by_market[market].statistical_uncertainty_passed
+            and by_market[market].temporal_stability_passed
+            and by_market[market].expected_r_passed
+            and by_market[market].profit_factor >= Decimal("1.15")
+            and (by_market[market].stress_return_percent or Decimal("0")) > 0
+            and by_market[market].max_drawdown_percent <= Decimal("20")
+        )
+    )
+    passing_cells = [by_market[market] for market in passing]
+    evidence = DevelopmentAuditEvidenceV1(
+        expected_r_bootstrap_lower=(
+            min(item.expected_r_confidence_lower_bound for item in passing_cells)
+            if passing_cells
+            else Decimal("0")
+        ),
+        profit_factor=(
+            min(item.profit_factor for item in passing_cells) if passing_cells else Decimal("0")
+        ),
+        stress_net_return=(
+            min(item.stress_return_percent or Decimal("0") for item in passing_cells)
+            if passing_cells
+            else Decimal("0")
+        ),
+        maximum_drawdown_fraction=(
+            max(item.max_drawdown_percent for item in by_market.values()) / Decimal("100")
+        ),
+        pbo_95_upper=report.pbo.upper_confidence_bound,
+        online_fdr_passed=candidate.online_fdr_passed,
+        passing_markets=passing,
+    )
+    if not candidate.cross_market_passed or not report.pbo.passed or not evidence.passed:
+        raise HTTPException(409, "persisted campaign does not pass development admission")
+    certificate = DevelopmentAuditCertificateV1(
+        strategy_ir_hash=request.strategy_ir_hash,
+        artifact_fingerprint=ensemble.fingerprint,
+        data_contract_fingerprint=contract.fingerprint,
+        model_artifact_ids=tuple(item.id for item in artifacts),
+        campaign_id=report.id,
+        campaign_fingerprint=stable_fingerprint(report.model_dump(mode="json")),
+        market_evaluation_fingerprints={
+            market: by_market[market].backtest_fingerprint for market in ALPHA_MARKETS
+        },
+        evidence=evidence,
+    )
+    await asyncio.to_thread(
+        store.save_research_certificate,
+        certificate,
+        "development_audit_v1",
+    )
+    return certificate.model_dump(mode="json")
+
+
+@app.get("/api/research/development-audits")
+async def list_development_audits():
+    return await asyncio.to_thread(
+        store.list_research_certificates_by_type,
+        "development_audit_v1",
+    )
+
+
+@app.post("/api/research/sandbox-admissions")
+async def issue_sandbox_admission(request: SandboxAdmissionIssueRequest):
+    datasets = await asyncio.to_thread(store.list_research_datasets, 2_000)
+    contract = assess_crypto_5m_contract(datasets)
+    if contract.status != "READY":
         raise HTTPException(
             409,
-            "sandbox Agent 仍有未闭环交易回合，完成平仓、复盘和对账后才能升级",
+            {
+                "code": "crypto_5m_v1_not_ready",
+                "status": contract.status,
+                "markets": [item.model_dump(mode="json") for item in contract.markets],
+            },
         )
-    target_leverage = min(
-        source_policy.max_leverage,
-        update.configuration.risk.max_leverage,
+    artifacts: list[AlphaModelArtifactV1] = []
+    for model_id in request.model_artifact_ids:
+        payload = await asyncio.to_thread(store.load_alpha_model_artifact, model_id)
+        if not payload:
+            raise HTTPException(409, f"model artifact not found: {model_id}")
+        artifacts.append(AlphaModelArtifactV1.model_validate(payload))
+    families = {item.model_family for item in artifacts}
+    required_family_groups = (
+        {"elastic_net_regression", "logistic_classification"},
+        {"lightgbm_regression", "lightgbm_classification"},
+        {"ensemble_50_50"},
+    )
+    if not all(families & group for group in required_family_groups):
+        raise HTTPException(409, "linear, LightGBM, and 50/50 ensemble artifacts are required")
+    if not all(item.walk_forward_passed for item in artifacts):
+        raise HTTPException(409, "linear and LightGBM models must independently pass walk-forward")
+    model_tasks = {item.task for item in artifacts if item.task != "ensemble"}
+    if len(model_tasks) != 1:
+        raise HTTPException(409, "linear and LightGBM model tasks differ")
+    artifact_lineages = {
+        (
+            item.profile,
+            item.horizon_bars,
+            item.feature_names,
+            item.feature_cube_fingerprint,
+            item.label_fingerprint,
+            item.training_window,
+            item.validation_windows,
+            item.purge_bars,
+            item.embargo_bars,
+            item.random_seed,
+            item.ir_fingerprint,
+            item.cost_model_fingerprint,
+        )
+        for item in artifacts
+    }
+    if len(artifact_lineages) != 1:
+        raise HTTPException(409, "model trio does not share one frozen training lineage")
+    installed_dependencies = dependency_versions()
+    if any(
+        any(
+            installed_dependencies.get(name) != value
+            for name, value in item.dependency_versions.items()
+        )
+        for item in artifacts
+    ):
+        raise HTTPException(409, "model artifact dependency version drift detected")
+    ensemble = next(
+        (
+            item
+            for item in artifacts
+            if item.id == request.ensemble_model_id and item.model_family == "ensemble_50_50"
+        ),
+        None,
+    )
+    if ensemble is None:
+        raise HTTPException(409, "ensemble_model_id is not the supplied ensemble artifact")
+    if any(item.ir_fingerprint != request.strategy_ir_hash for item in artifacts):
+        raise HTTPException(409, "model artifact and strategy IR fingerprints differ")
+    if any(item.canonical_ir_payload is None for item in artifacts):
+        raise HTTPException(409, "model artifacts must embed the frozen Canonical IR")
+    configuration = configuration_service.current_configuration()
+    expected_cost_fingerprint = alpha_transaction_cost_fingerprint(
+        fee_bps=configuration.fee_bps,
+        slippage_bps=configuration.slippage_bps,
+    )
+    if {item.cost_model_fingerprint for item in artifacts} != {expected_cost_fingerprint}:
+        raise HTTPException(409, "model artifacts do not match the current frozen cost model")
+    required_data_features = tuple(
+        sorted({feature for item in artifacts for feature in item.required_data_features})
+    )
+    contract = assess_crypto_5m_contract(
+        datasets,
+        required_features=required_data_features,
+    )
+    if contract.status != "READY":
+        raise HTTPException(
+            409,
+            {
+                "code": "model_required_features_untestable",
+                "required_features": required_data_features,
+                "status": contract.status,
+                "markets": [item.model_dump(mode="json") for item in contract.markets],
+            },
+        )
+    audit_status = await asyncio.to_thread(
+        store.load_research_certificate_status,
+        request.development_audit_certificate_id,
     )
     if (
-        update.configuration.market_type == "swap"
-        and target_leverage < update.configuration.contract_leverage
+        audit_status is None
+        or audit_status["certificate_type"] != "development_audit_v1"
+        or audit_status["revoked"]
     ):
+        raise HTTPException(409, "valid server-issued development audit is required")
+    development_audit = DevelopmentAuditCertificateV1.model_validate(audit_status["certificate"])
+    if (
+        development_audit.strategy_ir_hash != request.strategy_ir_hash
+        or development_audit.artifact_fingerprint != ensemble.fingerprint
+        or development_audit.data_contract_fingerprint != contract.fingerprint
+        or set(development_audit.model_artifact_ids) != {item.id for item in artifacts}
+    ):
+        raise HTTPException(409, "development audit does not bind this frozen model lineage")
+    try:
+        certificate = SandboxAdmissionCertificateV1(
+            strategy_ir_hash=request.strategy_ir_hash,
+            artifact_fingerprint=ensemble.fingerprint,
+            data_contract_fingerprint=contract.fingerprint,
+            model_artifact_ids=tuple(item.id for item in artifacts),
+            development_audit_certificate_id=development_audit.id,
+            audit_evidence=development_audit.evidence,
+            strategy_frozen=True,
+        )
+    except ValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await asyncio.to_thread(
+        store.save_research_certificate,
+        certificate,
+        "sandbox_admission_v1",
+    )
+    handoff_status = (
+        "admitted_waiting_current_signal"
+        if configuration.exchange_id == "okx" and configuration.trading_mode == TradingMode.SANDBOX
+        else "queued_until_okx_sandbox"
+    )
+    handoff = await asyncio.to_thread(
+        store.save_sandbox_admission_handoff,
+        certificate,
+        status=handoff_status,
+    )
+    if handoff_status == "admitted_waiting_current_signal":
+        await process_sandbox_alpha_handoffs()
+        handoff = (
+            await asyncio.to_thread(
+                store.load_sandbox_admission_handoff,
+                certificate.id,
+            )
+            or handoff
+        )
+    add_audit(
+        "research",
+        "crypto_5m_v1 开发审核通过并自动进入 OKX 模拟盘准入队列",
+        severity="warning",
+        certificate_id=certificate.id,
+        handoff_status=handoff_status,
+    )
+    return {"certificate": certificate.model_dump(mode="json"), "handoff": handoff}
+
+
+@app.get("/api/research/sandbox-admissions")
+async def list_sandbox_admissions():
+    records = await asyncio.to_thread(
+        store.list_research_certificates_by_type,
+        "sandbox_admission_v1",
+    )
+    result = []
+    for record in records:
+        certificate = SandboxAdmissionCertificateV1.model_validate(record["certificate"])
+        audit_valid = True
+        try:
+            await asyncio.to_thread(_development_audit_for_admission, certificate)
+        except RuntimeError:
+            audit_valid = False
+        result.append(
+            {
+                **record,
+                "revoked": bool(record["revoked"] or not audit_valid),
+                "handoff": await asyncio.to_thread(
+                    store.load_sandbox_admission_handoff,
+                    certificate.id,
+                ),
+                "progress": await asyncio.to_thread(
+                    sandbox_maturity_snapshot,
+                    certificate,
+                ),
+            }
+        )
+    return result
+
+
+@app.post("/api/research/sandbox-admissions/{certificate_id}/finalize")
+async def finalize_full_strategy_certificate(certificate_id: str):
+    certificate = await asyncio.to_thread(
+        maybe_issue_full_strategy_certificate_v2,
+        certificate_id,
+    )
+    if certificate is None:
         raise HTTPException(
             409,
-            "实盘固定执行杠杆高于 sandbox Agent 授权，不能无损迁移",
+            "sealed blind PASS and all 30-episode OKX sandbox maturity gates are required",
         )
-    live_policy = source_policy.model_copy(
-        update={
-            "id": f"{source_policy.id}-live",
-            "autonomy_mode": AgentAutonomyMode.LIVE_CAPPED,
-            "max_risk_per_trade": min(
-                source_policy.max_risk_per_trade,
-                update.configuration.risk.risk_per_trade,
-            ),
-            "max_daily_drawdown": min(
-                source_policy.max_daily_drawdown,
-                update.configuration.risk.max_daily_drawdown,
-            ),
-            "max_open_positions": min(
-                source_policy.max_open_positions,
-                update.configuration.risk.max_open_positions,
-            ),
-            "max_leverage": target_leverage,
-        }
-    )
-    now = datetime.now(UTC)
-    live_goal = source_goal.model_copy(
-        update={
-            "id": f"goal_live_{sha256(source_goal.id.encode()).hexdigest()[:16]}",
-            "autonomy_mode": AgentAutonomyMode.LIVE_CAPPED,
-            "risk_policy_id": live_policy.id,
-            "status": AgentGoalStatus.ACTIVE,
-            "created_at": now,
-            "updated_at": now,
-        }
-    )
-    return PreparedLiveAgentPromotion(
-        source_goal_id=source_goal.id,
-        live_policy=live_policy,
-        live_goal=live_goal,
-    )
+    return certificate.model_dump(mode="json")
+
+
+@app.get("/api/research/data-contracts/crypto-5m-v1")
+async def get_crypto_5m_data_contract():
+    datasets = await asyncio.to_thread(store.list_research_datasets, 2_000)
+    contract = assess_crypto_5m_contract(datasets)
+    return {**contract.model_dump(mode="json"), "fingerprint": contract.fingerprint}
+
+
+@app.get("/api/research/models/{model_id}")
+async def get_alpha_model_artifact(model_id: str):
+    payload = await asyncio.to_thread(store.load_alpha_model_artifact, model_id)
+    if not payload:
+        raise HTTPException(404, "alpha model artifact not found")
+    return payload
 
 
 @app.put("/api/settings", response_model=ConfigurationView)
 async def update_settings(update: ConfigurationUpdate):
+    # Settings cannot change account identity while an entry is being allocated.
+    async with v2_entry_allocation_lock:
+        return await _update_settings(update)
+
+
+async def _update_settings(update: ConfigurationUpdate):
+    global v2_configuration_generation
     previous = configuration_service.current_configuration()
-    promotion = prepare_live_agent_promotion(update, previous)
     previous_context = (
         previous.exchange_id,
         previous.trading_mode,
@@ -7848,6 +4982,19 @@ async def update_settings(update: ConfigurationUpdate):
         else None
     )
     sensitive_change = previous_context != next_context or credential_change
+    connection_change = sensitive_change or any(
+        getattr(previous, field) != getattr(update.configuration, field)
+        for field in ("network_proxy_url", "margin_mode", "contract_leverage")
+    )
+    if connection_change and (
+        trading_intelligence_store.automation_runtime().enabled
+        or trading_intelligence_store.list_positions()
+        or trading_intelligence_store.list_entry_orders(active_only=True)
+    ):
+        raise HTTPException(
+            409,
+            "请先停止自动化并收口 v2 持仓及挂单，再修改账户、凭证或连接配置",
+        )
     if sensitive_change and previous.trading_mode != TradingMode.PAPER:
         try:
             await runtime.initialize()
@@ -7861,26 +5008,12 @@ async def update_settings(update: ConfigurationUpdate):
             ) from exc
         if open_orders:
             raise HTTPException(409, "旧执行环境仍有挂单，请先撤单并完成对账")
-        if previous_context != next_context and portfolio.open_positions:
+        if portfolio.open_positions:
             raise HTTPException(409, "旧执行环境仍有持仓，请先平仓后再切换")
     try:
         view = configuration_service.save(update)
         await runtime.initialize(force=True)
-        if promotion:
-            validate_agent_policy_against_platform(promotion.live_policy)
-            promoted_view = view.model_copy(
-                update={
-                    "promoted_agent_goal_id": promotion.live_goal.id,
-                    "promoted_agent_policy_id": promotion.live_policy.id,
-                }
-            )
-            await asyncio.to_thread(
-                agent_store.promote_goal_to_live,
-                promotion.source_goal_id,
-                promotion.live_policy,
-                promotion.live_goal,
-            )
-            view = promoted_view
+        v2_configuration_generation += 1
     except Exception as exc:
         store.save_configuration(previous)
         if previous_target_credentials is not None:
@@ -7905,21 +5038,56 @@ async def update_settings(update: ConfigurationUpdate):
                 severity="warning",
                 archived=archived,
             )
+    next_strategy_configuration_fingerprint = strategy_certificate_configuration_fingerprint(
+        view.configuration
+    )
+    for item in await asyncio.to_thread(store.list_full_strategy_certificates_v2):
+        certificate = item["certificate"]
+        if (
+            not item["revoked"]
+            and certificate.get("configuration_fingerprint")
+            != next_strategy_configuration_fingerprint
+        ):
+            event = CertificateRevocationEvent(
+                certificate_id=certificate["id"],
+                reason_code="configuration_or_cost_model_changed",
+                evidence_reference=next_strategy_configuration_fingerprint,
+            )
+            await asyncio.to_thread(store.revoke_research_certificate, event)
+    next_cost_fingerprint = alpha_transaction_cost_fingerprint(
+        fee_bps=view.configuration.fee_bps,
+        slippage_bps=view.configuration.slippage_bps,
+    )
+    sandbox_certificates = await asyncio.to_thread(
+        store.list_research_certificates_by_type,
+        "sandbox_admission_v1",
+    )
+    for item in sandbox_certificates:
+        if item["revoked"]:
+            continue
+        admission = SandboxAdmissionCertificateV1.model_validate(item["certificate"])
+        cost_fingerprints = set()
+        for model_id in admission.model_artifact_ids:
+            payload = await asyncio.to_thread(store.load_alpha_model_artifact, model_id)
+            if payload:
+                cost_fingerprints.add(
+                    AlphaModelArtifactV1.model_validate(payload).cost_model_fingerprint
+                )
+        if cost_fingerprints != {next_cost_fingerprint}:
+            await asyncio.to_thread(
+                store.revoke_research_certificate,
+                CertificateRevocationEvent(
+                    certificate_id=admission.id,
+                    reason_code="configuration_or_cost_model_changed",
+                    evidence_reference=next_cost_fingerprint,
+                ),
+            )
     add_audit(
         "settings",
         "运行设置已更新",
         exchange=view.configuration.exchange_id,
         mode=str(view.configuration.trading_mode),
     )
-    if promotion:
-        add_audit(
-            "agent",
-            "sandbox Agent 授权与目标已原子升级为 live_capped",
-            severity="warning",
-            source_goal_id=promotion.source_goal_id,
-            live_goal_id=promotion.live_goal.id,
-            live_policy_id=promotion.live_policy.id,
-        )
     return view
 
 
@@ -8779,54 +5947,16 @@ async def dashboard():
         portfolio = await runtime.portfolio()
     except Exception as exc:
         raise HTTPException(503, f"真实行情不可用：{exc}") from exc
-    strategy_history = closed_candles(
-        history,
-        configuration.default_timeframe,
-        market.timestamp,
+    decision = RiskDecision(
+        approved=False,
+        checks=[
+            RiskCheck(
+                code="trading_intelligence_v2_boundary",
+                passed=False,
+                message="仅在 v2 WakeCondition 触发后为对应 TradePlan 执行预交易风控",
+            )
+        ],
     )
-    current_strategy_kind = configured_strategy_kind(configuration, strategy_history)
-    active_plan = ensure_plan(history, market, portfolio)
-    signal_strategy_kind = (
-        StrategyKind(active_plan.algorithm) if active_plan else current_strategy_kind
-    )
-    signal_kwargs = dict(
-        candles=strategy_history,
-        snapshot=market,
-        timeframe=configuration.default_timeframe,
-        allow_short=configuration.market_type == "swap",
-        confirmation_candles=confirmation_history(
-            strategy_history,
-            configuration.default_timeframe,
-        ),
-        require_confirmation=requires_higher_confirmation(configuration),
-    )
-    if active_plan or not configuration.strategy.automatic_regime_selection:
-        current_signal = strategy_factory.evaluate(
-            signal_strategy_kind,
-            **signal_kwargs,
-            strategy_spec=(active_plan.strategy_spec or None) if active_plan else None,
-        )
-    else:
-        signal_strategy_kind, current_signal, _ = strategy_factory.evaluate_ensemble(
-            **signal_kwargs
-        )
-    if active_plan:
-        decision = add_signal_gate(
-            risk_engine().evaluate(active_plan, portfolio, market),
-            active_plan,
-            current_signal,
-        )
-    else:
-        decision = RiskDecision(
-            approved=False,
-            checks=[
-                RiskCheck(
-                    code="actionable_plan",
-                    passed=False,
-                    message="当前没有满足条件的可执行计划，系统保持观望",
-                )
-            ],
-        )
     execution = runtime.execution
     assert execution is not None
     if runtime.order_ledger and runtime.order_ledger.records:
@@ -8835,89 +5965,21 @@ async def dashboard():
         recent_orders = list(execution.orders.values())[-10:][::-1]
     else:
         recent_orders = (await execution.open_orders())[-10:][::-1]
-    backtest_history = closed_candles(
-        history,
-        active_plan.timeframe if active_plan else configuration.default_timeframe,
-        market.timestamp,
-    )
-    backtest_exchange = active_plan.exchange if active_plan else configuration.exchange_id
-    backtest_symbol = active_plan.symbol if active_plan else configuration.default_symbol
-    backtest_timeframe = active_plan.timeframe if active_plan else configuration.default_timeframe
-    dataset, funding_rates, open_interest, positioning, basis = await materialize_research_dataset(
-        backtest_history,
-        exchange=backtest_exchange,
-        market_type=str(configuration.market_type),
-        symbol=backtest_symbol,
-        timeframe=backtest_timeframe,
-    )
-    strategy_spec = (active_plan.strategy_spec or None) if active_plan else None
-    cache_key = (
-        dataset.id,
-        active_plan.fingerprint if active_plan else str(signal_strategy_kind),
-        configuration.fee_bps,
-        configuration.slippage_bps,
-        configuration.risk.risk_per_trade,
-        configuration.risk.minimum_reward_risk,
-        requires_higher_confirmation(configuration),
-        configuration.strategy.automatic_regime_selection,
-        configuration.strategy.validation.model_dump_json(),
-    )
-    backtest = await execute_research_backtest(
-        dataset,
-        backtest_history,
-        cache_key=cache_key,
-        initial_equity=portfolio.equity,
-        fee_bps=configuration.fee_bps,
-        slippage_bps=configuration.slippage_bps,
-        strategy_kind=(
-            StrategyKind(active_plan.algorithm) if active_plan else signal_strategy_kind
-        ),
-        symbol=backtest_symbol,
-        timeframe=backtest_timeframe,
-        exchange=backtest_exchange,
-        risk_fraction=(
-            active_plan.sizing.risk_fraction if active_plan else configuration.risk.risk_per_trade
-        ),
-        minimum_reward_risk=(
-            active_plan.minimum_reward_risk
-            if active_plan
-            else configuration.risk.minimum_reward_risk
-        ),
-        allow_short=configuration.market_type == "swap",
-        require_confirmation=requires_higher_confirmation(configuration),
-        validation=configuration.strategy.validation,
-        strategy_spec=strategy_spec,
-        funding_rates=funding_rates,
-        open_interest=open_interest,
-        positioning=positioning,
-        basis=basis,
-        automatic_selection=(
-            configuration.strategy.automatic_regime_selection and active_plan is None
-        ),
-        side_filter=Side(active_plan.side) if active_plan else None,
-    )
-    if active_plan:
-        backtest.strategy_fingerprint = active_plan.fingerprint
     latency_ms = max(round((datetime.now(UTC) - market.timestamp).total_seconds() * 1000), 0)
     quality = runtime.market_quality
     return {
         "market": market,
         "candles": history[-CHART_CANDLE_LIMIT:],
-        "signal": current_signal,
         "portfolio": portfolio,
-        "plan": active_plan,
         "risk": decision,
         "orders": recent_orders,
         "audit": audit[:12],
-        "backtest": backtest,
         "system": {
             "mode": configuration.trading_mode,
             "market_type": configuration.market_type,
             "margin_mode": configuration.margin_mode,
             "contract_leverage": configuration.contract_leverage,
-            "live_locked": not configuration.live_trading_enabled,
             "data_latency_ms": latency_ms,
-            "strategy_workers": 1,
             "market_data_real": True,
             "exchange": configuration.exchange_id,
             "market_quality": quality,
@@ -9018,6 +6080,12 @@ async def liquidation_events(symbol: str | None = None, limit: int = 1000):
 async def stream_market(websocket: WebSocket):
     """Push the current exchange tick and forming candle to the browser."""
 
+    if not local_access.trusted_origin(
+        websocket.headers.get("origin"),
+        str(websocket.url),
+    ):
+        await websocket.close(code=1008, reason="untrusted origin")
+        return
     await websocket.accept()
     queue = runtime.market_data.subscribe()
     try:
@@ -9075,6 +6143,61 @@ async def strategy_spec_contract():
 
 @app.post("/api/research/autonomous-runs", response_model=ResearchRunResult)
 async def create_autonomous_research_run(request: AutonomousResearchRunRequest):
+    if request.research_profile == "crypto_5m_v1":
+        ir = compile_strategy_dsl(request.dsl)
+        artifacts: list[AlphaModelArtifactV1] = []
+        for model_id in request.model_artifact_ids:
+            payload = await asyncio.to_thread(store.load_alpha_model_artifact, model_id)
+            if payload is None:
+                raise HTTPException(409, f"alpha model artifact not found: {model_id}")
+            artifacts.append(AlphaModelArtifactV1.model_validate(payload))
+        families = {item.model_family for item in artifacts}
+        if not (
+            families & {"elastic_net_regression", "logistic_classification"}
+            and families & {"lightgbm_regression", "lightgbm_classification"}
+            and "ensemble_50_50" in families
+        ):
+            raise HTTPException(409, "crypto_5m_v1 requires one native model trio")
+        lineage = {
+            (
+                item.profile,
+                item.horizon_bars,
+                item.feature_names,
+                item.ir_fingerprint,
+                item.cost_model_fingerprint,
+            )
+            for item in artifacts
+        }
+        if len(lineage) != 1 or any(item.ir_fingerprint != ir.fingerprint for item in artifacts):
+            raise HTTPException(409, "autonomous run DSL and frozen model lineage differ")
+        if any(not item.walk_forward_passed for item in artifacts):
+            raise HTTPException(
+                409,
+                "autonomous run models did not independently pass walk-forward",
+            )
+        expected_cost = alpha_transaction_cost_fingerprint(
+            fee_bps=configuration_service.current_configuration().fee_bps,
+            slippage_bps=configuration_service.current_configuration().slippage_bps,
+        )
+        if {item.cost_model_fingerprint for item in artifacts} != {expected_cost}:
+            raise HTTPException(409, "autonomous run model cost lineage changed")
+        if any(item.dependency_versions != dependency_versions() for item in artifacts):
+            raise HTTPException(409, "autonomous run model dependency versions drifted")
+        required = tuple(
+            sorted({feature for item in artifacts for feature in item.required_data_features})
+        )
+        datasets = await asyncio.to_thread(store.list_research_datasets, 2_000)
+        contract = assess_crypto_5m_contract(datasets, required_features=required)
+        selected_fingerprints = {
+            item.get("data_fingerprint")
+            for item in datasets
+            if item.get("id") in {market.dataset_id for market in contract.markets}
+        }
+        if (
+            contract.status != "READY"
+            or request.snapshot.dataset_fingerprint not in selected_fingerprints
+        ):
+            raise HTTPException(409, "autonomous run snapshot is outside READY crypto_5m_v1")
     envelope = None
     if request.generator_envelope_id:
         envelope_payload = await asyncio.to_thread(
@@ -9146,8 +6269,15 @@ async def research_datasets(limit: int = 50):
     return [ResearchDataset.model_validate(payload) for payload in payloads]
 
 
-def ai_market_summary(market, history, symbol: str, timeframe: str) -> dict:
-    candles = closed_candles(history, timeframe, market.timestamp)[-300:]
+def ai_market_summary(
+    market,
+    history,
+    symbol: str,
+    timeframe: str,
+    *,
+    maximum_bars: int = 2000,
+) -> dict:
+    candles = closed_candles(history, timeframe, market.timestamp)[-maximum_bars:]
     if len(candles) < 50:
         raise ValueError("至少需要 50 根已收盘 K 线才能生成 AI 策略候选")
     closes = [candle.close for candle in candles]
@@ -9165,6 +6295,7 @@ def ai_market_summary(market, history, symbol: str, timeframe: str) -> dict:
         len(candles), 100
     )
     selected_kind = select_strategy_kind(candles)
+    current_atr = atr(candles, 14)
     return {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -9174,6 +6305,8 @@ def ai_market_summary(market, history, symbol: str, timeframe: str) -> dict:
         "market_timestamp": market.timestamp.isoformat(),
         "last_price": str(market.last),
         "spread_bps": str(market.spread_bps),
+        "atr_14": str(current_atr),
+        "atr_percent": str(current_atr / market.last * 100 if market.last else Decimal("0")),
         "funding_rate": str(market.funding_rate) if market.funding_rate is not None else None,
         "return_20_bars": str(closes[-1] / closes[-20] - Decimal("1")),
         "return_100_bars": str(closes[-1] / closes[-100] - Decimal("1")),
@@ -9183,7 +6316,340 @@ def ai_market_summary(market, history, symbol: str, timeframe: str) -> dict:
         "volume_ratio_20_to_100": str(
             recent_volume / baseline_volume if baseline_volume else Decimal("0")
         ),
+        "recent_average_volume": str(recent_volume),
+        "baseline_average_volume": str(baseline_volume),
         "deterministic_regime": str(selected_kind),
+        "closed_bars_only": True,
+        "coverage_ratio": str(
+            (Decimal(len(candles)) / Decimal(maximum_bars)).quantize(Decimal("0.0001"))
+        ),
+    }
+
+
+def strategy_required_features(raw_spec: dict) -> list[str]:
+    parameters = raw_spec.get("parameters") if isinstance(raw_spec.get("parameters"), dict) else {}
+    entry_model = str(parameters.get("entry_model") or "")
+    required = {"ohlcv"}
+    if (
+        parameters.get("funding_mode") not in {None, "ignore"}
+        or entry_model == "funding_contrarian"
+    ):
+        required.add("funding_rate")
+    if parameters.get("open_interest_mode") not in {None, "ignore"}:
+        required.add("open_interest")
+    if entry_model == "positioning_contrarian":
+        required.add("positioning")
+    if parameters.get("basis_mode") not in {None, "ignore"} or entry_model == "basis_contrarian":
+        required.add("basis")
+    if parameters.get("order_flow_mode") not in {None, "ignore"}:
+        required.add("order_flow")
+    if parameters.get("liquidation_flow_mode") not in {None, "ignore"}:
+        required.add("liquidation_flow")
+    return sorted(required)
+
+
+def review_policy_fingerprint(configuration: UserConfiguration) -> str:
+    return stable_fingerprint(
+        {
+            "validation": configuration.strategy.validation.model_dump(mode="json"),
+            "fee_bps": str(configuration.fee_bps),
+            "slippage_bps": str(configuration.slippage_bps),
+            "risk_per_trade": str(configuration.risk.risk_per_trade),
+            "max_gross_exposure": str(configuration.risk.max_gross_exposure),
+            "max_leverage": str(configuration.risk.max_leverage),
+            "contract_leverage": str(configuration.contract_leverage),
+        }
+    )
+
+
+def recent_candidate_failure_digest(
+    *,
+    symbol: str,
+    timeframe: str,
+    family: StrategyKind | None,
+    limit: int = 10,
+) -> tuple[list[dict], list[str]]:
+    digest: list[dict] = []
+    rejected_fingerprints: list[str] = []
+    for payload in store.list_strategy_candidates(500):
+        context = payload.get("research_context")
+        if not isinstance(context, dict):
+            continue
+        if context.get("symbol") != symbol or context.get("timeframe") != timeframe:
+            continue
+        spec = payload.get("spec") if isinstance(payload.get("spec"), dict) else {}
+        if family is not None and spec.get("family") != family.value:
+            continue
+        if str(payload.get("status") or "") != str(CandidateStatus.REJECTED):
+            continue
+        fingerprint = str(payload.get("spec_fingerprint") or "")
+        backtest = payload.get("backtest") if isinstance(payload.get("backtest"), dict) else {}
+        reasons = list(backtest.get("validation_reasons") or payload.get("decision_reasons") or [])
+        digest.append(
+            {
+                "fingerprint": fingerprint,
+                "family": spec.get("family"),
+                "reasons": reasons[-5:],
+                "cost_r": (backtest.get("cost_model") or {}).get("round_trip_cost_r"),
+            }
+        )
+        if fingerprint:
+            rejected_fingerprints.append(fingerprint)
+        if len(digest) >= limit:
+            break
+    return digest, rejected_fingerprints
+
+
+def candidate_trial_count(*, trial_group: str) -> int:
+    return current_candidate_trial_count(trial_group=trial_group) + 1
+
+
+def current_candidate_trial_count(*, trial_group: str) -> int:
+    count = 0
+    for payload in store.list_strategy_candidates(500):
+        context = payload.get("research_context")
+        if isinstance(context, dict) and context.get("trial_group") == trial_group:
+            count += 1
+    return count
+
+
+def build_candidate_research_context(
+    spec,
+    *,
+    symbol: str,
+    timeframe: str,
+    market_as_of: datetime,
+    summary_material: dict,
+    entry_profile: str = DEFAULT_ENTRY_PROFILE_ID,
+) -> CandidateResearchContext:
+    configuration = configuration_service.current_configuration()
+    spec_payload = spec.model_dump(mode="json", exclude={"fingerprint"})
+    trial_group = stable_fingerprint(
+        {
+            "exchange": configuration.exchange_id,
+            "market_type": str(configuration.market_type),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "family": spec_payload["family"],
+            "contract": "strategy_generation_v2",
+        }
+    )
+    return CandidateResearchContext(
+        exchange=configuration.exchange_id,
+        market_type=str(configuration.market_type),
+        symbol=symbol,
+        timeframe=timeframe,
+        entry_profile=entry_profile,
+        market_as_of=market_as_of,
+        summary_fingerprint=stable_fingerprint(summary_material),
+        fee_bps=configuration.fee_bps,
+        slippage_bps=configuration.slippage_bps,
+        risk_fraction=configuration.risk.risk_per_trade,
+        max_gross_exposure=configuration.risk.max_gross_exposure,
+        max_leverage=configuration.risk.max_leverage,
+        required_features=strategy_required_features(spec_payload),
+        trial_group=trial_group,
+        trial_count=candidate_trial_count(trial_group=trial_group),
+    )
+
+
+def build_candidate_preflight(
+    spec,
+    *,
+    origin_summary: dict,
+    configuration: UserConfiguration,
+) -> dict[str, str | int | float | bool | list[str]]:
+    parameters = spec.parameters
+    last_price = Decimal(str(origin_summary["last_price"]))
+    current_atr = Decimal(str(origin_summary["atr_14"]))
+    stop_atr = Decimal(str(getattr(parameters, "stop_atr", Decimal("1.5"))))
+    stop_distance = current_atr * stop_atr
+    risk_amount = configuration.paper_equity * configuration.risk.risk_per_trade
+    intended_quantity = risk_amount / stop_distance if stop_distance > 0 else Decimal("0")
+    intended_notional = intended_quantity * last_price
+    gross_exposure_limit = configuration.paper_equity * configuration.risk.max_gross_exposure
+    leverage_limit = configuration.paper_equity * min(
+        configuration.risk.max_leverage,
+        configuration.contract_leverage,
+    )
+    recent_volume = Decimal(str(origin_summary.get("recent_average_volume") or "0"))
+    volume_limit = (
+        recent_volume * Decimal("0.02") * last_price if recent_volume > 0 else intended_notional
+    )
+    capped_notional = min(
+        intended_notional,
+        gross_exposure_limit,
+        leverage_limit,
+        volume_limit,
+    )
+    capped_quantity = capped_notional / last_price if last_price > 0 else Decimal("0")
+    estimated_participation = (
+        min(capped_quantity / recent_volume, Decimal("0.02"))
+        if recent_volume > 0
+        else Decimal("0.02")
+    )
+    estimated_impact_bps = Decimal(str(math.sqrt(float(estimated_participation)))) * Decimal("5")
+    estimated_round_trip_bps = (
+        configuration.fee_bps + configuration.slippage_bps + estimated_impact_bps
+    ) * 2
+    estimated_cost = capped_notional * estimated_round_trip_bps / Decimal("10000")
+    capped_stop_risk = capped_quantity * stop_distance
+    cost_r = estimated_cost / capped_stop_risk if capped_stop_risk > 0 else Decimal("999")
+    maximum_cost_r = configuration.strategy.validation.maximum_estimated_round_trip_cost_r
+    reasons: list[str] = []
+    if cost_r > maximum_cost_r:
+        reasons.append(f"预计往返成本 {cost_r:.4f}R 超过设计上限 {maximum_cost_r:.4f}R")
+    position_limits: list[str] = []
+    if capped_notional < intended_notional:
+        if capped_notional == gross_exposure_limit:
+            position_limits.append("gross_exposure")
+        if capped_notional == leverage_limit:
+            position_limits.append("leverage")
+        if capped_notional == volume_limit:
+            position_limits.append("volume_participation")
+        reasons.append(f"风险仓位已受 {'+'.join(position_limits)} 上限约束")
+    return {
+        "eligible": cost_r <= maximum_cost_r,
+        "estimated_round_trip_cost_r": str(cost_r.quantize(Decimal("0.0001"))),
+        "maximum_round_trip_cost_r": str(maximum_cost_r),
+        "intended_notional": str(intended_notional.quantize(Decimal("0.01"))),
+        "capped_notional": str(capped_notional.quantize(Decimal("0.01"))),
+        "intended_quantity": str(intended_quantity.quantize(Decimal("0.00000001"))),
+        "actual_quantity": str(capped_quantity.quantize(Decimal("0.00000001"))),
+        "position_limit_reason": "+".join(position_limits) or "stop_risk",
+        "estimated_market_impact_bps_per_side": str(
+            estimated_impact_bps.quantize(Decimal("0.0001"))
+        ),
+        "required_features": strategy_required_features(
+            spec.model_dump(mode="json", exclude={"fingerprint"})
+        ),
+        "reasons": reasons,
+    }
+
+
+async def build_ai_generation_summary(
+    *,
+    symbol: str,
+    timeframe: str,
+    origin_market,
+    origin_history,
+) -> dict:
+    profile = get_entry_profile(DEFAULT_ENTRY_PROFILE_ID)
+    requested = list(
+        dict.fromkeys(
+            (
+                timeframe,
+                profile.local_context_timeframe,
+                profile.direction_context_timeframe,
+                profile.macro_context_timeframe,
+            )
+        )
+    )
+    summaries: dict[str, dict] = {}
+    for item in requested:
+        try:
+            if item == timeframe:
+                market, history = origin_market, origin_history
+            else:
+                market, history = await runtime.market_context(
+                    limit=2000,
+                    symbol=symbol,
+                    timeframe=item,
+                )
+            summaries[item] = ai_market_summary(market, history, symbol, item)
+        except (LookupError, ValueError) as exc:
+            summaries[item] = {"status": "unavailable", "reason": str(exc)[:300]}
+    return {"origin_timeframe": timeframe, "timeframes": summaries}
+
+
+def unified_research_strategy_library(family: str | None = None) -> dict:
+    """Return public strategy priors as offline Research inputs only."""
+
+    normalized_family = family.strip().lower() if family else None
+    single_leg_families = {item.value for item in StrategyKind}
+    research_families = {"relative_value", "relative_momentum", "carry"}
+    if normalized_family not in {None, *single_leg_families, *research_families}:
+        raise ValueError(
+            "strategy family must be trend, mean_reversion, breakout, "
+            "relative_value, relative_momentum, or carry"
+        )
+    selected_single_family = (
+        StrategyKind(normalized_family) if normalized_family in single_leg_families else None
+    )
+    single_entries = (
+        list_strategy_library(selected_single_family)
+        if normalized_family is None or selected_single_family is not None
+        else []
+    )
+    pair_entries = []
+    if normalized_family in {None, "relative_value", "relative_momentum"}:
+        for spec in PAIR_STRATEGY_LIBRARY:
+            pair_family = (
+                "relative_momentum"
+                if spec.model == "relative_momentum_equal_dollar"
+                else "relative_value"
+            )
+            if normalized_family is not None and normalized_family != pair_family:
+                continue
+            pair_entries.append(
+                {
+                    "id": pair_strategy_id(spec),
+                    "scope": "pair_research_only",
+                    "family": pair_family,
+                    "archetype": spec.model,
+                    "version": spec.version,
+                    "source_urls": [spec.source_url],
+                    "hypothesis": spec.hypothesis,
+                    "strategy_spec": spec.model_dump(mode="json"),
+                    "execution_eligible": False,
+                }
+            )
+    carry_entries = []
+    if normalized_family in {None, "carry"}:
+        carry_entries = [
+            {
+                "id": carry_strategy_id(spec),
+                "scope": "spot_perpetual_research_only",
+                "family": "carry",
+                "archetype": spec.model,
+                "version": spec.version,
+                "source_urls": [spec.source_url],
+                "hypothesis": spec.hypothesis,
+                "strategy_spec": spec.model_dump(mode="json"),
+                "execution_eligible": False,
+            }
+            for spec in CARRY_STRATEGY_LIBRARY
+        ]
+    single_payloads = [
+        {
+            **entry.model_dump(mode="json"),
+            "scope": "single_leg_research_only",
+            "execution_eligible": False,
+        }
+        for entry in single_entries
+    ]
+    all_entries = [*single_payloads, *pair_entries, *carry_entries]
+    family_counts: dict[str, int] = {}
+    for entry in all_entries:
+        entry_family = str(entry["family"])
+        family_counts[entry_family] = family_counts.get(entry_family, 0) + 1
+    archetypes = sorted({str(entry["archetype"]) for entry in all_entries})
+    return {
+        "version": 4,
+        "non_empty": bool(all_entries),
+        "entry_count": len(all_entries),
+        "family_counts": family_counts,
+        "archetype_count": len(archetypes),
+        "archetypes": archetypes,
+        "counts": {
+            "single_leg": len(single_payloads),
+            "pair_research": len(pair_entries),
+            "carry_research": len(carry_entries),
+        },
+        "entries": all_entries,
+        "indicator_catalog": INDICATOR_CATALOG,
+        "profitability_claim": False,
+        "execution_eligible": False,
     }
 
 
@@ -9316,7 +6782,11 @@ async def operator_strategy_library(
     if family:
         items = [item for item in items if item.family == family]
     if not include_hidden:
-        items = [item for item in items if not item.hidden]
+        items = [
+            item
+            for item in items
+            if not item.hidden and item.status not in {"archived", "retired"}
+        ]
     if search:
         needle = search.casefold()
         items = [
@@ -12970,22 +10440,36 @@ async def propose_ai_strategy_candidates(request: AIProposalRequest):
     timeframe = request.timeframe or configuration.default_timeframe
     try:
         market, history = await runtime.market_context(
-            limit=300,
+            limit=2000,
             symbol=symbol,
             timeframe=timeframe,
         )
-        summary = ai_market_summary(market, history, symbol, timeframe)
+        summary = await build_ai_generation_summary(
+            symbol=symbol,
+            timeframe=timeframe,
+            origin_market=market,
+            origin_history=history,
+        )
     except (LookupError, ValueError) as exc:
         raise HTTPException(422, str(exc)) from exc
+
+    failure_digest, rejected_fingerprints = await asyncio.to_thread(
+        recent_candidate_failure_digest,
+        symbol=symbol,
+        timeframe=timeframe,
+        family=request.family,
+    )
 
     ai_gateway.service = ai_configuration_service
     ai_gateway.proxy_url = configuration.network_proxy_url
     ai_view = ai_configuration_service.get()
     system_prompt = (
-        "You are a quantitative research assistant. Propose one parameterized strategy "
-        "candidate only. Never propose order execution, leverage changes, credentials, or "
-        "guaranteed returns. Use only the supplied bounded market summary. The output is a "
-        "research hypothesis that must pass deterministic validation and backtesting."
+        "You are a cost-aware quantitative research assistant. Propose exactly one "
+        "low-turnover parameterized strategy candidate. Never propose order execution, "
+        "leverage changes, credentials, or guaranteed returns. Use only the supplied causal "
+        "closed-bar summaries and failure digest. Prefer parameters whose ATR stop distance "
+        "can absorb the supplied round-trip costs. Do not repeat a rejected fingerprint. "
+        "The output is only a hypothesis and must pass deterministic validation."
     )
     requested_family = (
         request.family.value if request.family else "select the best supported family"
@@ -12993,45 +10477,143 @@ async def propose_ai_strategy_candidates(request: AIProposalRequest):
     user_prompt = (
         f"Operator hypothesis: {request.hypothesis}\n"
         f"Requested family: {requested_family}\n"
-        f"Market summary: {json.dumps(summary, ensure_ascii=False, sort_keys=True)}\n"
+        f"Causal multi-timeframe summary: "
+        f"{json.dumps(summary, ensure_ascii=False, sort_keys=True)}\n"
+        "Execution economics: "
+        f"fee_bps={configuration.fee_bps}, slippage_bps={configuration.slippage_bps}, "
+        f"risk_fraction={configuration.risk.risk_per_trade}, "
+        f"max_gross_exposure={configuration.risk.max_gross_exposure}, "
+        f"max_leverage={configuration.risk.max_leverage}, "
+        "market_impact=nonlinear_volume_participation_model_with_2_percent_cap, "
+        "maximum_round_trip_cost_r="
+        f"{configuration.strategy.validation.maximum_estimated_round_trip_cost_r}.\n"
+        f"Recent development failures: "
+        f"{json.dumps(failure_digest, ensure_ascii=False, sort_keys=True)}\n"
+        f"Rejected fingerprints: {json.dumps(rejected_fingerprints, ensure_ascii=False)}\n"
         "Return exactly one StrategySpec object. Set source to ai and explain the hypothesis "
-        "briefly. Keep every parameter inside the schema limits."
+        "briefly. Keep every parameter inside the schema limits. Favor lower turnover and "
+        "wider economically feasible stops over cosmetic parameter variation."
     )
     mode = ai_view.configuration.routing_mode
     providers: list[AIProvider | None]
     if request.provider:
         providers = [request.provider]
         mode = "manual"
-    elif mode == "consensus":
-        route = ai_gateway.routing_order()
-        if len(route) < 2:
-            raise HTTPException(409, "双模型复核至少需要启用两个已配置的 AI 厂商")
-        providers = route[:2]
     else:
+        # Research generation is the only automatic-AI boundary. One market
+        # event produces one structured proposal; deterministic review owns
+        # validation and comparison, so a second model call adds cost without
+        # adding execution authority.
         providers = [None]
+        mode = "single_efficient"
 
     proposals: list[AIProposalItem] = []
     try:
         for provider in providers:
-            completion, attempted = await ai_gateway.generate_json(
-                system=system_prompt,
-                prompt=user_prompt,
-                schema=strategy_spec_json_schema(),
-                schema_name="strategy_spec",
-                requested_provider=provider,
-                max_tokens=3200,
-                operation="strategy_candidate_generation",
-                prompt_version="strategy_candidate_v2",
-                schema_version="strategy_spec_v1",
+            completion = None
+            attempted: list[AIProvider] = []
+            spec = None
+            last_validation_error: ValueError | None = None
+            repair_payload: dict = {}
+            repair_error = "provider response was not valid JSON"
+            for attempt in range(2):
+                try:
+                    completion, attempted = await ai_gateway.generate_json(
+                        system=system_prompt,
+                        prompt=(
+                            user_prompt
+                            if attempt == 0
+                            else (
+                                "Repair the previous invalid strategy response. Return one "
+                                "compact StrategySpec JSON object only, with every required "
+                                f"field inside its bound. Validation error: {repair_error}. "
+                                "Previous response: "
+                                f"{json.dumps(repair_payload, ensure_ascii=False, sort_keys=True)}"
+                            )
+                        ),
+                        schema=strategy_spec_json_schema(),
+                        schema_name="strategy_spec",
+                        requested_provider=provider,
+                        max_tokens=4000 if attempt == 0 else 6000,
+                        # Reliability is more important than hidden chain-of-thought for
+                        # a schema-constrained hypothesis. Deterministic review owns the
+                        # empirical judgment after this isolated proposal is persisted.
+                        thinking_enabled=attempt == 0,
+                        operation="strategy_candidate_generation",
+                        prompt_version="strategy_candidate_v4_cost_aware",
+                        schema_version="strategy_spec_v1",
+                    )
+                    raw_spec = {
+                        **completion.data,
+                        "source": "ai",
+                        "hypothesis": request.hypothesis,
+                    }
+                    spec = validate_strategy_spec(raw_spec, expected_kind=request.family)
+                    break
+                except AIProviderError as exc:
+                    if attempt == 0 and exc.code == AIErrorCode.INVALID_RESPONSE:
+                        repair_error = str(exc)[:500]
+                        continue
+                    raise
+                except ValueError as exc:
+                    last_validation_error = exc
+                    repair_payload = dict(completion.data) if completion else {}
+                    repair_error = str(exc)[:500]
+                    if attempt == 0:
+                        continue
+                    raise
+            if completion is None or spec is None:
+                raise last_validation_error or ValueError(
+                    "AI strategy candidate repair did not produce a valid StrategySpec"
+                )
+            spec_payload = spec.model_dump(mode="json", exclude={"fingerprint"})
+            trial_group = stable_fingerprint(
+                {
+                    "exchange": configuration.exchange_id,
+                    "market_type": str(configuration.market_type),
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "family": spec_payload["family"],
+                    "contract": "strategy_generation_v2",
+                }
             )
-            raw_spec = {
-                **completion.data,
-                "source": "ai",
-                "hypothesis": request.hypothesis,
-            }
-            spec = validate_strategy_spec(raw_spec, expected_kind=request.family)
-            candidate = create_candidate(spec)
+            context = CandidateResearchContext(
+                exchange=configuration.exchange_id,
+                market_type=str(configuration.market_type),
+                symbol=symbol,
+                timeframe=timeframe,
+                entry_profile=DEFAULT_ENTRY_PROFILE_ID,
+                market_as_of=market.timestamp,
+                summary_fingerprint=stable_fingerprint(summary),
+                fee_bps=configuration.fee_bps,
+                slippage_bps=configuration.slippage_bps,
+                risk_fraction=configuration.risk.risk_per_trade,
+                max_gross_exposure=configuration.risk.max_gross_exposure,
+                max_leverage=configuration.risk.max_leverage,
+                required_features=strategy_required_features(spec_payload),
+                trial_group=trial_group,
+                trial_count=await asyncio.to_thread(
+                    candidate_trial_count,
+                    trial_group=trial_group,
+                ),
+            )
+            preflight = build_candidate_preflight(
+                spec,
+                origin_summary=summary["timeframes"][timeframe],
+                configuration=configuration,
+            )
+            preflight_reasons = list(preflight.get("reasons") or [])
+            if spec.fingerprint in rejected_fingerprints:
+                preflight["eligible"] = False
+                preflight_reasons.append("策略指纹与同一研究域的历史拒绝候选重复")
+                preflight["reasons"] = preflight_reasons
+            candidate = create_candidate(spec, research_context=context)
+            if not bool(preflight["eligible"]):
+                candidate.status = CandidateStatus.REJECTED
+                candidate.decision_reasons.extend(preflight_reasons)
             await asyncio.to_thread(store.save_strategy_candidate, candidate)
+            if bool(preflight["eligible"]):
+                review_worker_wakeup.set()
             proposals.append(
                 AIProposalItem(
                     provider=completion.provider,
@@ -13040,6 +10622,7 @@ async def propose_ai_strategy_candidates(request: AIProposalRequest):
                     usage=completion.usage,
                     latency_ms=completion.latency_ms,
                     route=attempted,
+                    preflight=preflight,
                 )
             )
     except AIProviderError as exc:
@@ -13107,13 +10690,28 @@ async def research_backtest_jobs(limit: int = 50):
 @app.post("/api/research/candidates", response_model=StrategyCandidate)
 async def propose_strategy_candidate(request: CandidateRequest):
     try:
+        validated = validate_strategy_spec(request.strategy_spec)
+        configuration = configuration_service.current_configuration()
+        context = await asyncio.to_thread(
+            build_candidate_research_context,
+            validated,
+            symbol=configuration.default_symbol,
+            timeframe=configuration.default_timeframe,
+            market_as_of=datetime.now(UTC),
+            summary_material={
+                "source": "operator",
+                "spec_fingerprint": validated.fingerprint,
+            },
+        )
         candidate = create_candidate(
-            request.strategy_spec,
+            validated,
             parent_candidate_id=request.parent_candidate_id,
+            research_context=context,
         )
     except ValueError as exc:
         raise HTTPException(422, f"candidate strategy spec is invalid: {exc}") from exc
     await asyncio.to_thread(store.save_strategy_candidate, candidate)
+    review_worker_wakeup.set()
     add_audit(
         "research",
         "受约束策略候选已登记，尚不可执行",
@@ -13455,7 +11053,7 @@ async def promote_strategy_candidate(
             raise HTTPException(409, str(exc)) from exc
         add_audit(
             "research",
-            "研究候选晋升为 Champion；不会自动激活交易计划",
+            "研究候选晋升为 Champion；仅作为离线研究证据保留",
             candidate_id=candidate.id,
         )
     return decision
@@ -13471,8 +11069,23 @@ async def create_ml_challenger():
     candles = closed_candles(history, configuration.default_timeframe, market.timestamp)
     report = await asyncio.to_thread(train_ml_challenger, candles)
     if report.accepted and report.candidate_spec:
-        candidate = create_candidate(report.candidate_spec)
+        validated = validate_strategy_spec(report.candidate_spec)
+        context = await asyncio.to_thread(
+            build_candidate_research_context,
+            validated,
+            symbol=configuration.default_symbol,
+            timeframe=configuration.default_timeframe,
+            market_as_of=market.timestamp,
+            summary_material={
+                "source": "ml",
+                "candle_count": len(candles),
+                "data_as_of": market.timestamp.isoformat(),
+                "spec_fingerprint": validated.fingerprint,
+            },
+        )
+        candidate = create_candidate(validated, research_context=context)
         await asyncio.to_thread(store.save_strategy_candidate, candidate)
+        review_worker_wakeup.set()
     return report
 
 
@@ -13629,784 +11242,6 @@ async def generate_strategy(request: GenerateRequest):
     return plan
 
 
-@app.post("/api/strategies/{plan_id}/approve", response_model=StrategyPlan)
-async def approve_strategy(plan_id: str, request: ApproveRequest):
-    plan = plans.get(plan_id)
-    if not plan:
-        raise HTTPException(404, "strategy plan not found")
-    if plan.status != PlanStatus.DRAFT:
-        raise HTTPException(409, "only a draft strategy can be approved")
-    validate_plan_research_provenance(plan)
-    expected = f"APPROVE {plan.fingerprint}"
-    if request.confirmation != expected:
-        raise HTTPException(400, f"confirmation must be exactly: {expected}")
-    artifact_data = store.load_latest_backtest(plan.id)
-    if not artifact_data:
-        raise HTTPException(409, "策略必须先完成一次绑定当前版本的真实数据回测")
-    artifact = BacktestResult.model_validate(artifact_data)
-    if artifact.strategy_fingerprint != plan.fingerprint:
-        raise HTTPException(409, "策略已发生变化，必须重新回测后再审核")
-    if artifact.cost_model.get("direction_filter") != str(plan.side):
-        raise HTTPException(409, "回测证据未绑定当前计划方向，必须重新回测")
-    if not artifact.robustness_passed:
-        reasons = "；".join(artifact.validation_reasons)
-        raise HTTPException(409, f"策略稳健性验收未通过：{reasons}")
-    if artifact.trade_sample_strongly_corroborated and not (
-        artifact.parameter_walk_forward and artifact.parameter_walk_forward.get("passed") is True
-    ):
-        raise HTTPException(
-            409,
-            "强证据低样本策略还必须通过“过去分段选参、下一分段验证”的参数前推报告",
-        )
-    plan.approved_at = datetime.now(UTC)
-    plan.approved_fingerprint = plan.fingerprint
-    plan.status = PlanStatus.APPROVED
-    store.save_strategy(plan)
-    add_audit(
-        "strategy",
-        "策略版本已人工审核",
-        plan_id=plan.id,
-        fingerprint=plan.fingerprint,
-        data_fingerprint=artifact.data_fingerprint,
-    )
-    return plan
-
-
-@app.post("/api/strategies/{plan_id}/activate", response_model=StrategyPlan)
-async def activate_strategy(plan_id: str, request: ActivateRequest):
-    plan = plans.get(plan_id)
-    if not plan:
-        raise HTTPException(404, "strategy plan not found")
-    validate_agent_plan_grant(plan)
-    validate_plan_research_provenance(plan)
-    if plan.status != PlanStatus.APPROVED:
-        raise HTTPException(409, "strategy must be approved before activation")
-    if plan.approved_fingerprint != plan.fingerprint:
-        raise HTTPException(409, "approved strategy fingerprint no longer matches")
-    if plan.entry.expires_at:
-        expires_at = plan.entry.expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-        if expires_at <= datetime.now(UTC):
-            raise HTTPException(409, "strategy entry window has expired; generate a new version")
-    expected = f"ACTIVATE {plan.symbol}"
-    if request.confirmation != expected:
-        raise HTTPException(400, f"confirmation must be exactly: {expected}")
-    configuration = configuration_service.current_configuration()
-    expected_margin_mode = (
-        str(configuration.margin_mode) if configuration.market_type == "swap" else "cash"
-    )
-    expected_leverage = (
-        configuration.contract_leverage if configuration.market_type == "swap" else Decimal("1")
-    )
-    if (
-        plan.exchange != configuration.exchange_id
-        or plan.trading_mode != configuration.trading_mode
-        or plan.market_type != configuration.market_type
-        or plan.margin_mode != expected_margin_mode
-        or plan.leverage != expected_leverage
-    ):
-        raise HTTPException(409, "策略交易所、模式、市场、保证金模式或杠杆与当前环境不一致")
-    try:
-        market, history = await runtime.market_context(
-            limit=configuration_service.current_configuration().strategy.research_bars,
-            symbol=plan.symbol,
-            timeframe=plan.timeframe,
-        )
-        portfolio = await runtime.portfolio()
-    except Exception as exc:
-        raise HTTPException(503, f"激活前行情或账户检查失败：{exc}") from exc
-    signal = evaluate_current_plan_signal(plan, history, market)
-    lifecycle = assess_entry_signal(plan, signal)
-    decision = add_signal_gate(risk_engine().evaluate(plan, portfolio, market), plan, signal)
-    if not decision.approved:
-        failures = "；".join(check.message for check in decision.checks if not check.passed)
-        raise HTTPException(409, f"策略未通过激活风控：{failures}")
-    if lifecycle.state == EntrySignalState.DEGRADED:
-        add_audit(
-            "strategy",
-            "计划信号暂时转为 flat，但未形成反向证据；保留有效入场计划。",
-            severity="warning",
-            plan_id=plan.id,
-            lifecycle_state=str(lifecycle.state),
-        )
-    for previous in plans.values():
-        if (
-            previous.id != plan.id
-            and previous.lineage_id == plan.lineage_id
-            and previous.status == PlanStatus.ACTIVE
-        ):
-            previous.status = PlanStatus.ARCHIVED
-            store.save_strategy(previous)
-    plan.status = PlanStatus.ACTIVE
-    store.save_strategy(plan)
-    add_audit("strategy", "策略已激活，等待入场条件", plan_id=plan.id)
-    return plan
-
-
-def _multi_leg_certificate_for_request(request: MultiLegExecutionRequest):
-    payload = (
-        store.load_relative_value_campaign(request.campaign_id)
-        if request.strategy_kind == "pair"
-        else store.load_carry_campaign(request.campaign_id)
-    )
-    if payload is None:
-        raise HTTPException(404, "multi-leg research Campaign not found")
-    report = (
-        PairResearchCampaignReport.model_validate(payload)
-        if request.strategy_kind == "pair"
-        else CarryResearchCampaignReport.model_validate(payload)
-    )
-    certificate = report.execution_certificate
-    if not report.execution_eligible or certificate is None:
-        raise HTTPException(409, "multi-leg Campaign has no sealed-blind execution certificate")
-    try:
-        validate_multi_leg_execution_certificate(certificate, request=request)
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    return certificate
-
-
-def _validated_multi_leg_strategy_spec(
-    request: MultiLegExecutionRequest,
-    certificate,
-) -> PairStrategySpec | CarryStrategySpec:
-    if certificate.version < 2 or not certificate.strategy_spec_payload:
-        raise HTTPException(
-            409,
-            "multi-leg execution requires a v2 certificate with a frozen strategy spec",
-        )
-    if request.strategy_kind == "pair":
-        spec: PairStrategySpec | CarryStrategySpec = PairStrategySpec.model_validate(
-            certificate.strategy_spec_payload
-        )
-        if {leg.role for leg in request.legs} != {"pair_a", "pair_b"}:
-            raise HTTPException(422, "pair execution requires pair_a and pair_b roles")
-        if any(leg.market_type != "swap" for leg in request.legs):
-            raise HTTPException(422, "pair execution requires swap legs")
-    else:
-        spec = CarryStrategySpec.model_validate(certificate.strategy_spec_payload)
-        if {leg.role for leg in request.legs} != {"spot", "perpetual"}:
-            raise HTTPException(422, "carry execution requires spot and perpetual roles")
-        spot = next(leg for leg in request.legs if leg.role == "spot")
-        perpetual = next(leg for leg in request.legs if leg.role == "perpetual")
-        if (
-            spot.market_type != "spot"
-            or spot.side != OrderSide.BUY
-            or perpetual.market_type != "swap"
-            or perpetual.side != OrderSide.SELL
-            or spot.symbol != perpetual.symbol
-        ):
-            raise HTTPException(
-                422,
-                "carry execution requires same-symbol spot buy and perpetual sell",
-            )
-    if spec.fingerprint != certificate.strategy_fingerprint:
-        raise HTTPException(409, "certificate strategy spec fingerprint mismatch")
-    return spec
-
-
-async def _paper_multi_leg_adapters(
-    request: MultiLegExecutionRequest,
-) -> dict[str, PaperExchange]:
-    configuration = configuration_service.current_configuration()
-    if configuration.trading_mode != TradingMode.PAPER or request.trading_mode != "paper":
-        raise HTTPException(
-            409,
-            "multi-leg exchange execution remains locked; use paper commissioning first",
-        )
-    if any(leg.exchange != configuration.exchange_id for leg in request.legs):
-        raise HTTPException(409, "multi-leg request exchange differs from the active environment")
-    adapters: dict[str, PaperExchange] = {}
-    for adapter_key in sorted({leg.adapter_key for leg in request.legs}):
-        scoped_legs = [leg for leg in request.legs if leg.adapter_key == adapter_key]
-        scope = scoped_legs[0]
-        paper = PaperExchange(
-            initial_cash=configuration.paper_equity,
-            fee_bps=configuration.fee_bps,
-            slippage_bps=configuration.slippage_bps,
-            market_type=scope.market_type,
-            margin_mode=str(configuration.margin_mode),
-            contract_leverage=configuration.contract_leverage,
-            store=store,
-            account_id=(f"paper:{scope.exchange}:{scope.market_type}:multi_leg:{adapter_key}"),
-        )
-        public = CcxtExchangeAdapter(
-            scope.exchange,
-            {},
-            sandbox=False,
-            live_enabled=False,
-            public_only=True,
-            market_type=scope.market_type,
-            margin_mode=str(configuration.margin_mode),
-            contract_leverage=configuration.contract_leverage,
-            proxy_url=configuration.network_proxy_url,
-        )
-        try:
-            snapshots = await asyncio.gather(
-                *(public.market_snapshot(leg.symbol) for leg in scoped_legs)
-            )
-        finally:
-            await public.close()
-        for snapshot in snapshots:
-            paper.update_market(snapshot)
-        adapters[adapter_key] = paper
-    return adapters
-
-
-async def _sandbox_strategy_multi_leg_adapters(
-    request: MultiLegExecutionRequest,
-) -> tuple[dict[str, CcxtExchangeAdapter], dict[str, OrderLedger]]:
-    configuration = configuration_service.current_configuration()
-    if configuration.trading_mode != TradingMode.SANDBOX or request.trading_mode != "sandbox":
-        raise HTTPException(409, "multi-leg exchange execution requires sandbox mode")
-    if any(leg.exchange != configuration.exchange_id for leg in request.legs):
-        raise HTTPException(409, "multi-leg request exchange differs from active sandbox")
-    credential_fingerprint = configuration_service.credential_fingerprint(configuration)
-    commissioning_payload = store.load_multi_leg_commissioning(
-        configuration.exchange_id,
-        request.strategy_kind,
-    )
-    if commissioning_payload is None:
-        raise HTTPException(409, "matching multi-leg sandbox commissioning is missing")
-    commissioning = MultiLegCommissioningResult.model_validate(commissioning_payload)
-    scopes = sorted(f"{leg.exchange}:{leg.market_type}:{leg.symbol}" for leg in request.legs)
-    try:
-        validate_multi_leg_commissioning_result(
-            commissioning,
-            exchange=configuration.exchange_id,
-            credential_fingerprint=credential_fingerprint,
-            strategy_kind=request.strategy_kind,
-            execution_scopes=scopes,
-        )
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    credentials = configuration_service.credentials_for(configuration)
-    adapters: dict[str, CcxtExchangeAdapter] = {}
-    ledgers: dict[str, OrderLedger] = {}
-    for adapter_key in sorted({leg.adapter_key for leg in request.legs}):
-        scoped_legs = [leg for leg in request.legs if leg.adapter_key == adapter_key]
-        scope = scoped_legs[0]
-        adapter = CcxtExchangeAdapter(
-            configuration.exchange_id,
-            credentials,
-            sandbox=True,
-            live_enabled=False,
-            market_type=scope.market_type,
-            margin_mode=str(configuration.margin_mode),
-            contract_leverage=configuration.contract_leverage,
-            store=store,
-            account_id=(f"{configuration.exchange_id}:sandbox:{scope.market_type}:multi_leg"),
-            proxy_url=configuration.network_proxy_url,
-        )
-        adapters[adapter_key] = adapter
-        ledgers[adapter_key] = OrderLedger(
-            store,
-            f"{configuration.exchange_id}:sandbox:{scope.market_type}:multi_leg",
-        )
-    return adapters, ledgers
-
-
-@app.post(
-    "/api/execution/multi-leg/paper",
-    response_model=MultiLegExecutionRun,
-)
-async def execute_paper_multi_leg(request: MultiLegExecutionRequest):
-    certificate = _multi_leg_certificate_for_request(request)
-    _validated_multi_leg_strategy_spec(request, certificate)
-    if risk_state_service.get().halted:
-        raise HTTPException(409, "global risk halt blocks multi-leg entry")
-    adapters = await _paper_multi_leg_adapters(request)
-    coordinator = MultiLegExecutionCoordinator(
-        store,
-        adapters,
-        risk_state=risk_state_service,
-    )
-    return await coordinator.execute(
-        request,
-        validate_certificate=lambda candidate: validate_multi_leg_execution_certificate(
-            certificate,
-            request=candidate,
-        ),
-    )
-
-
-@app.post(
-    "/api/execution/multi-leg/sandbox",
-    response_model=MultiLegExecutionRun,
-)
-async def execute_sandbox_multi_leg(request: MultiLegExecutionRequest):
-    certificate = _multi_leg_certificate_for_request(request)
-    _validated_multi_leg_strategy_spec(request, certificate)
-    if risk_state_service.get().halted:
-        raise HTTPException(409, "global risk halt blocks multi-leg entry")
-    adapters, ledgers = await _sandbox_strategy_multi_leg_adapters(request)
-    try:
-        coordinator = MultiLegExecutionCoordinator(
-            store,
-            adapters,
-            risk_state=risk_state_service,
-            reconciliation_attempts=8,
-            reconciliation_delay_seconds=0.5,
-            order_sink=lambda adapter_key, order: ledgers[adapter_key].record(
-                order,
-                protection_verified=False,
-            ),
-        )
-        return await coordinator.execute(
-            request,
-            validate_certificate=lambda candidate: validate_multi_leg_execution_certificate(
-                certificate,
-                request=candidate,
-            ),
-        )
-    finally:
-        await asyncio.gather(
-            *(adapter.close() for adapter in adapters.values()),
-            return_exceptions=True,
-        )
-
-
-@app.post(
-    "/api/execution/multi-leg/{run_id}/close",
-    response_model=MultiLegExecutionRun,
-)
-async def close_paper_multi_leg(run_id: str):
-    payload = await asyncio.to_thread(store.load_multi_leg_execution_run, run_id)
-    if payload is None:
-        raise HTTPException(404, "multi-leg execution run not found")
-    run = MultiLegExecutionRun.model_validate(payload)
-    certificate = _multi_leg_certificate_for_request(run.request)
-    _validated_multi_leg_strategy_spec(run.request, certificate)
-    if run.request.trading_mode == "paper":
-        adapters = await _paper_multi_leg_adapters(run.request)
-        ledgers: dict[str, OrderLedger] = {}
-    elif run.request.trading_mode == "sandbox":
-        adapters, ledgers = await _sandbox_strategy_multi_leg_adapters(run.request)
-    else:
-        raise HTTPException(
-            409,
-            "live multi-leg execution is locked until profitability certification",
-        )
-    try:
-        coordinator = MultiLegExecutionCoordinator(
-            store,
-            adapters,
-            risk_state=risk_state_service,
-            reconciliation_attempts=(8 if run.request.trading_mode == "sandbox" else 3),
-            reconciliation_delay_seconds=(0.5 if run.request.trading_mode == "sandbox" else 0.05),
-            order_sink=(
-                (
-                    lambda adapter_key, order: ledgers[adapter_key].record(
-                        order,
-                        protection_verified=False,
-                    )
-                )
-                if ledgers
-                else None
-            ),
-        )
-        return await coordinator.close(
-            run_id,
-            validate_certificate=lambda candidate: validate_multi_leg_execution_certificate(
-                certificate,
-                request=candidate,
-            ),
-        )
-    finally:
-        await asyncio.gather(
-            *(adapter.close() for adapter in adapters.values()),
-            return_exceptions=True,
-        )
-
-
-async def _evaluate_multi_leg_exit(run_id: str) -> MultiLegExecutionRun:
-    payload = await asyncio.to_thread(store.load_multi_leg_execution_run, run_id)
-    if payload is None:
-        raise HTTPException(404, "multi-leg execution run not found")
-    run = MultiLegExecutionRun.model_validate(payload)
-    if run.status != MultiLegExecutionStatus.HEDGED:
-        return run
-    certificate = _multi_leg_certificate_for_request(run.request)
-    spec = _validated_multi_leg_strategy_spec(run.request, certificate)
-    if run.request.trading_mode == "paper":
-        execution_adapters = await _paper_multi_leg_adapters(run.request)
-        ledgers: dict[str, OrderLedger] = {}
-        configuration = configuration_service.current_configuration()
-        market_adapters = {
-            key: CcxtExchangeAdapter(
-                legs[0].exchange,
-                {},
-                sandbox=False,
-                live_enabled=False,
-                public_only=True,
-                market_type=legs[0].market_type,
-                margin_mode=str(configuration.margin_mode),
-                contract_leverage=configuration.contract_leverage,
-                proxy_url=configuration.network_proxy_url,
-            )
-            for key in sorted({leg.adapter_key for leg in run.request.legs})
-            for legs in [[leg for leg in run.request.legs if leg.adapter_key == key]]
-        }
-    elif run.request.trading_mode == "sandbox":
-        execution_adapters, ledgers = await _sandbox_strategy_multi_leg_adapters(run.request)
-        market_adapters = execution_adapters
-    else:
-        raise HTTPException(409, "live multi-leg monitoring remains locked")
-    separate_market_adapters = run.request.trading_mode == "paper"
-    try:
-        bar_seconds = timeframe_seconds(run.request.timeframe)
-        if run.request.strategy_kind == "pair":
-            pair_a = next(leg for leg in run.request.legs if leg.role == "pair_a")
-            pair_b = next(leg for leg in run.request.legs if leg.role == "pair_b")
-            limit = min(max(spec.formation_window + 8, 80), 1200)
-            candles_a, candles_b, snapshot_a, snapshot_b = await asyncio.gather(
-                market_adapters[pair_a.adapter_key].fetch_candles(
-                    pair_a.symbol,
-                    run.request.timeframe,
-                    limit,
-                ),
-                market_adapters[pair_b.adapter_key].fetch_candles(
-                    pair_b.symbol,
-                    run.request.timeframe,
-                    limit,
-                ),
-                market_adapters[pair_a.adapter_key].market_snapshot(pair_a.symbol),
-                market_adapters[pair_b.adapter_key].market_snapshot(pair_b.symbol),
-            )
-            as_of = min(snapshot_a.timestamp, snapshot_b.timestamp)
-            signal = latest_causal_pair_signal(
-                closed_candles(candles_a, run.request.timeframe, as_of),
-                closed_candles(candles_b, run.request.timeframe, as_of),
-                spec,
-            )
-            if signal is None:
-                raise RuntimeError("pair exit monitor lacks a causal synchronized signal")
-            market_data_at, signal_value, hedge_ratio = signal
-            held_bars = max(
-                int((market_data_at - run.created_at).total_seconds() // bar_seconds),
-                0,
-            )
-            should_close, reason = evaluate_pair_exit(
-                spec_payload=certificate.strategy_spec_payload,
-                pair_a_side=pair_a.side,
-                zscore=signal_value,
-                held_bars=held_bars,
-            )
-            signal_name = "pair_zscore"
-        else:
-            spot = next(leg for leg in run.request.legs if leg.role == "spot")
-            perpetual = next(leg for leg in run.request.legs if leg.role == "perpetual")
-            spot_market, perpetual_market = await asyncio.gather(
-                market_adapters[spot.adapter_key].market_snapshot(spot.symbol),
-                market_adapters[perpetual.adapter_key].market_snapshot(perpetual.symbol),
-            )
-            market_data_at = min(spot_market.timestamp, perpetual_market.timestamp)
-            signal_value = perpetual_market.last / spot_market.last - Decimal("1")
-            hedge_ratio = None
-            held_bars = max(
-                int((market_data_at - run.created_at).total_seconds() // bar_seconds),
-                0,
-            )
-            should_close, reason = evaluate_carry_exit(
-                spec_payload=certificate.strategy_spec_payload,
-                basis_rate=signal_value,
-                funding_rate=perpetual_market.funding_rate,
-                held_bars=held_bars,
-            )
-            signal_name = "carry_basis_rate"
-        run.exit_monitor = MultiLegExitMonitorState(
-            market_data_at=market_data_at,
-            held_bars=held_bars,
-            signal_name=signal_name,
-            signal_value=signal_value,
-            hedge_ratio=hedge_ratio,
-            should_close=should_close,
-            reason=reason,
-            consecutive_errors=0,
-        )
-        await asyncio.to_thread(store.save_multi_leg_execution_run, run)
-        if not should_close:
-            return run
-        coordinator = MultiLegExecutionCoordinator(
-            store,
-            execution_adapters,
-            risk_state=risk_state_service,
-            reconciliation_attempts=(8 if run.request.trading_mode == "sandbox" else 3),
-            reconciliation_delay_seconds=(0.5 if run.request.trading_mode == "sandbox" else 0.05),
-            order_sink=(
-                (
-                    lambda adapter_key, order: ledgers[adapter_key].record(
-                        order,
-                        protection_verified=False,
-                    )
-                )
-                if ledgers
-                else None
-            ),
-        )
-        closed_run = await coordinator.close(
-            run.id,
-            validate_certificate=lambda candidate: validate_multi_leg_execution_certificate(
-                certificate,
-                request=candidate,
-            ),
-        )
-        add_audit(
-            "execution",
-            "multi-leg exit monitor completed coordinated close",
-            run_id=run.id,
-            reason=reason,
-            signal_value=str(signal_value),
-            held_bars=held_bars,
-        )
-        return closed_run
-    finally:
-        await asyncio.gather(
-            *(adapter.close() for adapter in execution_adapters.values()),
-            return_exceptions=True,
-        )
-        if separate_market_adapters:
-            await asyncio.gather(
-                *(adapter.close() for adapter in market_adapters.values()),
-                return_exceptions=True,
-            )
-
-
-async def _resume_interrupted_multi_leg_run(
-    run: MultiLegExecutionRun,
-) -> MultiLegExecutionRun:
-    certificate = _multi_leg_certificate_for_request(run.request)
-    _validated_multi_leg_strategy_spec(run.request, certificate)
-    if run.request.trading_mode == "paper":
-        adapters = await _paper_multi_leg_adapters(run.request)
-        ledgers: dict[str, OrderLedger] = {}
-    elif run.request.trading_mode == "sandbox":
-        adapters, ledgers = await _sandbox_strategy_multi_leg_adapters(run.request)
-    else:
-        raise RuntimeError("live multi-leg restart recovery remains locked")
-    try:
-        coordinator = MultiLegExecutionCoordinator(
-            store,
-            adapters,
-            risk_state=risk_state_service,
-            reconciliation_attempts=(8 if run.request.trading_mode == "sandbox" else 3),
-            reconciliation_delay_seconds=(0.5 if run.request.trading_mode == "sandbox" else 0.05),
-            order_sink=(
-                (
-                    lambda adapter_key, order: ledgers[adapter_key].record(
-                        order,
-                        protection_verified=False,
-                    )
-                )
-                if ledgers
-                else None
-            ),
-        )
-
-        def validator(candidate: MultiLegExecutionRequest) -> None:
-            validate_multi_leg_execution_certificate(
-                certificate,
-                request=candidate,
-            )
-
-        if run.status == MultiLegExecutionStatus.CLOSING:
-            return await coordinator.close(
-                run.id,
-                validate_certificate=validator,
-            )
-        return await coordinator.execute(
-            run.request,
-            validate_certificate=validator,
-        )
-    finally:
-        await asyncio.gather(
-            *(adapter.close() for adapter in adapters.values()),
-            return_exceptions=True,
-        )
-
-
-async def multi_leg_exit_monitor_loop() -> None:
-    while True:
-        payloads = await asyncio.to_thread(store.list_multi_leg_execution_runs, 1000)
-        for payload in payloads:
-            run = MultiLegExecutionRun.model_validate(payload)
-            if run.status in {
-                MultiLegExecutionStatus.RESERVED,
-                MultiLegExecutionStatus.SUBMITTING,
-                MultiLegExecutionStatus.RECONCILING,
-                MultiLegExecutionStatus.COMPENSATING,
-                MultiLegExecutionStatus.CLOSING,
-            }:
-                try:
-                    await _resume_interrupted_multi_leg_run(run)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    risk_state_service.halt(
-                        "multi-leg restart recovery failed; manual venue reconciliation "
-                        f"is required for {run.id}: {str(exc)[:160]}",
-                        source="multi_leg_restart_recovery",
-                    )
-                    metrics.increment("multi_leg_restart_recovery_failures_total")
-                continue
-            if run.status != MultiLegExecutionStatus.HEDGED:
-                continue
-            try:
-                await _evaluate_multi_leg_exit(run.id)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                latest_payload = await asyncio.to_thread(
-                    store.load_multi_leg_execution_run,
-                    run.id,
-                )
-                latest = MultiLegExecutionRun.model_validate(latest_payload or payload)
-                previous_errors = (
-                    latest.exit_monitor.consecutive_errors if latest.exit_monitor is not None else 0
-                )
-                latest.exit_monitor = MultiLegExitMonitorState(
-                    reason=str(exc)[:500],
-                    consecutive_errors=previous_errors + 1,
-                )
-                await asyncio.to_thread(store.save_multi_leg_execution_run, latest)
-                metrics.increment("multi_leg_exit_monitor_failures_total")
-                if latest.exit_monitor.consecutive_errors >= 3:
-                    risk_state_service.halt(
-                        "multi-leg exit monitoring failed repeatedly; manual position "
-                        f"reconciliation is required for {latest.id}",
-                        source="multi_leg_exit_monitor",
-                    )
-        await asyncio.sleep(30)
-
-
-@app.post(
-    "/api/execution/multi-leg/{run_id}/evaluate-exit",
-    response_model=MultiLegExecutionRun,
-)
-async def evaluate_multi_leg_exit(run_id: str):
-    return await _evaluate_multi_leg_exit(run_id)
-
-
-@app.get(
-    "/api/execution/multi-leg",
-    response_model=list[MultiLegExecutionRun],
-)
-async def list_multi_leg_execution_runs(limit: int = 100):
-    payloads = await asyncio.to_thread(
-        store.list_multi_leg_execution_runs,
-        min(max(limit, 1), 1000),
-    )
-    return [MultiLegExecutionRun.model_validate(payload) for payload in payloads]
-
-
-@app.post("/api/strategies/{plan_id}/execute", response_model=ExecuteResponse)
-async def execute_strategy(plan_id: str):
-    plan = plans.get(plan_id)
-    if not plan:
-        raise HTTPException(404, "strategy plan not found")
-    validate_agent_plan_grant(plan)
-    validate_plan_research_provenance(plan)
-    if plan.status != PlanStatus.ACTIVE:
-        raise HTTPException(409, "strategy must be active before execution")
-    configuration = configuration_service.current_configuration()
-    if configuration.trading_mode != TradingMode.PAPER and not runtime.reconciliation_entry_allowed:
-        health = runtime.reconciliation_health
-        raise HTTPException(
-            409,
-            "订单对账尚未恢复，暂时禁止新开仓；"
-            f"连续失败 {health.consecutive_failures}/{health.failure_threshold} 次，"
-            "后台会自动重试",
-        )
-    if (
-        plan.exchange != configuration.exchange_id
-        or plan.trading_mode != configuration.trading_mode
-        or plan.market_type != configuration.market_type
-        or plan.margin_mode
-        != (str(configuration.margin_mode) if configuration.market_type == "swap" else "cash")
-        or plan.leverage
-        != (
-            configuration.contract_leverage if configuration.market_type == "swap" else Decimal("1")
-        )
-    ):
-        raise HTTPException(409, "策略交易所、模式、市场、保证金模式或杠杆与当前执行环境不一致")
-    if (
-        configuration.trading_mode != TradingMode.PAPER
-        and not configuration_service.is_execution_ready(configuration)
-    ):
-        raise HTTPException(409, "真实交易网关尚未通过测试网原子保护单验收")
-    try:
-        market, history = await runtime.market_context(symbol=plan.symbol, timeframe=plan.timeframe)
-        portfolio = await runtime.portfolio()
-    except Exception as exc:
-        raise HTTPException(503, f"执行前行情或账户检查失败：{exc}") from exc
-    assert runtime.execution is not None
-    signal = evaluate_current_plan_signal(plan, history, market)
-    lifecycle = assess_entry_signal(plan, signal)
-    if not lifecycle.execution_allowed:
-        plan.status = PlanStatus.ARCHIVED
-        store.save_strategy(plan)
-        raise HTTPException(
-            409,
-            f"最新已收盘信号为 {signal.direction}，与计划 {plan.side} 不一致，拒绝下单",
-        )
-    if lifecycle.state == EntrySignalState.DEGRADED:
-        add_audit(
-            "execution",
-            "最新信号为 flat 且无反向证据；计划仍在有效期和价格区间内，继续硬风险复核。",
-            severity="warning",
-            plan_id=plan.id,
-            lifecycle_state=str(lifecycle.state),
-        )
-    engine = ExecutionEngine(runtime.execution, risk_engine(), risk_state_service)
-    try:
-        # Reuse the same complete snapshot used by signal validation. In swap
-        # mode runtime.market_context enriches it with funding data; fetching a
-        # second bare ticker here would silently discard that mandatory input.
-        result = await engine.submit_plan(plan, portfolio, market)
-    except Exception as exc:
-        if isinstance(exc, ProtectionVerificationError) and runtime.order_ledger:
-            for submitted_order in exc.orders:
-                runtime.order_ledger.record(submitted_order, protection_verified=False)
-        state = risk_state_service.halt(
-            f"订单提交异常，等待对账：{str(exc)[:160]}",
-            source="execution_uncertain",
-        )
-        add_audit(
-            "execution",
-            "订单提交异常，已自动停机并等待对账",
-            severity="critical",
-            plan_id=plan.id,
-            reason=state.reason,
-        )
-        raise HTTPException(502, state.reason) from exc
-    if result.order:
-        if runtime.order_ledger:
-            for submitted_order in result.orders:
-                runtime.order_ledger.record(submitted_order, protection_verified=True)
-        add_audit(
-            "execution",
-            f"已提交 {len(result.orders)} 个原子保护入场订单",
-            order_id=result.order.id,
-            plan_id=plan.id,
-            mode=str(configuration_service.current_configuration().trading_mode),
-        )
-    else:
-        failed = [check.code for check in result.decision.checks if not check.passed]
-        add_audit(
-            "risk",
-            "订单被风险引擎拒绝",
-            severity="warning",
-            plan_id=plan.id,
-            failed_checks=",".join(failed),
-        )
-    return ExecuteResponse(
-        decision=result.decision,
-        order=result.order,
-        orders=result.orders,
-    )
-
-
 @app.post("/api/orders/{order_id}/cancel", response_model=Order)
 async def cancel_order(order_id: str):
     """Cancel a tracked working order without changing any open position."""
@@ -14542,7 +11377,7 @@ async def strategy_market_fit(plan_id: str):
         raise HTTPException(503, f"最新市场适配检查所需行情不可用：{exc}") from exc
     completed = closed_candles(history, plan.timeframe, market.timestamp)
     assessment = score_market_state(completed)
-    signal = evaluate_current_plan_signal(plan, completed, market)
+    signal = await resolve_current_plan_signal(plan, completed, market)
     lifecycle = assess_entry_signal(plan, signal)
     direction_matches = signal.actionable and str(signal.direction) == str(plan.side)
     family_matches = assessment.selected_kind.value == plan.algorithm
@@ -14577,11 +11412,11 @@ async def strategy_market_fit(plan_id: str):
 @app.get("/api/risk", response_model=RiskDecision)
 async def current_risk():
     try:
-        market, history = await runtime.market_context()
+        market, _history = await runtime.market_context()
         portfolio: PortfolioState = await runtime.portfolio()
     except Exception as exc:
         raise HTTPException(503, f"风险检查所需数据不可用：{exc}") from exc
-    return risk_engine().evaluate(ensure_plan(history, market, portfolio), portfolio, market)
+    return risk_engine().evaluate(None, portfolio, market)
 
 
 @app.get("/api/risk/state", response_model=RiskControlState)
@@ -14592,6 +11427,10 @@ async def get_risk_state():
 @app.post("/api/risk/halt", response_model=RiskControlState)
 async def halt_trading(request: HaltRequest):
     state = risk_state_service.halt(request.reason)
+    # New submissions now fail their generation check. Drain the one already
+    # admitted to the exchange boundary before acknowledging the stop.
+    async with v2_submission_lock:
+        pass
     add_audit("risk", "已触发全局交易停机", severity="critical", reason=state.reason)
     return state
 
@@ -14631,6 +11470,1862 @@ async def paged_audit_events(
         items=[AuditEvent.model_validate(item) for item in items],
         next_cursor=next_cursor,
     )
+
+
+class TradingIntelligenceDecisionRequest(BaseModel):
+    symbol: Literal["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+    trigger: Literal[
+        "NO_ACTIVE_THESIS",
+        "WAKE_TRIGGERED",
+        "PLAN_EXPIRED",
+        "PLAN_INVALIDATED",
+        "TRADE_COMPLETED",
+        "THESIS_INVALIDATED",
+        "MAJOR_MARKET_EVENT",
+        "BOUNDED_RETRY",
+        "ENTRY_ORDER_TERMINAL",
+    ]
+    trigger_event_id: str | None = None
+    mode: TradingModeV2 = TradingModeV2.SHADOW
+
+
+class TradingIntelligenceExecuteRequest(BaseModel):
+    episode_id: str
+    wake_event_id: str | None = None
+    plan_version: int | None = Field(default=None, ge=1)
+    mode: TradingModeV2 = TradingModeV2.SHADOW
+
+
+class TradingIntelligenceAutomationRequest(BaseModel):
+    mode: Literal[TradingModeV2.SHADOW, TradingModeV2.OKX_DEMO] = TradingModeV2.OKX_DEMO
+    symbols: list[Literal["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]] = Field(
+        default_factory=lambda: list(V2_SYMBOLS), min_length=1
+    )
+
+
+def v2_llm_portfolio_context(
+    portfolio: PortfolioState,
+    *,
+    symbol: str,
+    max_daily_drawdown: Decimal,
+    risk_halted: bool,
+    unresolved_reconciliation: bool,
+    managed_positions: list[PositionRuntimeV2] | None = None,
+) -> dict:
+    """Expose position context to the LLM without leaking sizing/affordability inputs."""
+
+    normalized_symbol = symbol.removesuffix(":USDT")
+    positions = [
+        {
+            "symbol": item.symbol,
+            "side": str(item.side),
+            "average_entry": str(item.average_entry),
+            "mark_price": str(item.mark_price),
+            "stop_loss": str(item.stop_loss) if item.stop_loss is not None else None,
+            "take_profit": str(item.take_profit) if item.take_profit is not None else None,
+        }
+        for item in portfolio.open_positions
+    ]
+    for position in managed_positions or []:
+        if position.state not in {PositionStateV2.OPEN, PositionStateV2.PARTIALLY_FILLED}:
+            continue
+        row = next(
+            (item for item in positions
+             if item["symbol"].removesuffix(":USDT") == position.symbol.removesuffix(":USDT")
+             and item["side"].upper() == position.side),
+            None,
+        )
+        if row is not None:
+            row.update({
+                "symbol": position.symbol,
+                "side": position.side,
+                "position_id": position.position_id,
+                "position_version": position.version,
+                "state": str(position.state),
+                "plan_id": position.plan_id,
+                "stop_loss": str(position.current_stop),
+            })
+    symbol_positions = [
+        item for item in positions if item["symbol"].removesuffix(":USDT") == normalized_symbol
+    ]
+    return {
+        "decision_symbol": symbol,
+        "position_state": "OPEN" if symbol_positions else "FLAT",
+        "account_position_state": "OPEN" if positions else "FLAT",
+        "symbol_positions": symbol_positions,
+        "has_position_for_symbol": any(
+            item.symbol.removesuffix(":USDT") == normalized_symbol
+            for item in portfolio.open_positions
+        ),
+        "open_positions": positions,
+        "risk_engine_status": "HALTED" if risk_halted else "AVAILABLE",
+        "daily_drawdown_limit_reached": (portfolio.daily_drawdown_fraction >= max_daily_drawdown),
+        "unresolved_order_or_position": unresolved_reconciliation,
+        "sizing_note": (
+            "Equity, cash, margin, quantity and leverage are intentionally withheld; "
+            "the deterministic Risk Engine evaluates them only after an entry trigger."
+        ),
+    }
+
+
+class HumanLiveGrantPreviewRequest(BaseModel):
+    symbols: list[Literal["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]] = Field(min_length=1)
+    max_risk_per_trade: Decimal = Field(gt=0, le=Decimal("0.03"))
+    max_portfolio_risk: Decimal = Field(gt=0, le=Decimal("0.10"))
+    max_leverage: Decimal = Field(ge=1, le=Decimal("20"))
+    max_daily_drawdown: Decimal = Field(gt=0, le=Decimal("0.10"))
+    max_open_positions: int = Field(ge=1, le=20)
+    valid_hours: int = Field(default=24, ge=1, le=168)
+
+
+class HumanLiveGrantIssueRequest(HumanLiveGrantPreviewRequest):
+    configuration_fingerprint: str = Field(min_length=64, max_length=64)
+    risk_confirmation_one: bool
+    risk_confirmation_two: bool
+
+
+def v2_live_grant_preview_payload(request: HumanLiveGrantPreviewRequest) -> dict:
+    view = configuration_service.get()
+    configuration = view.configuration
+    fingerprint = v2_configuration_fingerprint(configuration)
+    blockers: list[str] = ["live_reconciliation_not_implemented"]
+    if configuration.exchange_id != "okx":
+        blockers.append("exchange_must_be_okx")
+    if str(configuration.market_type) != "swap":
+        blockers.append("market_type_must_be_swap")
+    credentials = view.credential_scopes.get("okx:live")
+    if not credentials or not (
+        credentials.api_key_configured
+        and credentials.secret_configured
+        and credentials.passphrase_configured
+    ):
+        blockers.append("okx_live_credentials_incomplete")
+    commissioning = view.commissioning
+    if not commissioning or not commissioning.agent_position_management_passed:
+        blockers.append("native_protection_and_position_management_commissioning_required")
+    report = runtime.reconciliation_report
+    if report is None:
+        blockers.append("reconciliation_not_available")
+    else:
+        if report.uncertain_order_ids or report.unknown_open_order_ids:
+            blockers.append("uncertain_or_unknown_orders")
+        if report.unknown_position_symbols:
+            blockers.append("unknown_positions")
+        if report.unprotected_order_ids:
+            blockers.append("unprotected_orders")
+    return {
+        "eligible": not blockers,
+        "blockers": blockers,
+        "configuration_fingerprint": fingerprint,
+        "exchange": "okx",
+        "symbols": request.symbols,
+        "limits": request.model_dump(mode="json"),
+        "expires_at": datetime.now(UTC) + timedelta(hours=request.valid_hours),
+        "requires_two_confirmations": True,
+    }
+
+
+def durable_official_events(limit: int = 1000) -> list[OfficialEvent]:
+    events: dict[str, OfficialEvent] = {}
+    for item in trading_intelligence_store.list_events(limit=limit):
+        if item["event_type"] != "OFFICIAL_EVENT":
+            continue
+        try:
+            event = OfficialEvent.model_validate(item["payload"]["event"])
+        except (KeyError, ValidationError):
+            continue
+        events[event.event_id] = event
+    return sorted(events.values(), key=lambda value: value.scheduled_at)
+
+
+async def collect_official_events_once() -> tuple[list[OfficialEvent], dict[str, str], int]:
+    events, health = await official_event_client.fetch_all()
+    persisted = 0
+    for event in events:
+        event_id, created = await asyncio.to_thread(
+            trading_intelligence_store.append_event,
+            dedupe_key=f"official-event:{event.source}:{event.source_hash}",
+            event_type="OFFICIAL_EVENT",
+            aggregate_type="official_event",
+            aggregate_id=event.event_id,
+            aggregate_version=1,
+            payload={"event": event.model_dump(mode="json")},
+        )
+        persisted += int(created)
+        windows = active_risk_windows([event])
+        if windows:
+            window_event_id, window_created = await asyncio.to_thread(
+                trading_intelligence_store.append_event,
+                dedupe_key=(
+                    f"official-event-window-active:{event.event_id}:"
+                    f"{event.scheduled_at.isoformat()}"
+                ),
+                event_type="OFFICIAL_EVENT_WINDOW_ACTIVE",
+                aggregate_type="official_event",
+                aggregate_id=event.event_id,
+                aggregate_version=1,
+                payload={
+                    "official_event_id": event_id,
+                    "event": event.model_dump(mode="json"),
+                    "active_windows": windows,
+                },
+            )
+            if window_created and trading_intelligence_automation is not None:
+                await trading_intelligence_automation.on_major_event(window_event_id)
+    return events, health, persisted
+
+
+@app.get("/api/trading-intelligence/official-events")
+async def trading_intelligence_official_events():
+    events = await asyncio.to_thread(durable_official_events)
+    return {
+        "events": events,
+        "active_risk_windows": active_risk_windows(events),
+        "etf_flow": ETF_FLOW_STATUS,
+    }
+
+
+@app.get("/api/trading-intelligence/migration-summary")
+async def trading_intelligence_migration_summary():
+    def legacy_counts() -> dict[str, int]:
+        result: dict[str, int] = {}
+        with store._lock, store.connect() as connection:
+            names = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            for table in (
+                "agent_goals",
+                "agent_runs",
+                "agent_events",
+                "strategies",
+                "orders",
+            ):
+                if table in names:
+                    result[table] = int(
+                        connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()[
+                            "count"
+                        ]
+                    )
+        return result
+
+    return {
+        "runtime": "trading_intelligence_v2",
+        "legacy_strategy_scheduler_running": False,
+        "legacy_agent_scheduler_running": False,
+        "legacy_mutations": "not_registered_http_404",
+        "legacy_runtime_modules_present": False,
+        "legacy_evidence": "read_only",
+        "historical_record_counts": await asyncio.to_thread(legacy_counts),
+    }
+
+
+@app.get("/api/trading-intelligence/quant-models")
+async def trading_intelligence_quant_models():
+    result = []
+    for symbol in V2_SYMBOLS:
+        try:
+            artifact = await asyncio.to_thread(load_quant_v1_artifact, symbol)
+            eligible = bool(artifact and quant_model_is_eligible(artifact))
+            result.append(
+                {
+                    "symbol": symbol,
+                    "timeframe": "5m",
+                    "health": (
+                        "healthy" if eligible else ("degraded" if artifact else "unavailable")
+                    ),
+                    "entry_eligible": eligible,
+                    "reason": (
+                        None
+                        if eligible or not artifact
+                        else "purged OOF metrics do not beat the uniform 3-class baseline"
+                    ),
+                    "model_fingerprint": artifact.model_fingerprint if artifact else None,
+                    "data_as_of": artifact.data_as_of if artifact else None,
+                    "validation": artifact.validation if artifact else None,
+                }
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            result.append(
+                {
+                    "symbol": symbol,
+                    "timeframe": "5m",
+                    "health": "degraded",
+                    "reason": str(exc)[:200],
+                }
+            )
+    return result
+
+
+@app.post("/api/trading-intelligence/official-events/refresh")
+async def refresh_trading_intelligence_official_events():
+    events, health, persisted = await collect_official_events_once()
+    return {
+        "events": events,
+        "active_risk_windows": active_risk_windows(events),
+        "source_health": health,
+        "persisted": persisted,
+        "etf_flow": ETF_FLOW_STATUS,
+    }
+
+
+@app.get("/api/trading-intelligence/overview")
+async def trading_intelligence_overview():
+    market_states = await asyncio.gather(
+        *(
+            asyncio.to_thread(trading_intelligence_store.latest_market_state, symbol)
+            for symbol in V2_SYMBOLS
+        )
+    )
+    quant_predictions = await asyncio.gather(
+        *(
+            asyncio.to_thread(trading_intelligence_store.latest_quant_prediction, symbol)
+            for symbol in V2_SYMBOLS
+        )
+    )
+    return {
+        "version": 2,
+        "runtime_modes": [str(item) for item in TradingModeV2],
+        "symbols": list(V2_SYMBOLS),
+        "market_states": [item for item in market_states if item],
+        "active_theses": await asyncio.to_thread(trading_intelligence_store.list_active_theses),
+        "active_plans": await asyncio.to_thread(trading_intelligence_store.list_open_plans),
+        "active_waits": await asyncio.to_thread(
+            trading_intelligence_store.list_wait_runtimes,
+            active_only=True,
+        ),
+        "positions": await asyncio.to_thread(trading_intelligence_store.list_positions),
+        "entry_orders": await asyncio.to_thread(v2_overview_entry_orders),
+        "quant_predictions": [item for item in quant_predictions if item],
+        "quant_models": await trading_intelligence_quant_models(),
+        "episodes": await asyncio.to_thread(trading_intelligence_store.list_episodes, limit=50),
+        "automation": await asyncio.to_thread(trading_intelligence_store.automation_runtime),
+        "live_grant": await asyncio.to_thread(trading_intelligence_store.active_grant),
+        "llm_health": await asyncio.to_thread(ai_gateway.health_snapshot),
+        "learning": await asyncio.to_thread(v2_learning_snapshot),
+        "portfolio_policy": configuration_service.current_configuration().risk.model_dump(
+            mode="json"
+        ),
+    }
+
+
+def v2_overview_entry_orders():
+    active = trading_intelligence_store.list_entry_orders(active_only=True)
+    recent = trading_intelligence_store.list_entry_orders(limit=100)
+    return list({item.entry_id: item for item in [*recent, *active]}.values())
+
+
+def v2_learning_snapshot():
+    from .trading_learning import LearningSnapshot
+
+    artifact = trading_intelligence_store.get_artifact("trading-learning-current")
+    return artifact["payload"] if artifact else LearningSnapshot().model_dump(mode="json")
+
+
+@app.get("/api/trading-intelligence/learning")
+async def trading_intelligence_learning():
+    return await asyncio.to_thread(v2_learning_snapshot)
+
+
+@app.get("/api/trading-intelligence/market-state/{symbol:path}")
+async def trading_intelligence_market_state(symbol: str):
+    if symbol not in V2_SYMBOLS:
+        raise HTTPException(400, "v2 supports only OKX BTC/ETH/SOL USDT perpetuals")
+    state = await asyncio.to_thread(trading_intelligence_store.latest_market_state, symbol)
+    if not state:
+        raise HTTPException(404, "market state not available")
+    return state
+
+
+@app.post("/api/trading-intelligence/market-state", response_model=MarketStateV2)
+async def ingest_trading_intelligence_market_state(state: MarketStateV2):
+    raise HTTPException(403, "生产行情只能由服务端采集器写入，请使用 refresh 接口")
+
+
+@app.post(
+    "/api/trading-intelligence/market-state/{symbol:path}/refresh",
+    response_model=MarketStateV2,
+)
+async def refresh_trading_intelligence_market_state(symbol: str):
+    if symbol not in V2_SYMBOLS:
+        raise HTTPException(400, "v2 supports only OKX BTC/ETH/SOL USDT perpetuals")
+    configuration = configuration_service.current_configuration()
+    if configuration.exchange_id != "okx" or str(configuration.market_type) != "swap":
+        raise HTTPException(409, "MarketState v2 requires OKX swap market data")
+    exchange_symbol = symbol.removesuffix(":USDT")
+    try:
+        contexts = await asyncio.gather(
+            *(
+                runtime.market_context(
+                    limit=260,
+                    symbol=exchange_symbol,
+                    timeframe=timeframe,
+                )
+                for timeframe in ("1m", "5m", "15m", "1h", "4h", "1d")
+            )
+        )
+    except Exception as exc:
+        raise HTTPException(503, f"MarketState v2 source data unavailable: {exc}") from exc
+    market = contexts[0][0].model_copy(update={"symbol": symbol})
+    candles_by_timeframe: dict[str, list[Candle]] = {}
+    quality_by_timeframe: dict[str, dict] = {}
+    for timeframe, (_, history) in zip(
+        ("1m", "5m", "15m", "1h", "4h", "1d"), contexts, strict=True
+    ):
+        causal = closed_candles(history, timeframe, market.timestamp)
+        candles_by_timeframe[timeframe] = causal
+        try:
+            _, quality = validate_candles(causal, timeframe)
+            quality_by_timeframe[timeframe] = quality.model_dump(mode="json")
+        except Exception as exc:
+            quality_by_timeframe[timeframe] = {
+                "status": "unavailable",
+                "message": str(exc)[:200],
+            }
+    microstructure: dict = {}
+    if runtime.market is not None:
+        with suppress(Exception):
+            microstructure = await runtime.market.market_microstructure(exchange_symbol) or {}
+    cross_histories: dict[str, list[Candle]] = {symbol: candles_by_timeframe.get("1h", [])}
+    other_symbols = [item for item in V2_SYMBOLS if item != symbol]
+    other_contexts = await asyncio.gather(
+        *(
+            runtime.market_context(
+                limit=120,
+                symbol=item.removesuffix(":USDT"),
+                timeframe="1h",
+            )
+            for item in other_symbols
+        ),
+        return_exceptions=True,
+    )
+    for other_symbol, context in zip(other_symbols, other_contexts, strict=True):
+        if isinstance(context, Exception):
+            continue
+        _, history = context
+        cross_histories[other_symbol] = closed_candles(history, "1h", market.timestamp)
+    state = await asyncio.to_thread(
+        build_market_state_v2,
+        market=market,
+        candles_by_timeframe=candles_by_timeframe,
+        quality_by_timeframe=quality_by_timeframe,
+        microstructure=microstructure,
+        cross_market=build_cross_market_context(cross_histories),
+        normalized_events=active_risk_windows(
+            await asyncio.to_thread(durable_official_events),
+            at=market.timestamp,
+        ),
+    )
+    try:
+        await infer_quant_v1_on_five_minute_close(state)
+    except (OSError, ValueError, RuntimeError) as exc:
+        await asyncio.to_thread(
+            trading_intelligence_store.append_event,
+            dedupe_key=f"quant-degraded:{state.symbol}:{state.data_as_of:%Y%m%d%H%M}",
+            event_type="QUANT_INFERENCE_DEGRADED",
+            aggregate_type="quant_model",
+            aggregate_id=state.symbol,
+            aggregate_version=1,
+            payload={"reason_hash": sha256(str(exc).encode()).hexdigest()},
+        )
+    if risk_state_service.get().halted:
+        await asyncio.to_thread(trading_intelligence_store.save_market_state, state)
+    else:
+        await require_v2_automation().on_market_state(state)
+    return state
+
+
+@app.get("/api/trading-intelligence/episodes")
+async def trading_intelligence_episodes(
+    symbol: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    if symbol is not None and symbol not in V2_SYMBOLS:
+        raise HTTPException(400, "unsupported v2 symbol")
+    return await asyncio.to_thread(
+        trading_intelligence_store.list_episodes,
+        symbol=symbol,
+        limit=limit,
+    )
+
+
+@app.get("/api/trading-intelligence/events")
+async def trading_intelligence_events(
+    aggregate_id: str | None = None,
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    return await asyncio.to_thread(
+        trading_intelligence_store.list_events,
+        aggregate_id=aggregate_id,
+        limit=limit,
+    )
+
+
+@app.get("/api/trading-intelligence/attribution")
+async def trading_intelligence_attribution():
+    outcomes: list[DecisionOutcomeV2] = []
+    for episode in await asyncio.to_thread(
+        trading_intelligence_store.list_episodes,
+        limit=5000,
+    ):
+        if not episode.outcome:
+            continue
+        try:
+            outcomes.append(DecisionOutcomeV2.model_validate(episode.outcome))
+        except ValidationError:
+            continue
+    return build_decision_attribution(outcomes)
+
+
+@app.get(
+    "/api/trading-intelligence/trade-history",
+    response_model=TradeHistoryResponseV2,
+)
+async def trading_intelligence_trade_history(
+    symbol: str | None = None,
+    days: int = Query(default=30, ge=0, le=3650),
+    limit: int = Query(default=500, ge=1, le=2000),
+):
+    if symbol is not None and symbol not in V2_SYMBOLS:
+        raise HTTPException(400, "unsupported v2 symbol")
+    positions, episode_list = await asyncio.gather(
+        asyncio.to_thread(
+            trading_intelligence_store.list_positions,
+            symbol=symbol,
+            include_closed=True,
+        ),
+        asyncio.to_thread(trading_intelligence_store.list_episodes, symbol=symbol, limit=5000),
+    )
+    episodes = {item.episode_id: item for item in episode_list}
+    closed_episode_ids = {
+        item.episode_id for item in positions if str(item.state) == "CLOSED" and item.episode_id
+    }
+    allocations: dict[str, RiskAllocation] = {}
+    for episode in episode_list:
+        if episode.episode_id not in closed_episode_ids:
+            continue
+        allocation_id = episode.risk_allocation_id
+        if not allocation_id or allocation_id in allocations:
+            continue
+        artifact = await asyncio.to_thread(
+            trading_intelligence_store.get_artifact,
+            allocation_id,
+        )
+        if not artifact or artifact["artifact_type"] != "RiskAllocation":
+            continue
+        try:
+            allocations[allocation_id] = RiskAllocation.model_validate(artifact["payload"])
+        except ValidationError:
+            continue
+    return build_trade_history_v2(
+        positions,
+        episodes,
+        allocations,
+        symbol=symbol,
+        days=days,
+        limit=limit,
+    )
+
+
+@app.get("/api/trading-intelligence/artifacts/{artifact_id}")
+async def trading_intelligence_artifact(artifact_id: str):
+    artifact = await asyncio.to_thread(trading_intelligence_store.get_artifact, artifact_id)
+    if not artifact:
+        raise HTTPException(404, "trading intelligence artifact not found")
+    return artifact
+
+
+@app.post("/api/trading-intelligence/decide")
+async def invoke_trading_intelligence(request: TradingIntelligenceDecisionRequest):
+    token = decision_entry_generation.set(risk_state_service.entry_generation)
+    try:
+        return await _invoke_trading_intelligence(request)
+    finally:
+        decision_entry_generation.reset(token)
+
+
+async def _invoke_trading_intelligence(request: TradingIntelligenceDecisionRequest):
+    state = await asyncio.to_thread(trading_intelligence_store.latest_market_state, request.symbol)
+    if not state:
+        raise HTTPException(409, "a current MarketState v2 is required")
+    try:
+        validate_market_state_time(state)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    active_theses = await asyncio.to_thread(
+        trading_intelligence_store.list_active_theses, request.symbol
+    )
+    if request.trigger == "NO_ACTIVE_THESIS" and active_theses:
+        raise HTTPException(409, "an active thesis already exists")
+    trigger_event = None
+    if request.trigger != "NO_ACTIVE_THESIS":
+        if not request.trigger_event_id:
+            raise HTTPException(400, "this trigger requires a durable event id")
+        trigger_event = await asyncio.to_thread(
+            trading_intelligence_store.get_event,
+            request.trigger_event_id,
+        )
+        if not trigger_event:
+            raise HTTPException(409, "trigger event is not present in the durable ledger")
+        if request.trigger == "WAKE_TRIGGERED" and trigger_event["event_type"] not in {
+            "WAKE_TRIGGERED",
+            "WAIT_PLAN_EXPIRED",
+        }:
+            raise HTTPException(409, "event is not a WakeCondition firing")
+    quant = await asyncio.to_thread(
+        trading_intelligence_store.latest_quant_prediction, request.symbol
+    )
+    quant_model_eligible = False
+    if quant is not None:
+        try:
+            quant_model = await asyncio.to_thread(load_quant_v1_model, request.symbol)
+            quant_model_eligible = bool(
+                quant_model and quant_model_is_eligible(quant_model.artifact)
+            )
+        except (OSError, ValueError, RuntimeError):
+            quant_model_eligible = False
+    # Demo/Shadow retain the prediction as counterfactual evidence. Only Live
+    # treats model quality plus fresh directional edge as a hard entry gate.
+    if request.mode == TradingModeV2.LIVE_AUTHORIZED and not quant_model_eligible:
+        quant = None
+    try:
+        portfolio = await runtime.portfolio()
+    except Exception as exc:
+        raise HTTPException(503, f"portfolio state unavailable: {exc}") from exc
+    configuration = configuration_service.current_configuration()
+    risk_control = risk_state_service.get()
+    reconciliation = runtime.reconciliation_report
+    unresolved_reconciliation = bool(
+        reconciliation
+        and (
+            reconciliation.uncertain_order_ids
+            or reconciliation.unknown_open_order_ids
+            or reconciliation.unknown_position_symbols
+            or reconciliation.unprotected_order_ids
+        )
+    )
+    quant_policy = "HARD_GATE" if request.mode == TradingModeV2.LIVE_AUTHORIZED else "ADVISORY"
+    previous_plan = next(
+        iter(await asyncio.to_thread(trading_intelligence_store.list_open_plans, request.symbol)),
+        None,
+    )
+    previous_state = await asyncio.to_thread(
+        trading_intelligence_store.previous_market_state,
+        request.symbol,
+        before_state_hash=state.state_hash,
+        before_data_as_of=state.data_as_of,
+    )
+    previous_wait = None
+    if trigger_event and trigger_event["aggregate_type"] in {"plan", "wait_runtime"}:
+        artifact = await asyncio.to_thread(
+            trading_intelligence_store.get_artifact,
+            trigger_event["aggregate_id"],
+        )
+        if artifact and artifact["artifact_type"] == "WaitRuntimeV2":
+            previous_wait = WaitRuntimeV2.model_validate(artifact["payload"])
+
+    def changed_paths(before: MarketStateV2 | None, current: MarketStateV2) -> list[str]:
+        if before is None:
+            return []
+        prior_payload = before.model_dump(mode="json", exclude_none=True)
+        current_payload = current.model_dump(mode="json", exclude_none=True)
+        changes: list[str] = []
+
+        def walk(left, right, prefix: str = "") -> None:
+            if len(changes) >= 100:
+                return
+            if isinstance(left, dict) and isinstance(right, dict):
+                for key in sorted(set(left) | set(right)):
+                    path = f"{prefix}.{key}" if prefix else key
+                    if key not in left or key not in right:
+                        changes.append(path)
+                    else:
+                        walk(left[key], right[key], path)
+                return
+            if left != right:
+                changes.append(prefix)
+
+        walk(prior_payload, current_payload)
+        return changes
+
+    delta = DeltaContext(
+        prior_state_hash=previous_state.state_hash if previous_state else None,
+        current_state_hash=state.state_hash,
+        changed_paths=changed_paths(previous_state, state),
+        material_changes=[
+            f"event:{request.trigger}",
+            f"quant_policy:{quant_policy.lower()}",
+            f"quant_prediction:{'available' if quant is not None else 'unavailable'}",
+            f"quant_model_live_eligible:{str(quant_model_eligible).lower()}",
+        ],
+        trigger_type=request.trigger,
+        trigger_evidence=(
+            {
+                "event_id": trigger_event["event_id"],
+                "event_type": trigger_event["event_type"],
+                "aggregate_type": trigger_event["aggregate_type"],
+                "aggregate_id": trigger_event["aggregate_id"],
+                "aggregate_version": trigger_event["aggregate_version"],
+                "payload": trigger_event["payload"],
+            }
+            if trigger_event
+            else None
+        ),
+    )
+
+    async def decision_error_response(
+        message: str,
+        decision_result=None,
+    ) -> dict:
+        error_message = message.removeprefix("CONTRACT_ERROR:").strip()
+        if decision_result is not None:
+            rejected = decision_result.episode.model_copy(deep=True)
+            rejected.status = "DECISION_ERROR"
+            rejected.trigger_event_id = request.trigger_event_id
+            rejected.outcome = {
+                "error_code": "CONTRACT_OR_STATE_ERROR",
+                "summary": error_message[:2000],
+                "trigger": request.trigger,
+            }
+            rejected.output_hashes = {
+                **rejected.output_hashes,
+                "rejection": sha256(message.encode()).hexdigest(),
+            }
+            await asyncio.to_thread(
+                trading_intelligence_store.save_artifact,
+                decision_result.analysis.analysis_id,
+                "MarketAnalysis",
+                decision_result.analysis,
+            )
+            await asyncio.to_thread(
+                trading_intelligence_store.save_artifact,
+                decision_result.decision.decision_id,
+                "PortfolioTraderDecision",
+                decision_result.decision,
+            )
+        else:
+            rejected = DecisionEpisode(
+                symbol=state.symbol,
+                status="DECISION_ERROR",
+                market_state_hash=state.state_hash,
+                delta=delta,
+                quant_prediction_id=quant.prediction_id if quant else None,
+                trigger_event_id=request.trigger_event_id,
+                prompt_versions={
+                    "analyst": "market_analyst_v2",
+                    "trader": "portfolio_trader_v2",
+                    "repair": "schema_repair_once_v2",
+                },
+                outcome={
+                    "error_code": "CONTRACT_OR_STATE_ERROR",
+                    "summary": error_message[:2000],
+                    "trigger": request.trigger,
+                },
+                output_hashes={"rejection": sha256(message.encode()).hexdigest()},
+            )
+        await asyncio.to_thread(trading_intelligence_store.save_episode, rejected)
+        return {
+            "analysis": decision_result.analysis if decision_result is not None else None,
+            "decision": decision_result.decision if decision_result is not None else None,
+            "episode": rejected,
+            "decision_error": True,
+        }
+
+    decision_positions = await asyncio.to_thread(trading_intelligence_store.list_positions)
+    try:
+        from .trading_learning import learning_context
+
+        try:
+            learned_context = await asyncio.to_thread(
+                learning_context, trading_intelligence_store, request.symbol, str(request.mode)
+            )
+        except Exception:
+            logger.exception("Trading learning unavailable; continuing without advisory memory")
+            learned_context = {"policy": "ADVISORY_ONLY", "groups": [], "status": "UNAVAILABLE"}
+        result = await dual_llm_decision_service.decide(
+            market_state=state,
+            delta=delta,
+            quant=quant,
+            portfolio=v2_llm_portfolio_context(
+                portfolio,
+                symbol=request.symbol,
+                max_daily_drawdown=configuration.risk.max_daily_drawdown,
+                risk_halted=risk_control.halted,
+                unresolved_reconciliation=unresolved_reconciliation,
+                managed_positions=decision_positions,
+            ),
+            previous_thesis=(active_theses[0].model_dump(mode="json") if active_theses else None),
+            previous_plan=(previous_plan.model_dump(mode="json") if previous_plan else None),
+            previous_wait_plan=(
+                previous_wait.wait_plan.model_dump(mode="json") if previous_wait else None
+            ),
+            previous_market_state=previous_state,
+            require_quant_edge=request.mode == TradingModeV2.LIVE_AUTHORIZED,
+            minimum_reward_risk=configuration.risk.minimum_reward_risk,
+            learning=learned_context,
+        )
+    except ValueError as exc:
+        if str(exc).startswith("CONTRACT_ERROR:"):
+            return await decision_error_response(str(exc))
+        raise HTTPException(503, str(exc)) from exc
+    except AIProviderError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    if decision_entry_generation.get() != risk_state_service.entry_generation:
+        return await decision_error_response(
+            "decision invalidated by a stop while awaiting LLM", result
+        )
+    if result.decision.action == "WAIT":
+        referenced_thesis_id = (
+            result.decision.wait_plan.thesis_id if result.decision.wait_plan else None
+        )
+        valid_thesis_ids = {item.thesis_id for item in active_theses}
+        if result.decision.thesis:
+            valid_thesis_ids.add(result.decision.thesis.thesis_id)
+        if referenced_thesis_id is not None and referenced_thesis_id not in valid_thesis_ids:
+            return await decision_error_response(
+                "WAIT thesis_id, when provided, must reference an existing "
+                "or returned active Thesis",
+                result,
+            )
+    managed_position_context = None
+    managed_plan_context = None
+    if result.decision.action in {"MANAGE_EXISTING", "EXIT"}:
+        active_positions = await asyncio.to_thread(
+            trading_intelligence_store.list_positions,
+            symbol=request.symbol,
+        )
+        target_id = result.decision.position_id
+        target_version = result.decision.position_version
+        try:
+            managed_position_context = resolve_position_decision(
+                target_id, target_version, decision_positions, active_positions
+            )
+        except ValueError as exc:
+            return await decision_error_response(
+                f"MANAGE_EXISTING/EXIT target rejected: {exc}",
+                result,
+            )
+        managed_plan_context = await asyncio.to_thread(
+            trading_intelligence_store.get_plan,
+            managed_position_context.plan_id,
+        )
+        if not managed_plan_context:
+            return await decision_error_response(
+                "position references an unavailable TradePlan",
+                result,
+            )
+    decision_thesis = result.decision.thesis
+    if decision_thesis:
+        now = datetime.now(UTC)
+        maximum_expiry = max(now, state.data_as_of) + timedelta(hours=4)
+        if decision_thesis.expires_at <= now:
+            return await decision_error_response(
+                "returned Thesis is already expired",
+                result,
+            )
+        existing_thesis = await asyncio.to_thread(
+            trading_intelligence_store.get_thesis,
+            decision_thesis.thesis_id,
+        )
+        decision_thesis = decision_thesis.model_copy(
+            update={
+                "version": existing_thesis.version if existing_thesis else 1,
+                "state": existing_thesis.state if existing_thesis else ThesisState.CREATED,
+                "created_at": (existing_thesis.created_at if existing_thesis else now),
+                "expires_at": min(decision_thesis.expires_at, maximum_expiry),
+            }
+        )
+        result.decision.thesis = decision_thesis
+    if result.decision.trade_plan and await asyncio.to_thread(
+        trading_intelligence_store.get_plan,
+        result.decision.trade_plan.plan_id,
+    ):
+        return await decision_error_response(
+            "returned TradePlan id already exists",
+            result,
+        )
+    await asyncio.to_thread(trading_intelligence_store.cancel_active_waits, request.symbol)
+    result.episode.trigger_event_id = request.trigger_event_id
+    await asyncio.to_thread(
+        trading_intelligence_store.save_artifact,
+        result.analysis.analysis_id,
+        "MarketAnalysis",
+        result.analysis,
+    )
+    await asyncio.to_thread(
+        trading_intelligence_store.save_artifact,
+        result.decision.decision_id,
+        "PortfolioTraderDecision",
+        result.decision,
+    )
+    if result.decision.thesis:
+        existing_thesis = await asyncio.to_thread(
+            trading_intelligence_store.get_thesis,
+            result.decision.thesis.thesis_id,
+        )
+        if existing_thesis:
+            updated_thesis = await asyncio.to_thread(
+                trading_intelligence_store.update_thesis_content,
+                result.decision.thesis,
+                expected_version=existing_thesis.version,
+            )
+            result.decision.thesis = updated_thesis
+        else:
+            await asyncio.to_thread(
+                trading_intelligence_store.save_thesis,
+                result.decision.thesis,
+            )
+        if not existing_thesis and str(result.decision.thesis.state) == "CREATED":
+            await asyncio.to_thread(
+                trading_intelligence_store.transition_thesis,
+                result.decision.thesis.thesis_id,
+                expected_version=result.decision.thesis.version,
+                target=ThesisState.ACTIVE,
+            )
+    if result.decision.trade_plan:
+        await asyncio.to_thread(trading_intelligence_store.save_plan, result.decision.trade_plan)
+        validated = await asyncio.to_thread(
+            trading_intelligence_store.transition_plan,
+            result.decision.trade_plan.plan_id,
+            expected_version=result.decision.trade_plan.version,
+            target=TradingIntelligencePlanState.VALIDATED,
+        )
+        activated = await asyncio.to_thread(
+            trading_intelligence_store.transition_plan,
+            result.decision.trade_plan.plan_id,
+            expected_version=validated.version,
+            target=TradingIntelligencePlanState.ACTIVE,
+        )
+        if activated.order_type is None:
+            activated = await asyncio.to_thread(
+                trading_intelligence_store.transition_plan,
+                activated.plan_id,
+                expected_version=activated.version,
+                target=TradingIntelligencePlanState.WAITING_TRIGGER,
+            )
+        result.decision.trade_plan = activated
+    if result.decision.action in {"MANAGE_EXISTING", "EXIT"}:
+        async with v2_entry_allocation_lock:
+            current_positions = await asyncio.to_thread(
+                trading_intelligence_store.list_positions, symbol=request.symbol
+            )
+            try:
+                managed_position_context = resolve_position_decision(
+                    result.decision.position_id, result.decision.position_version,
+                    decision_positions, current_positions,
+                )
+            except ValueError as exc:
+                return await decision_error_response(
+                    f"position changed before management: {exc}", result
+                )
+            managed_plan_context = await asyncio.to_thread(
+                trading_intelligence_store.get_plan, managed_position_context.plan_id
+            )
+            assert managed_position_context is not None
+            assert managed_plan_context is not None
+            managed_position = managed_position_context
+            managed_plan = managed_plan_context
+            result.episode.position_id = managed_position.position_id
+            result.episode.plan_id = managed_plan.plan_id
+            result.episode.thesis_id = managed_plan.thesis_id
+            if result.decision.action == "MANAGE_EXISTING":
+                proposed = result.decision.management_plan
+                assert proposed is not None
+                # Native TP/SL submitted at entry remain immutable fail-safe protection.
+                # The LLM may tighten deterministic runtime rules, but cannot silently
+                # replace venue protection levels without a commissioned amend protocol.
+                effective_management = proposed.model_copy(
+                    update={
+                        "hard_stop": managed_plan.management.hard_stop,
+                        "take_profits": managed_plan.management.take_profits,
+                    }
+                )
+                updated_plan = managed_plan.model_copy(update={"management": effective_management})
+                updated_plan = await asyncio.to_thread(
+                    trading_intelligence_store.update_plan_content,
+                    updated_plan,
+                    expected_version=managed_plan.version,
+                )
+                if effective_management != managed_plan.management:
+                    managed_position = await asyncio.to_thread(
+                        trading_intelligence_store.update_position,
+                        managed_position.position_id,
+                        expected_version=managed_position.version,
+                        updates={"management_version": managed_position.management_version + 1},
+                    )
+                await asyncio.to_thread(
+                    trading_intelligence_store.append_event,
+                    dedupe_key=(
+                        f"position-management-updated:{managed_position.position_id}:"
+                        f"{updated_plan.version}:{result.decision.decision_id}"
+                    ),
+                    event_type="POSITION_MANAGEMENT_UPDATED",
+                    aggregate_type="position",
+                    aggregate_id=managed_position.position_id,
+                    aggregate_version=managed_position.version,
+                    payload={
+                        "plan_id": updated_plan.plan_id,
+                        "plan_version": updated_plan.version,
+                        "native_protection_levels_preserved": True,
+                        "decision_position_version": result.decision.position_version,
+                        "applied_position_version": managed_position.version,
+                    },
+                )
+            else:
+                exit_reason = "; ".join(
+                    item.reference for item in result.decision.invalidation_evidence
+                )[:2000]
+                updated_position = await asyncio.to_thread(
+                    trading_intelligence_store.update_position,
+                    managed_position.position_id,
+                    expected_version=managed_position.version,
+                    updates={
+                        "exit_requested_at": datetime.now(UTC),
+                        "exit_reason": exit_reason or "LLM thesis invalidation",
+                    },
+                )
+                await asyncio.to_thread(
+                    trading_intelligence_store.append_event,
+                    dedupe_key=(
+                        f"position-exit-requested:{updated_position.position_id}:"
+                        f"{updated_position.version}"
+                    ),
+                    event_type="POSITION_EXIT_REQUESTED",
+                    aggregate_type="position",
+                    aggregate_id=updated_position.position_id,
+                    aggregate_version=updated_position.version,
+                    payload={
+                        "decision_id": result.decision.decision_id,
+                        "invalidation_evidence": [
+                            item.model_dump(mode="json")
+                            for item in result.decision.invalidation_evidence
+                        ],
+                    },
+                )
+    await asyncio.to_thread(trading_intelligence_store.save_episode, result.episode)
+    if result.decision.wait_plan:
+        await asyncio.to_thread(
+            trading_intelligence_store.save_wait_runtime,
+            WaitRuntimeV2(
+                episode_id=result.episode.episode_id,
+                symbol=request.symbol,
+                wait_plan=result.decision.wait_plan,
+            ),
+        )
+    execution_result = None
+    if result.decision.trade_plan and result.decision.trade_plan.order_type is not None:
+        if decision_entry_generation.get() != risk_state_service.entry_generation:
+            cancelled = await asyncio.to_thread(
+                trading_intelligence_store.transition_plan,
+                result.decision.trade_plan.plan_id,
+                expected_version=result.decision.trade_plan.version,
+                target=TradingIntelligencePlanState.CANCELLED,
+            )
+            result.decision.trade_plan = cancelled
+            return await decision_error_response(
+                "decision invalidated before entry submission", result
+            )
+        execution_result = await execute_automated_trading_intelligence_plan(
+            result.decision.trade_plan.plan_id,
+            result.episode.episode_id,
+            None,
+            request.mode,
+            plan_version=result.decision.trade_plan.version,
+        )
+    return {
+        "analysis": result.analysis,
+        "decision": result.decision,
+        "episode": result.episode,
+        "execution": execution_result,
+    }
+
+
+v2_entry_allocation_lock = asyncio.Lock()
+v2_submission_lock = asyncio.Lock()
+v2_configuration_generation = 0
+decision_entry_generation: ContextVar[int | None] = ContextVar(
+    "decision_entry_generation", default=None
+)
+critical_workers: dict[str, asyncio.Task] = {}
+
+
+def on_critical_worker_exit(task: asyncio.Task) -> None:
+    if critical_workers.get(task.get_name()) is not task:
+        return
+    error = None if task.cancelled() else task.exception()
+    logger.error("Critical worker exited: %s (%s)", task.get_name(), type(error).__name__)
+    risk_state_service.halt(
+        f"critical background worker stopped: {task.get_name()}",
+        source="worker_failure",
+    )
+
+
+@asynccontextmanager
+async def v2_submission_guard(generation: int, configuration_fingerprint: str):
+    async with v2_submission_lock:
+        if not critical_workers or any(task.done() for task in critical_workers.values()):
+            raise EntryRiskBlocked("critical trading workers are not running")
+        if generation != risk_state_service.entry_generation or risk_state_service.get().halted:
+            raise EntryRiskBlocked("entry invalidated by a risk stop")
+        current = configuration_service.current_configuration()
+        if v2_configuration_fingerprint(current) != configuration_fingerprint:
+            raise EntryRiskBlocked("configuration changed before entry submission")
+        yield
+
+
+@app.post("/api/trading-intelligence/plans/{plan_id}/execute")
+async def execute_trading_intelligence_plan(
+    plan_id: str,
+    request: TradingIntelligenceExecuteRequest,
+):
+    # Serialize only account allocation/submission. Symbol analysis remains independent.
+    # A submitted entry is durable before the next symbol reads its risk reservation.
+    token = None
+    if decision_entry_generation.get() is None:
+        token = decision_entry_generation.set(risk_state_service.entry_generation)
+    try:
+        async with v2_entry_allocation_lock:
+            return await _execute_trading_intelligence_plan(plan_id, request)
+    finally:
+        if token is not None:
+            decision_entry_generation.reset(token)
+
+
+async def _record_entry_rejection(
+    plan_id: str,
+    episode: DecisionEpisode | None,
+    *,
+    reason: str,
+    code: str = "ENTRY_REJECTED",
+) -> None:
+    """Make an entry refusal terminal and keep the decision audit truthful."""
+
+    current_plan = await asyncio.to_thread(trading_intelligence_store.get_plan, plan_id)
+    rejected_plan = current_plan
+    if current_plan and current_plan.state not in {
+        TradingIntelligencePlanState.COMPLETED,
+        TradingIntelligencePlanState.EXPIRED,
+        TradingIntelligencePlanState.INVALIDATED,
+        TradingIntelligencePlanState.CANCELLED,
+    }:
+        rejected_plan = await asyncio.to_thread(
+            trading_intelligence_store.transition_plan,
+            plan_id,
+            expected_version=current_plan.version,
+            target=TradingIntelligencePlanState.CANCELLED,
+        )
+    if episode is not None:
+        rejected_episode = episode.model_copy(deep=True)
+        rejected_episode.status = "ENTRY_REJECTED"
+        rejected_episode.outcome = {
+            "error_code": code,
+            "summary": reason[:2000],
+            "plan_state": str(rejected_plan.state) if rejected_plan else None,
+        }
+        await asyncio.to_thread(trading_intelligence_store.save_episode, rejected_episode)
+    await asyncio.to_thread(
+        trading_intelligence_store.append_event,
+        dedupe_key=(
+            f"entry-execution-rejected:{plan_id}:"
+            f"{rejected_plan.version if rejected_plan else 0}:"
+            f"{sha256(reason.encode()).hexdigest()}"
+        ),
+        event_type="ENTRY_EXECUTION_REJECTED",
+        aggregate_type="plan",
+        aggregate_id=plan_id,
+        aggregate_version=rejected_plan.version if rejected_plan else 1,
+        payload={
+            "reason": reason,
+            "error_code": code,
+            "episode_id": episode.episode_id if episode else None,
+            "plan_state": str(rejected_plan.state) if rejected_plan else None,
+        },
+    )
+
+
+async def _execute_trading_intelligence_plan(
+    plan_id: str,
+    request: TradingIntelligenceExecuteRequest,
+):
+    if request.mode == TradingModeV2.LIVE_AUTHORIZED:
+        raise HTTPException(
+            409, "Live execution is disabled until Live reconciliation is available"
+        )
+    entry_generation = decision_entry_generation.get()
+    if entry_generation is None:
+        entry_generation = risk_state_service.entry_generation
+    if entry_generation != risk_state_service.entry_generation:
+        raise HTTPException(409, "entry invalidated by a risk stop")
+    risk_control = risk_state_service.get()
+    if risk_control.halted:
+        raise HTTPException(409, f"global risk halt is active: {risk_control.source}")
+    plan = await asyncio.to_thread(trading_intelligence_store.get_plan, plan_id)
+    if not plan:
+        raise HTTPException(404, "Trading Intelligence plan not found")
+    immediate = plan.order_type is not None
+    episodes = await asyncio.to_thread(
+        trading_intelligence_store.list_episodes,
+        symbol=plan.symbol,
+        limit=500,
+    )
+    episode = next((item for item in episodes if item.episode_id == request.episode_id), None)
+    if not episode or episode.plan_id != plan_id:
+        raise HTTPException(409, "DecisionEpisode does not own this plan")
+    if immediate:
+        existing_entry = await asyncio.to_thread(trading_intelligence_store.entry_for_plan, plan_id)
+        if existing_entry is not None:
+            if existing_entry.episode_id != request.episode_id:
+                raise HTTPException(409, "DecisionEpisode does not own this entry order")
+            return {
+                "mode": str(existing_entry.mode),
+                "status": str(existing_entry.status),
+                "plan_id": plan_id,
+                "entry_order": existing_entry.model_dump(mode="json"),
+            }
+        if request.plan_version != plan.version:
+            raise HTTPException(409, "exact current plan_version is required")
+    allowed_states = {
+        TradingIntelligencePlanState.WAITING_TRIGGER,
+        TradingIntelligencePlanState.ARMED,
+    }
+    if immediate:
+        allowed_states = {TradingIntelligencePlanState.ACTIVE}
+    if plan.state not in allowed_states:
+        raise HTTPException(409, "plan is not waiting for an entry trigger")
+    existing_positions = await asyncio.to_thread(
+        trading_intelligence_store.list_positions,
+        symbol=plan.symbol,
+    )
+    same_direction = [item for item in existing_positions if item.side == plan.side]
+    if immediate and same_direction:
+        if len(same_direction) != 1 or not any(
+            item.position_id == plan.position_id and item.version == plan.position_version
+            for item in same_direction
+        ):
+            raise HTTPException(
+                409, "same-direction add requires exact position_id and position_version"
+            )
+    elif immediate and plan.position_id is not None:
+        raise HTTPException(409, "target position is no longer open")
+    elif not immediate and any(position.plan_id != plan.plan_id for position in existing_positions):
+        raise HTTPException(
+            409,
+            "an attributable position already exists for this symbol; "
+            "a second plan cannot share the venue's aggregate position",
+        )
+    events = await asyncio.to_thread(
+        trading_intelligence_store.list_events,
+        aggregate_id=plan_id,
+        limit=1000,
+    )
+    wake_event = next(
+        (
+            item
+            for item in events
+            if item["event_id"] == request.wake_event_id and item["event_type"] == "WAKE_TRIGGERED"
+        ),
+        None,
+    )
+    if not immediate and not wake_event:
+        raise HTTPException(409, "a durable WakeCondition firing is required")
+    state = await asyncio.to_thread(trading_intelligence_store.latest_market_state, plan.symbol)
+    if not state:
+        raise HTTPException(409, "current MarketState v2 is unavailable")
+    try:
+        validate_market_state_time(state)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    quant = await asyncio.to_thread(trading_intelligence_store.latest_quant_prediction, plan.symbol)
+    configuration_view = configuration_service.get()
+    configuration = configuration_view.configuration
+    fingerprint = v2_configuration_fingerprint(configuration)
+    grant = await asyncio.to_thread(trading_intelligence_store.active_grant)
+    demo_credentials = configuration_view.credential_scopes.get("okx:sandbox")
+    demo_available = bool(
+        demo_credentials
+        and demo_credentials.api_key_configured
+        and demo_credentials.secret_configured
+        and demo_credentials.passphrase_configured
+    )
+    actual_mode = resolve_trading_mode(
+        requested=request.mode,
+        symbol=plan.symbol,
+        configuration_fingerprint_value=fingerprint,
+        live_grant=grant,
+        demo_credentials_available=demo_available,
+    )
+    adapter = None
+    if actual_mode != TradingModeV2.SHADOW:
+        credential_scope = (
+            "okx:live" if actual_mode == TradingModeV2.LIVE_AUTHORIZED else "okx:sandbox"
+        )
+        credentials = secret_store.get_credentials(credential_scope)
+        adapter = CcxtExchangeAdapter(
+            "okx",
+            credentials,
+            sandbox=actual_mode == TradingModeV2.OKX_DEMO,
+            live_enabled=actual_mode == TradingModeV2.LIVE_AUTHORIZED,
+            public_only=False,
+            market_type=configuration.market_type,
+            margin_mode=configuration.margin_mode,
+            contract_leverage=configuration.contract_leverage,
+            store=store,
+            account_id=f"okx:{str(actual_mode).lower()}:swap:v2",
+            proxy_url=configuration.network_proxy_url,
+            entry_submission_guard=partial(v2_submission_guard, entry_generation, fingerprint),
+        )
+    try:
+        if adapter is not None:
+            portfolio = await adapter.portfolio()
+            market = await adapter.market_snapshot(plan.symbol.removesuffix(":USDT"))
+            execution_adapter = adapter
+        else:
+            market, _ = await runtime.market_context(
+                limit=50,
+                symbol=plan.symbol.removesuffix(":USDT"),
+                timeframe="5m",
+            )
+            portfolio = await runtime.portfolio()
+            execution_adapter = runtime.execution
+            if execution_adapter is None:
+                raise RuntimeError("shadow execution runtime is unavailable")
+        available_margin = (
+            portfolio.available_margin
+            if portfolio.available_margin is not None
+            else portfolio.equity
+        )
+        # The MarketState slippage feature is a size-agnostic stress estimate
+        # and can sit at its 100 bps cap before RiskAllocation exists. Using it
+        # here rejected small Demo orders despite a tight executable spread.
+        # Depth remains bounded independently by liquidity_notional_cap.
+        estimated_slippage_bps = market.spread_bps
+        from .portfolio_risk_v2 import portfolio_risk_snapshot
+
+        managed_positions = await asyncio.to_thread(trading_intelligence_store.list_positions)
+        pending_entries = await asyncio.to_thread(
+            trading_intelligence_store.list_entry_orders,
+            active_only=True,
+        )
+        portfolio_risk = portfolio_risk_snapshot(
+            portfolio,
+            managed_positions,
+            existing_position_stress=configuration.risk.existing_position_stress,
+            pending_entries=pending_entries,
+            mode=str(actual_mode),
+        )
+        existing_position_risk = None
+        if plan.position_id is not None:
+            target = next(
+                (
+                    item
+                    for item in portfolio_risk["positions"]
+                    if item.get("position_id") == plan.position_id
+                    and item.get("position_version") == plan.position_version
+                ),
+                None,
+            )
+            if target is None:
+                raise HTTPException(409, "target position risk context is unavailable")
+            existing_position_risk = ExistingPositionRisk(
+                position_id=plan.position_id,
+                position_version=plan.position_version,
+                symbol=plan.symbol,
+                side=plan.side,
+                quantity=target["quantity"],
+                mark_price=target["mark_price"],
+                risk_amount=target["risk_amount"],
+            )
+        risk_context = TradingIntelligenceRiskContext(
+            equity=portfolio.equity,
+            available_margin=max(available_margin, Decimal("0.00000001")),
+            portfolio_risk_used=portfolio_risk["risk_fraction"],
+            daily_drawdown=portfolio.daily_drawdown_fraction,
+            open_positions=portfolio_risk["open_positions"],
+            estimated_slippage_bps=estimated_slippage_bps,
+            existing_position=existing_position_risk,
+            liquidity_notional_cap=max(
+                available_margin * configuration.risk.max_leverage * Decimal("0.25"),
+                Decimal("10"),
+            ),
+            correlation_risk_multiplier=(
+                Decimal("0.5")
+                if any(item["side"] == plan.side for item in portfolio_risk["positions"])
+                else Decimal("1")
+            ),
+        )
+        risk_limits = TradingIntelligenceRiskLimits(
+            risk_per_trade=configuration.risk.risk_per_trade,
+            max_portfolio_risk=configuration.risk.max_portfolio_risk,
+            max_daily_drawdown=configuration.risk.max_daily_drawdown,
+            max_open_positions=configuration.risk.max_open_positions,
+            max_leverage=configuration.risk.max_leverage,
+            max_slippage_bps=configuration.risk.max_spread_bps,
+            minimum_reward_risk=configuration.risk.minimum_reward_risk,
+        )
+        allocation = DeterministicRiskEngine().allocate(
+            plan,
+            risk_context,
+            risk_limits,
+            grant=grant,
+            live=actual_mode == TradingModeV2.LIVE_AUTHORIZED,
+        )
+        if adapter is not None:
+            adapter.contract_leverage = allocation.leverage
+        execution = V2ExecutionEngine(
+            execution_adapter,
+            trading_intelligence_store,
+            margin_mode=str(configuration.margin_mode),
+            execution_leverage=allocation.leverage,
+            demo_credentials_available=demo_available,
+        )
+        try:
+            preflight_mode = await execution.preflight(
+                plan=plan,
+                market_state=state,
+                requested_mode=request.mode,
+                configuration_fingerprint=fingerprint,
+                live_grant=grant,
+                quant=quant,
+            )
+        except EntryRiskBlocked as exc:
+            await _record_entry_rejection(
+                plan_id,
+                episode,
+                reason=str(exc),
+                code="ENTRY_RISK_BLOCKED",
+            )
+            await asyncio.to_thread(
+                trading_intelligence_store.append_event,
+                dedupe_key=f"entry-execution-blocked:{request.wake_event_id}",
+                event_type="ENTRY_EXECUTION_BLOCKED",
+                aggregate_type="plan",
+                aggregate_id=plan_id,
+                aggregate_version=plan.version,
+                payload={
+                    "wake_event_id": request.wake_event_id,
+                    "reason": str(exc),
+                    "risk_halted": False,
+                },
+            )
+            return V2ExecutionResult(
+                mode=actual_mode,
+                status="REJECTED",
+                plan_id=plan.plan_id,
+                allocation_id=allocation.allocation_id,
+                reason=str(exc),
+            )
+        if immediate:
+            result = await execution.execute(
+                plan=plan,
+                allocation=allocation,
+                market_state=state,
+                market=market,
+                episode=episode,
+                requested_mode=request.mode,
+                configuration_fingerprint=fingerprint,
+                live_grant=grant,
+                quant=quant,
+                preflight_mode=preflight_mode,
+            )
+            if actual_mode == TradingModeV2.OKX_DEMO:
+                await asyncio.to_thread(reconciliation_protected_plan_ids)
+            return result
+        armed_plan = plan
+        if plan.state == TradingIntelligencePlanState.WAITING_TRIGGER:
+            armed_plan = await asyncio.to_thread(
+                trading_intelligence_store.transition_plan,
+                plan_id,
+                expected_version=plan.version,
+                target=TradingIntelligencePlanState.ARMED,
+            )
+        _claim_event_id, claimed = await asyncio.to_thread(
+            trading_intelligence_store.append_event,
+            dedupe_key=f"entry-execution:{request.wake_event_id}",
+            event_type="ENTRY_EXECUTION_CLAIMED",
+            aggregate_type="plan",
+            aggregate_id=plan_id,
+            aggregate_version=armed_plan.version,
+            payload={
+                "wake_event_id": request.wake_event_id,
+                "episode_id": request.episode_id,
+                "mode": str(actual_mode),
+            },
+        )
+        if not claimed:
+            raise RuntimeError("this WakeCondition execution has already been claimed")
+        triggered_plan = await asyncio.to_thread(
+            trading_intelligence_store.transition_plan,
+            plan_id,
+            expected_version=armed_plan.version,
+            target=TradingIntelligencePlanState.TRIGGERED,
+        )
+        result = await execution.execute(
+            plan=triggered_plan,
+            allocation=allocation,
+            market_state=state,
+            market=market,
+            episode=episode,
+            requested_mode=request.mode,
+            configuration_fingerprint=fingerprint,
+            live_grant=grant,
+            quant=quant,
+            preflight_mode=preflight_mode,
+        )
+        if actual_mode == TradingModeV2.OKX_DEMO:
+            await asyncio.to_thread(reconciliation_protected_plan_ids)
+        return result
+    except HTTPException as exc:
+        await _record_entry_rejection(plan_id, episode, reason=str(exc.detail))
+        raise
+    except (PermissionError, ValueError, RuntimeError) as exc:
+        current_plan = await asyncio.to_thread(trading_intelligence_store.get_plan, plan_id)
+        if (
+            current_plan
+            and current_plan.order_type is not None
+            and await asyncio.to_thread(
+                trading_intelligence_store.entry_for_plan,
+                plan_id,
+            )
+            is None
+        ):
+            await _record_entry_rejection(
+                plan_id,
+                episode,
+                reason=str(exc),
+                code="EXCHANGE_OR_EXECUTION_REJECTED",
+            )
+            raise HTTPException(409, str(exc)) from exc
+        if current_plan and current_plan.state == TradingIntelligencePlanState.TRIGGERED:
+            await asyncio.to_thread(
+                trading_intelligence_store.append_event,
+                dedupe_key=f"entry-execution-failed:{request.wake_event_id}",
+                event_type="ENTRY_EXECUTION_FAILED",
+                aggregate_type="plan",
+                aggregate_id=plan_id,
+                aggregate_version=current_plan.version,
+                payload={
+                    "wake_event_id": request.wake_event_id,
+                    "reason_hash": sha256(str(exc).encode()).hexdigest(),
+                    "risk_halted": True,
+                },
+            )
+            risk_state_service.halt(
+                "Trading Intelligence v2 entry failed after the durable trigger claim",
+                source="trading_intelligence_v2",
+            )
+        raise HTTPException(409, str(exc)) from exc
+    finally:
+        if adapter is not None:
+            await adapter.close()
+
+
+async def invoke_automated_trading_intelligence_decision(
+    symbol: str,
+    trigger: str,
+    trigger_event_id: str | None,
+    mode: TradingModeV2,
+) -> dict:
+    result = await invoke_trading_intelligence(
+        TradingIntelligenceDecisionRequest(
+            symbol=symbol,
+            trigger=trigger,
+            trigger_event_id=trigger_event_id,
+            mode=mode,
+        )
+    )
+    return result
+
+
+async def execute_automated_trading_intelligence_plan(
+    plan_id: str,
+    episode_id: str,
+    wake_event_id: str | None,
+    mode: TradingModeV2,
+    *,
+    plan_version: int | None = None,
+) -> dict:
+    try:
+        result = await execute_trading_intelligence_plan(
+            plan_id,
+            TradingIntelligenceExecuteRequest(
+                episode_id=episode_id,
+                wake_event_id=wake_event_id,
+                plan_version=plan_version,
+                mode=mode,
+            ),
+        )
+    except HTTPException as exc:
+        reason = str(exc.detail)
+        if not is_expected_automated_entry_rejection(exc.status_code, reason):
+            raise
+        plan = await asyncio.to_thread(trading_intelligence_store.get_plan, plan_id)
+        await asyncio.to_thread(
+            trading_intelligence_store.append_event,
+            dedupe_key=f"entry-execution-blocked:{plan_id}:{plan_version}:{episode_id}:{wake_event_id}",
+            event_type="ENTRY_EXECUTION_BLOCKED",
+            aggregate_type="plan",
+            aggregate_id=plan_id,
+            aggregate_version=plan.version if plan else 1,
+            payload={
+                "wake_event_id": wake_event_id,
+                "reason": reason,
+                "risk_halted": False,
+            },
+        )
+        return {
+            "mode": str(mode),
+            "status": "REJECTED",
+            "plan_id": plan_id,
+            "reason": reason,
+        }
+    return result.model_dump(mode="json") if isinstance(result, BaseModel) else result
+
+
+async def v2_demo_commissioning(symbols: list[str]) -> dict:
+    view = configuration_service.get()
+    blockers: list[str] = []
+    credentials_view = view.credential_scopes.get("okx:sandbox")
+    if not credentials_view or not (
+        credentials_view.api_key_configured
+        and credentials_view.secret_configured
+        and credentials_view.passphrase_configured
+    ):
+        blockers.append("okx_demo_credentials_incomplete")
+        return {"eligible": False, "blockers": blockers}
+    risk_state = risk_state_service.get()
+    if risk_state.halted:
+        blockers.append(f"global_risk_halt:{risk_state.source}")
+    for attempt in range(3):
+        adapter = build_v2_demo_adapter()
+        try:
+            health = await adapter.health()
+            account = await adapter.validate_account_configuration()
+            portfolio = await adapter.portfolio()
+            open_orders = await adapter.open_orders()
+            known_order_ids = {
+                order_id
+                for episode in trading_intelligence_store.list_episodes(limit=1000)
+                for order_id in episode.order_ids
+            }
+            unknown_orders = [item.id for item in open_orders if item.id not in known_order_ids]
+            if unknown_orders:
+                blockers.append("unknown_demo_open_orders")
+            known_position_scopes = {
+                (
+                    item.symbol.removesuffix(":USDT"),
+                    Side.LONG if item.side == "LONG" else Side.SHORT,
+                )
+                for item in trading_intelligence_store.list_positions()
+            }
+            unknown_positions = [
+                item
+                for item in portfolio.open_positions
+                if (item.symbol, item.side) not in known_position_scopes
+            ]
+            if unknown_positions:
+                blockers.append("unknown_demo_open_positions")
+            protection = {}
+            for symbol in symbols:
+                protection[symbol] = all(
+                    [
+                        await adapter.protection_available(
+                            symbol.removesuffix(":USDT"), position_side
+                        )
+                        for position_side in (PositionSide.LONG, PositionSide.SHORT)
+                    ]
+                )
+                if not protection[symbol]:
+                    blockers.append(f"native_protection_unavailable:{symbol}")
+            return {
+                "eligible": not blockers,
+                "blockers": blockers,
+                "health": health,
+                "account": account,
+                "equity": str(portfolio.equity),
+                "open_position_count": len(portfolio.open_positions),
+                "open_order_count": len(open_orders),
+                "unknown_order_count": len(unknown_orders),
+                "unknown_position_count": len(unknown_positions),
+                "protection": protection,
+            }
+        except Exception as exc:
+            if attempt == 2:
+                return {
+                    "eligible": False,
+                    "blockers": [*blockers, "okx_demo_temporarily_unavailable"],
+                    "error_code": type(exc).__name__,
+                    "error_hash": sha256(str(exc).encode()).hexdigest(),
+                }
+            await asyncio.sleep(0.5 * (attempt + 1))
+        finally:
+            await adapter.close()
+    raise AssertionError("bounded Demo commissioning loop did not return")
+
+
+def require_v2_automation() -> TradingIntelligenceAutomation:
+    global trading_intelligence_automation
+    if trading_intelligence_automation is None:
+        trading_intelligence_automation = TradingIntelligenceAutomation(
+            trading_intelligence_store,
+            trading_intelligence_engine,
+            decide=invoke_automated_trading_intelligence_decision,
+            execute=execute_automated_trading_intelligence_plan,
+            reconcile=reconcile_v2_before_resume,
+        )
+    return trading_intelligence_automation
+
+
+@app.get("/api/trading-intelligence/automation", response_model=AutomationRuntimeV2)
+async def get_trading_intelligence_automation():
+    return await asyncio.to_thread(require_v2_automation().runtime)
+
+
+@app.post("/api/trading-intelligence/automation/commission")
+async def commission_trading_intelligence_automation(
+    request: TradingIntelligenceAutomationRequest,
+):
+    if request.mode == TradingModeV2.SHADOW:
+        return {"eligible": True, "blockers": [], "mode": str(request.mode)}
+    return await v2_demo_commissioning(request.symbols)
+
+
+@app.post(
+    "/api/trading-intelligence/automation/start",
+    response_model=AutomationRuntimeV2,
+)
+async def start_trading_intelligence_automation(
+    request: TradingIntelligenceAutomationRequest,
+):
+    generation = risk_state_service.entry_generation
+    configuration_generation = v2_configuration_generation
+    if request.mode == TradingModeV2.OKX_DEMO:
+        commissioning = await v2_demo_commissioning(request.symbols)
+        if not commissioning["eligible"]:
+            raise HTTPException(409, commissioning)
+    service = require_v2_automation()
+    async with v2_submission_lock:
+        if generation != risk_state_service.entry_generation:
+            raise HTTPException(409, "自动化启动已被停止操作取消，请重新发起")
+        if configuration_generation != v2_configuration_generation:
+            raise HTTPException(409, "验收期间账户配置已改变，请重新验收")
+        if risk_state_service.get().halted:
+            raise HTTPException(409, "风险暂停尚未解除，不能启动自动化")
+        # No await between the generation check and the durable state transition.
+        service.configure(enabled=True, requested_mode=request.mode, symbols=request.symbols)
+    try:
+        await service.resume(evaluate_market_states=False)
+    except Exception:
+        if generation == risk_state_service.entry_generation:
+            service.configure(
+                enabled=False,
+                requested_mode=request.mode,
+                symbols=request.symbols,
+            )
+        raise
+    if generation != risk_state_service.entry_generation or risk_state_service.get().halted:
+        return service.runtime()
+    current = service.runtime()
+    running = current.model_copy(
+        update={
+            "status": (
+                AutomationRuntimeStatus.DEGRADED
+                if current.symbol_failures
+                else AutomationRuntimeStatus.RUNNING
+            ),
+            "updated_at": datetime.now(UTC),
+        }
+    )
+    await asyncio.to_thread(
+        trading_intelligence_store.save_automation_runtime,
+        running,
+        expected_updated_at=current.updated_at,
+    )
+    return service.runtime()
+
+
+@app.post(
+    "/api/trading-intelligence/automation/stop",
+    response_model=AutomationRuntimeV2,
+)
+async def stop_trading_intelligence_automation():
+    risk_state_service.invalidate_entries()
+    service = require_v2_automation()
+    stopped = await asyncio.to_thread(
+        service.configure,
+        enabled=False,
+        requested_mode=service.runtime().requested_mode,
+        symbols=service.runtime().symbols,
+    )
+    await reconcile_v2_before_resume()
+    return stopped
+
+
+@app.post("/api/trading-intelligence/live-grants/preview")
+async def preview_trading_intelligence_live_grant(request: HumanLiveGrantPreviewRequest):
+    return v2_live_grant_preview_payload(request)
+
+
+@app.post("/api/trading-intelligence/live-grants", response_model=HumanLiveGrant)
+async def issue_trading_intelligence_live_grant(request: HumanLiveGrantIssueRequest):
+    preview = v2_live_grant_preview_payload(request)
+    if preview["blockers"]:
+        raise HTTPException(409, {"blockers": preview["blockers"]})
+    if request.configuration_fingerprint != preview["configuration_fingerprint"]:
+        raise HTTPException(409, "configuration changed after grant preview")
+    try:
+        grant = HumanLiveGrant(
+            symbols=request.symbols,
+            max_risk_per_trade=request.max_risk_per_trade,
+            max_portfolio_risk=request.max_portfolio_risk,
+            max_leverage=request.max_leverage,
+            max_daily_drawdown=request.max_daily_drawdown,
+            max_open_positions=request.max_open_positions,
+            configuration_fingerprint=request.configuration_fingerprint,
+            expires_at=datetime.now(UTC) + timedelta(hours=request.valid_hours),
+            risk_confirmation_one=request.risk_confirmation_one,
+            risk_confirmation_two=request.risk_confirmation_two,
+        )
+    except ValidationError as exc:
+        raise HTTPException(400, exc.errors(include_url=False)) from exc
+    await asyncio.to_thread(trading_intelligence_store.issue_grant, grant)
+    add_audit(
+        "trading_intelligence",
+        "HumanLiveGrant v2 issued",
+        severity="critical",
+        grant_id=grant.grant_id,
+        expires_at=grant.expires_at.isoformat(),
+    )
+    return grant
+
+
+@app.delete(
+    "/api/trading-intelligence/live-grants/{grant_id}",
+    response_model=HumanLiveGrant,
+)
+async def revoke_trading_intelligence_live_grant(grant_id: str):
+    try:
+        grant = await asyncio.to_thread(trading_intelligence_store.revoke_grant, grant_id)
+    except KeyError as exc:
+        raise HTTPException(404, "HumanLiveGrant not found") from exc
+    add_audit(
+        "trading_intelligence",
+        "HumanLiveGrant v2 revoked",
+        severity="critical",
+        grant_id=grant_id,
+    )
+    return grant
+
+
+@app.api_route(
+    "/api/{unregistered_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+async def unregistered_api_route(unregistered_path: str):
+    del unregistered_path
+    raise HTTPException(404, "API route not found")
 
 
 web_distribution = Path(__file__).resolve().parent.parent.parent / "apps" / "web" / "dist"

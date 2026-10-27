@@ -11,9 +11,9 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from time import time
 
-import websockets
 from pydantic import BaseModel
 
+from . import websocket_transport as websockets
 from .domain import OrderStatus
 from .order_ledger import PrivateOrderEvent
 

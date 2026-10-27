@@ -276,6 +276,23 @@ class StrategyDSLV2(BaseModel):
     exits: list[str] = Field(default_factory=list, max_length=8)
     risk: RiskDefinition
     invalidation: list[str] = Field(min_length=1, max_length=16)
+    regime_gates: dict[str, str] = Field(default_factory=dict, max_length=7)
+
+    @model_validator(mode="after")
+    def validate_regime_gate_names(self):
+        allowed = {
+            "trend",
+            "volatility",
+            "liquidity",
+            "funding",
+            "open_interest",
+            "basis",
+            "order_flow",
+        }
+        unknown = set(self.regime_gates) - allowed
+        if unknown:
+            raise ValueError(f"unknown regime gates: {sorted(unknown)}")
+        return self
 
 
 class CanonicalNode(BaseModel, frozen=True):
@@ -309,6 +326,7 @@ class CanonicalStrategyIR(BaseModel, frozen=True):
     risk_budget_fraction: str
     maximum_holding_bars: int
     invalidation: tuple[str, ...]
+    regime_gates: tuple[tuple[str, str], ...] = ()
     operator_policy_version: str = OPERATOR_POLICY_VERSION
 
     @property
@@ -451,6 +469,7 @@ def compile_strategy_dsl(payload: StrategyDSLV2 | dict[str, Any]) -> CanonicalSt
         dsl.signals.filter,
         dsl.risk.stop_distance,
         *dsl.exits,
+        *dsl.regime_gates.values(),
     ]
     for reference in (item for item in referenced if item is not None):
         if reference not in value_types:
@@ -458,6 +477,9 @@ def compile_strategy_dsl(payload: StrategyDSLV2 | dict[str, Any]) -> CanonicalSt
     for reference in (dsl.signals.long, dsl.signals.short, dsl.signals.filter):
         if reference is not None and value_types[reference] != ValueType.BOOLEAN_SERIES:
             raise StrategyDSLValidationError(f"signal {reference!r} must be boolean")
+    for gate, reference in dsl.regime_gates.items():
+        if value_types[reference] != ValueType.BOOLEAN_SERIES:
+            raise StrategyDSLValidationError(f"regime gate {gate!r} must be boolean")
     if value_types[dsl.risk.stop_distance] != ValueType.SERIES:
         raise StrategyDSLValidationError("stop distance must be a series")
     return CanonicalStrategyIR(
@@ -476,6 +498,7 @@ def compile_strategy_dsl(payload: StrategyDSLV2 | dict[str, Any]) -> CanonicalSt
         risk_budget_fraction=format(dsl.risk.risk_budget_fraction.normalize(), "f"),
         maximum_holding_bars=dsl.risk.maximum_holding_bars,
         invalidation=tuple(dsl.invalidation),
+        regime_gates=tuple(sorted(dsl.regime_gates.items())),
     )
 
 

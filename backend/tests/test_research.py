@@ -65,6 +65,24 @@ def test_research_fingerprint_includes_market_identity():
     assert hourly.data_fingerprint != four_hour.data_fingerprint
 
 
+def test_research_dataset_records_training_segments_for_gaps_above_three_bars():
+    candles = demo_candles(40)
+    segmented = [*candles[:10], *candles[14:]]
+
+    dataset = build_research_dataset(
+        segmented,
+        exchange="binance",
+        market_type="swap",
+        symbol="BTC/USDT",
+        timeframe="1h",
+    )
+
+    assert dataset.largest_gap_bars == 4
+    assert dataset.segment_count == 2
+    assert dataset.training_segment_boundaries == (candles[14].timestamp,)
+    assert dataset.segment_reasons[0].startswith("contiguous_gap_above_3_bars_before:")
+
+
 def test_blind_dataset_role_and_split_contract_are_fingerprint_bound():
     candles = demo_candles(40)
     boundary = candles[30].timestamp

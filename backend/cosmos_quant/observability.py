@@ -6,6 +6,8 @@ from time import monotonic
 
 
 class Metrics:
+    max_series = 10_000
+
     def __init__(self):
         self.started_at = monotonic()
         self._lock = Lock()
@@ -15,11 +17,15 @@ class Metrics:
     def increment(self, name: str, value: float = 1, **labels: str) -> None:
         key = (name, tuple(sorted(labels.items())))
         with self._lock:
+            if key not in self._counters and len(self._counters) >= self.max_series:
+                return
             self._counters[key] += value
 
     def gauge(self, name: str, value: float, **labels: str) -> None:
         key = (name, tuple(sorted(labels.items())))
         with self._lock:
+            if key not in self._gauges and len(self._gauges) >= self.max_series:
+                return
             self._gauges[key] = value
 
     def render_prometheus(self) -> str:

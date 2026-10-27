@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import {
   discoverAIModels,
+  getAIHealth,
   getAISettings,
   getAIUsage,
   saveAISettings,
@@ -18,6 +19,7 @@ import {
 } from './api'
 import type {
   AIConfiguration,
+  AIHealth,
   AIConfigurationView,
   AIProvider,
   AIProviderConfiguration,
@@ -46,19 +48,22 @@ export default function AISettingsWorkspace() {
   const [view, setView] = useState<AIConfigurationView | null>(null)
   const [configuration, setConfiguration] = useState<AIConfiguration | null>(null)
   const [usage, setUsage] = useState<AIUsageReport | null>(null)
+  const [health, setHealth] = useState<AIHealth | null>(null)
   const [selected, setSelected] = useState<AIProvider>('openai')
   const [apiKey, setApiKey] = useState('')
   const [clearExisting, setClearExisting] = useState(false)
   const [busy, setBusy] = useState<BusyState>('loading')
   const [message, setMessage] = useState<{ tone: 'success' | 'error'; text: string } | null>(null)
+  const [loadAttempt, setLoadAttempt] = useState(0)
 
   useEffect(() => {
     let active = true
-    Promise.all([getAISettings(), getAIUsage(30)])
-      .then(([next, nextUsage]) => {
+    Promise.all([getAISettings(), getAIUsage(30), getAIHealth()])
+      .then(([next, nextUsage, nextHealth]) => {
         if (!active) return
         setView(next)
         setUsage(nextUsage)
+        setHealth(nextHealth)
         setConfiguration(structuredClone(next.configuration))
         const firstConfigured = next.configuration.providers.find(
           item => next.credentials[item.provider].api_key_configured,
@@ -71,7 +76,7 @@ export default function AISettingsWorkspace() {
       }))
       .finally(() => active && setBusy(null))
     return () => { active = false }
-  }, [])
+  }, [loadAttempt])
 
   const current = useMemo(
     () => configuration?.providers.find(item => item.provider === selected) ?? null,
@@ -145,9 +150,14 @@ export default function AISettingsWorkspace() {
     try {
       if (apiKey || clearExisting) await persist()
       const result = await testAIProvider(selected)
-      const [next, nextUsage] = await Promise.all([getAISettings(), getAIUsage(30)])
+      const [next, nextUsage, nextHealth] = await Promise.all([
+        getAISettings(),
+        getAIUsage(30),
+        getAIHealth(),
+      ])
       setView(next)
       setUsage(nextUsage)
+      setHealth(nextHealth)
       setConfiguration(structuredClone(next.configuration))
       setMessage({
         tone: result.ok ? 'success' : 'error',
@@ -179,8 +189,10 @@ export default function AISettingsWorkspace() {
 
   if (!configuration || !current || !view) {
     return (
-      <div className="ai-settings-loading">
-        <span className="ai-orbit" />{message?.text ?? '正在读取 AI 服务配置…'}
+      <div className="ai-settings-loading" role={message ? 'alert' : 'status'}>
+        {busy === 'loading' ? <span className="ai-orbit" /> : <Activity aria-hidden="true" />}
+        <span>{message?.text ?? '正在读取 AI 服务配置…'}</span>
+        {busy !== 'loading' && <button className="button primary" onClick={() => { setBusy('loading'); setMessage(null); setLoadAttempt(value => value + 1) }}><RefreshCw />重新读取</button>}
       </div>
     )
   }
@@ -191,6 +203,8 @@ export default function AISettingsWorkspace() {
   const modelOptions = runtime.models.filter(model => (
     current.allow_preview_models || !/(preview|experimental|exp)/i.test(model)
   ))
+  const circuit = health?.providers[selected]
+  const decisionQuality = circuit?.agent_decision_quality
 
   return (
     <section className="ai-settings-workspace">
@@ -203,15 +217,29 @@ export default function AISettingsWorkspace() {
         <div className="ai-health-summary" aria-label="AI 配置状态">
           <div><strong>{configuredCount}</strong><span>凭证已配置</span></div>
           <div><strong>{enabledCount}</strong><span>已加入路由</span></div>
+          <div><strong>0</strong><span>审核 / 交易 LLM</span></div>
           <i className={enabledCount ? 'ready' : ''} />
         </div>
       </header>
 
+      {circuit && circuit.status !== 'ready' && <div className="ai-circuit-banner" role="status">
+        <Activity /><div><strong>研究 AI {circuit.status === 'circuit_open' ? '正在熔断冷却' : '连接降级'}</strong><span>{circuit.last_error_message || '连续请求失败，网关会在冷却后自动半开探测。'} 审核与交易热路径均为 0 LLM，仍会持续运行。</span></div><code>{circuit.consecutive_failures} 次连续失败</code>
+      </div>}
+
+      {decisionQuality && <div className={`ai-quality-banner ${decisionQuality.automatic_allowed ? 'ready' : 'blocked'}`} role="status">
+        <ShieldCheck aria-hidden="true" />
+        <div>
+          <strong>{decisionQuality.automatic_allowed ? '自动研究路由可用' : '自动研究路由已被质量闸门暂停'}</strong>
+          <span>{decisionQuality.reason}；审核与交易继续使用确定性程序。</span>
+        </div>
+        <code>{decisionQuality.success_rate == null ? '待积累样本' : `${(decisionQuality.success_rate * 100).toFixed(1)}% · ${decisionQuality.request_count} 次`}</code>
+      </div>}
+
       {usage && <div className="ai-usage-summary" aria-label="近 30 天 AI 用量">
-        <div><span>请求</span><strong>{usage.summary.request_count.toLocaleString()}</strong></div>
+        <div><span>请求 / 失败</span><strong>{usage.summary.request_count.toLocaleString()} / {usage.summary.failed_request_count.toLocaleString()}</strong></div>
         <div><span>Token</span><strong>{usage.summary.total_tokens.toLocaleString()}</strong></div>
         <div><span>缓存命中</span><strong>{(usage.summary.cache_hit_rate * 100).toFixed(1)}%</strong></div>
-        <div><span>隐藏推理</span><strong>{usage.summary.reasoning_tokens.toLocaleString()}</strong></div>
+        <div><span>自动结构成功率</span><strong>{decisionQuality?.success_rate == null ? '—' : `${(decisionQuality.success_rate * 100).toFixed(1)}%`}</strong></div>
         <div><span>估算费用</span><strong>¥{Number(usage.summary.estimated_cost_cny).toFixed(3)}</strong></div>
       </div>}
 
@@ -306,10 +334,10 @@ export default function AISettingsWorkspace() {
               <label>
                 <span>思考模式</span>
                 <select value={current.thinking_enabled ? 'enabled' : 'disabled'} onChange={event => updateProvider('thinking_enabled', event.target.value === 'enabled')}>
-                  <option value="enabled">开启</option>
+                  <option value="enabled">开启（保留配置）</option>
                   <option value="disabled">关闭</option>
                 </select>
-                <small>Agent 决策建议保持开启；连接测试会自动关闭。</small>
+                <small>自动控制与 StrategySpec 请求会为 JSON 可靠性强制关闭；此值不再影响审核或交易。</small>
               </label>
               <label>
                 <span>推理强度</span>
@@ -317,7 +345,7 @@ export default function AISettingsWorkspace() {
                   <option value="high">High（推荐）</option>
                   <option value="max">Max</option>
                 </select>
-                <small>请求会显式发送该值，不再依赖服务端默认。</small>
+                <small>仅供未来非控制型深度研究使用；当前自动链路不依赖该值。</small>
               </label>
             </div>}
           </div>
@@ -331,7 +359,7 @@ export default function AISettingsWorkspace() {
             </div>
           </div>
 
-          <div className="ai-safety-line"><ShieldCheck aria-hidden="true" /><div><strong>研究隔离已开启</strong><p>AI 输出必须通过 StrategySpec 校验、不可变数据集回测和人工晋升；即使成为 Champion，也不会自动进入交易执行。</p></div></div>
+          <div className="ai-safety-line"><ShieldCheck aria-hidden="true" /><div><strong>离线研究与实时决策严格隔离</strong><p>Research AI 只生成和验证离线候选，不会自动交接到实时交易；v2 实时决策只消费 MarketState、Quant、Portfolio 和既有 Thesis，并始终经过确定性硬风控。</p></div></div>
 
           {message && <div className={`ai-settings-message ${message.tone}`} role="status"><span>{message.text}</span></div>}
 

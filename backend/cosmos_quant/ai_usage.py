@@ -36,6 +36,8 @@ class AICompletionResult(BaseModel):
     usage: AIUsage = Field(default_factory=AIUsage)
     latency_ms: int = Field(ge=0)
     provider_request_id: str | None = None
+    finish_reason: str | None = None
+    response_char_count: int = Field(default=0, ge=0)
     operation: str = "structured_generation"
     thinking_enabled: bool | None = None
     reasoning_effort: AIReasoningEffort | None = None
@@ -54,6 +56,11 @@ class AIUsageEvent(BaseModel):
     reasoning_effort: AIReasoningEffort | None = None
     prompt_version: str = Field(default="v1", min_length=1, max_length=100)
     schema_version: str = Field(default="v1", min_length=1, max_length=100)
+    succeeded: bool = True
+    error_code: str | None = Field(default=None, max_length=100)
+    error_detail: str | None = Field(default=None, max_length=500)
+    finish_reason: str | None = Field(default=None, max_length=100)
+    response_char_count: int = Field(default=0, ge=0)
     usage: AIUsage
     latency_ms: int = Field(ge=0)
     created_at: datetime
@@ -63,6 +70,7 @@ class AIUsageSummary(BaseModel):
     since: datetime
     until: datetime
     request_count: int = Field(default=0, ge=0)
+    failed_request_count: int = Field(default=0, ge=0)
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
@@ -95,12 +103,13 @@ class DeepSeekPrice:
 
 _SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
 _NEW_PRICING_START = datetime(2026, 8, 17, tzinfo=_SHANGHAI)
+_V41_PRICING_START = datetime(2026, 9, 10, 12, tzinfo=_SHANGHAI)
 _MILLION = Decimal(1_000_000)
 
 
 def deepseek_price(model: str, at: datetime) -> DeepSeekPrice | None:
     normalized = model.lower()
-    if "deepseek-v4-flash" in normalized:
+    if normalized == "deepseek-flash" or "deepseek-v4-flash" in normalized:
         family = "flash"
     elif "deepseek-v4-pro" in normalized:
         family = "pro"
@@ -115,6 +124,14 @@ def deepseek_price(model: str, at: datetime) -> DeepSeekPrice | None:
 
     peak = 9 <= local.hour < 12 or 14 <= local.hour < 18
     if family == "flash":
+        if local >= _V41_PRICING_START:
+            return (
+                DeepSeekPrice(Decimal("0.006"), Decimal("0.3"), Decimal("1.2"), "peak")
+                if peak
+                else DeepSeekPrice(
+                    Decimal("0.003"), Decimal("0.15"), Decimal("0.6"), "off_peak"
+                )
+            )
         return (
             DeepSeekPrice(Decimal("0.10"), Decimal("3.0"), Decimal("9.0"), "peak")
             if peak

@@ -7,8 +7,7 @@ from decimal import Decimal
 from hashlib import sha256
 from uuid import uuid4
 
-import websockets
-
+from . import websocket_transport as websockets
 from .domain import LiquidationEvent, OrderSide, Side
 from .market_data_capture import CaptureSessionStatus, MarketDataCaptureSession
 from .storage import SqliteStore

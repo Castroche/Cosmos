@@ -1,0 +1,31 @@
+async page => {
+ const checks=[];
+ await page.goto('http://127.0.0.1:8010/?section=library');
+ await page.getByPlaceholder('搜索名称、ID 或描述').fill('UI验收策略');
+ await page.locator('.library-table article').waitFor({state:'hidden'});
+ await page.getByRole('checkbox',{name:'显示已归档/隐藏'}).check();
+ await page.getByRole('button',{name:'恢复',exact:true}).click();
+ await page.getByRole('button',{name:'归档',exact:true}).waitFor();
+ checks.push('策略创建、搜索、归档、恢复通过');
+ await page.getByRole('button',{name:'新建个人策略',exact:true}).click();
+ await page.route('**/api/strategy-library',route=>route.request().method()==='POST'?route.fulfill({status:422,contentType:'application/json',body:JSON.stringify({detail:'验收：参数无效'})}):route.continue());
+ await page.getByRole('button',{name:'保存到个人策略库',exact:true}).click();
+ await page.getByRole('dialog',{name:'创建个人策略'}).getByRole('alert').waitFor();
+ checks.push({modalError:await page.getByRole('dialog').getByRole('alert').innerText()});
+ await page.keyboard.press('Escape');
+ await page.getByRole('dialog').waitFor({state:'hidden'});
+ await page.unroute('**/api/strategy-library');
+ await page.route('**/api/ai/settings',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({detail:'验收：配置暂时不可用'})}));
+ await page.goto('http://127.0.0.1:8010/?section=ai');
+ await page.getByRole('button',{name:'重新读取'}).waitFor();
+ checks.push({aiReadFailure:await page.getByRole('alert').innerText()});
+ await page.unroute('**/api/ai/settings');
+ await page.getByRole('button',{name:'重新读取'}).click();
+ await page.getByRole('heading',{name:'AI 服务',exact:true}).waitFor();
+ await page.getByRole('button',{name:/Anthropic/}).click();
+ await page.getByRole('heading',{name:'Anthropic',exact:true}).waitFor();
+ await page.getByRole('button',{name:'保存 AI 配置',exact:true}).click();
+ await page.getByText(/Anthropic 配置已保存/).waitFor();
+ checks.push('AI 读取失败重试、厂商切换、配置保存通过');
+ return checks;
+}
