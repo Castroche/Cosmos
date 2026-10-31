@@ -211,6 +211,12 @@ class LifecycleService:
             self.strategy_review_worker_loop(),
             name="durable-strategy-review",
         )
+        await asyncio.to_thread(self.store.learning.recover)
+        self.learning_worker_task = asyncio.create_task(
+            self.learning_refresh_loop(), name="learning-evidence-refresh"
+        )
+        if self.trading_intelligence_automation.runtime().enabled:
+            self.learning_shadow.start()
         self.critical_workers.clear()
         for task in (official_event_worker, market_state_worker, self.v2_position_worker_task):
             self.critical_workers[task.get_name()] = task
@@ -220,6 +226,11 @@ class LifecycleService:
                 await self.trading_intelligence_automation.resume(evaluate_market_states=False)
             yield
         finally:
+            await self.learning_shadow.stop()
+            if self.learning_worker_task:
+                self.learning_worker_task.cancel()
+                await asyncio.gather(self.learning_worker_task, return_exceptions=True)
+                self.learning_worker_task = None
             self.critical_workers.clear()
             maintenance.cancel()
             catalog_worker.cancel()

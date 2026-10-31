@@ -174,10 +174,12 @@ class IntelligenceAutomationService:
             running,
             expected_updated_at=current.updated_at,
         )
+        self.learning_shadow.start()
         return service.runtime()
 
     async def stop_trading_intelligence_automation(self):
         self.risk_state_service.invalidate_entries()
+        await self.learning_shadow.stop()
         service = self.require_v2_automation()
         stopped = await asyncio.to_thread(
             service.configure,

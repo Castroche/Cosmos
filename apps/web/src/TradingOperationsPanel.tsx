@@ -1,4 +1,5 @@
-import { ArrowUpRight, BrainCircuit, Clock3, Layers3 } from 'lucide-react'
+import LearningPanel from './LearningPanel'
+import { ArrowUpRight, Clock3, Layers3 } from 'lucide-react'
 import { describeWakeCondition, entryStatusLabel, isActualPosition, isPendingEntry, latestEntryOrders, wakeActionLabel } from './api'
 import type { EntryOrderRuntime, MarketStateV2, TradingIntelligenceOverview } from './types'
 
@@ -55,22 +56,7 @@ export default function TradingOperationsPanel({ overview, view, onSelect }: {
       </article>)}</div> : <div className="ti-operations-empty"><Clock3 /><strong>{overview ? '当前没有等待策略' : '正在读取等待策略'}</strong><span>等待条件与实际入场委托分别记录。</span></div>}
     </section>
   }
-  if (view === 'learning') {
-    const learning = overview?.learning
-    return <section className="ti-learning-plane" aria-label="交易学习">
-      <header className="ti-learning-heading"><div><BrainCircuit /><strong>交易经验库</strong>
-        <span>成交 → 归因 → 更新经验 → 下一次决策</span></div>
-        <small>{learning?.sample_count ?? 0} 笔有效样本 · {learning?.version === 'empty' || !learning ? '等待首笔完整交易' : `版本 ${learning.version.slice(0, 8)}`}</small></header>
-      <p className="ti-learning-note">按品种、方向和行情状态积累成本后结果，更新入场与止盈建议。经验随新交易自动更新，开仓审核规则保持不变。</p>
-      {learning?.groups.length ? <div className="ti-learning-groups">{learning.groups.map(group => <article key={`${group.mode}-${group.symbol}-${group.setup}-${group.regime}-${group.side}`}>
-        <header><strong>{group.symbol.split('/')[0]} <b className={group.side === 'LONG' ? 'positive' : 'negative'}>{group.side}</b></strong><span>{group.regime} · {group.mode}</span></header>
-        <dl><div><dt>已学习</dt><dd>{group.sample_count} 笔</dd></div><div><dt>平滑胜率</dt><dd>{amount(Number(group.posterior_win_rate) * 100)}%</dd></div><div><dt>成本后期望</dt><dd className={Number(group.expectancy_r) >= 0 ? 'positive' : 'negative'}>{amount(Number(group.expectancy_r))} R</dd></div></dl>
-        {group.lessons.map(lesson => <p key={lesson}>{lesson}</p>)}
-      </article>)}</div> : <div className="ti-operations-empty"><BrainCircuit /><strong>等待可学习的完整成交</strong><span>平仓并取得完整成交证据后，系统会自动生成第一版经验。当前不展示模拟学习成绩。</span></div>}
-      {!!learning?.skipped_count && <p className="ti-learning-note">{learning.skipped_count} 条历史结果缺少完整成交证据，未计入学习统计。</p>}
-      {!!learning?.recent.length && <div className="ti-learning-tape">{learning.recent.map(item => <span key={item.episode_id}>{item.symbol.split('/')[0]} · {item.side}<b className={Number(item.realized_pnl) >= 0 ? 'positive' : 'negative'}>{amount(Number(item.realized_pnl))} USDT</b><small>{amount(Number(item.return_on_risk))} R</small></span>)}</div>}
-    </section>
-  }
+  if (view === 'learning') return <LearningPanel />
   const positions = overview?.positions.filter(isActualPosition) ?? []
   return <section className="ti-positions-plane" aria-label="组合持仓">
     <header className="ti-learning-heading"><div><Layers3 /><strong>全部品种持仓</strong><span>仅已成交且尚未平仓数量 · 同向加仓关联多个计划</span></div><small>{positions.length} / {overview?.portfolio_policy?.max_open_positions ?? '—'} 仓位</small></header>

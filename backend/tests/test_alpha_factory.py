@@ -484,4 +484,4 @@ def test_certificate_thresholds_and_storage_are_append_only(tmp_path):
     assert store.list_full_strategy_certificates_v2()[0]["selection"]["selected"] is True
     with store.connect() as connection:
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-    assert version == 10
+    assert version == 11

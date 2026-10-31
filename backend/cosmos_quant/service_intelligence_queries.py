@@ -331,10 +331,9 @@ class IntelligenceQueriesService:
         return list({item.entry_id: item for item in [*recent, *active]}.values())
 
     def v2_learning_snapshot(self):
-        from .trading_learning import LearningSnapshot
+        from .trading_learning import selected_snapshot
 
-        artifact = self.trading_intelligence_store.get_artifact("trading-learning-current")
-        return artifact["payload"] if artifact else LearningSnapshot().model_dump(mode="json")
+        return selected_snapshot(self.trading_intelligence_store).model_dump(mode="json")
 
     async def trading_intelligence_learning(self):
         return await asyncio.to_thread(self.v2_learning_snapshot)
@@ -422,6 +421,15 @@ class IntelligenceQueriesService:
                 at=market.timestamp,
             ),
         )
+        try:
+            await asyncio.to_thread(
+                self.learning_shadow.observe,
+                symbol,
+                candles_by_timeframe.get("5m", []),
+                now=market.timestamp,
+            )
+        except Exception:
+            logger.exception("Shadow price observation unavailable")
         try:
             await self.infer_quant_v1_on_five_minute_close(state)
         except (OSError, ValueError, RuntimeError) as exc:

@@ -30,6 +30,7 @@ class AIUsage(BaseModel):
 
 
 class AICompletionResult(BaseModel):
+    configuration_hash: str | None = None
     provider: AIProvider
     model: str
     data: dict
@@ -128,16 +129,12 @@ def deepseek_price(model: str, at: datetime) -> DeepSeekPrice | None:
             return (
                 DeepSeekPrice(Decimal("0.006"), Decimal("0.3"), Decimal("1.2"), "peak")
                 if peak
-                else DeepSeekPrice(
-                    Decimal("0.003"), Decimal("0.15"), Decimal("0.6"), "off_peak"
-                )
+                else DeepSeekPrice(Decimal("0.003"), Decimal("0.15"), Decimal("0.6"), "off_peak")
             )
         return (
             DeepSeekPrice(Decimal("0.10"), Decimal("3.0"), Decimal("9.0"), "peak")
             if peak
-            else DeepSeekPrice(
-                Decimal("0.05"), Decimal("1.5"), Decimal("4.5"), "off_peak"
-            )
+            else DeepSeekPrice(Decimal("0.05"), Decimal("1.5"), Decimal("4.5"), "off_peak")
         )
     return (
         DeepSeekPrice(Decimal("0.30"), Decimal("9.0"), Decimal("27.0"), "peak")

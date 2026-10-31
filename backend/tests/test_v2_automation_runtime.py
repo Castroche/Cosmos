@@ -902,6 +902,11 @@ def test_position_reconciliation_restores_open_then_closes_with_outcome(
     assert final_episode.status == "COMPLETED"
     assert Decimal(str(final_episode.outcome["return_after_cost"])) > 0
     assert final_episode.outcome["evidence_complete"] is True
+    # Completion is durable before the background learning refresh runs.
+    assert store.get_artifact("trading-learning-current") is None
+    from cosmos_quant.trading_learning import refresh_learning
+
+    refresh_learning(store)
     learned = store.get_artifact("trading-learning-current")["payload"]
     assert learned["sample_count"] == 1
     assert learned["groups"][0]["regime"] == str(state().regime)

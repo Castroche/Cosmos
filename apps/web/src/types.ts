@@ -1610,3 +1610,12 @@ export type HumanLiveGrantPreviewV2 = {
   expires_at: string
   requires_two_confirmations: true
 }
+export type LearningSettings = { enabled: boolean; pinned_version: string | null; shadow_enabled: boolean }
+export type LearningVersion = { version: string; sample_count: number; updated_at: string; algorithm: string }
+export type LearningCase = { episode_id: string; campaign_id: string; symbol: string; mode: string; side: string; regime: string; available_at: string; realized_pnl: string }
+export type LearningEvidence = TradingLearningSnapshot & { records?: LearningCase[]; excluded?: Array<{episode_id: string; reason: string}> }
+export type LearningSummary = { completed: number; daily_used: number; daily_limit: number; sample_rate: number; evidence_status: string; format_valid_rate: number | null; cost: number | null; counts: Record<string, number> }
+export type LearningDecision = { action: string; trade_plan?: { limit_price?: string; reference_price?: string; management?: { hard_stop: string } } | null }
+export type LearningProxy = { status: string; direction_return?: number; mfe?: number; mae?: number }
+export type LearningComparison = { decision_id: string; status: string; created_at: string; payload: { symbol: string; mode: string; primary: LearningDecision; control?: LearningDecision | null; case_ids: string[]; learning_version?: string; skip_reason?: string | null; detail?: string; primary_latency_ms?: number; control_latency_ms?: number; primary_usage?: { total_tokens: number }; control_usage?: Array<{total_tokens: number}>; proxy: {status: string; primary?: LearningProxy; control?: LearningProxy} } }
+export type LearningPage<T> = { items: T[]; total: number; limit: number; offset: number }

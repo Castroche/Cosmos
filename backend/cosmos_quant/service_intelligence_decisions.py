@@ -25,13 +25,16 @@ logger = __import__("logging").getLogger(__name__)
 
 class IntelligenceDecisionsService:
     async def invoke_trading_intelligence(self, request: TradingIntelligenceDecisionRequest):
+        self.active_decisions += 1
         token = self.decision_entry_generation.set(self.risk_state_service.entry_generation)
         try:
             return await self._invoke_trading_intelligence(request)
         finally:
             self.decision_entry_generation.reset(token)
+            self.active_decisions -= 1
 
     async def _invoke_trading_intelligence(self, request: TradingIntelligenceDecisionRequest):
+        decision_started = datetime.now(UTC)
         state = await asyncio.to_thread(
             self.trading_intelligence_store.latest_market_state, request.symbol
         )
@@ -234,6 +237,7 @@ class IntelligenceDecisionsService:
                     self.trading_intelligence_store,
                     request.symbol,
                     str(request.mode),
+                    as_of=decision_started, regime=str(state.regime),
                 )
             except Exception:
                 logger.exception("Trading learning unavailable; continuing without advisory memory")
@@ -268,6 +272,12 @@ class IntelligenceDecisionsService:
             raise HTTPException(503, str(exc)) from exc
         except AIProviderError as exc:
             raise HTTPException(503, str(exc)) from exc
+        try:
+            await self.learning_shadow.offer(
+                result, mode=str(request.mode), decision_started=decision_started
+            )
+        except Exception:
+            logger.exception("Shadow admission failed; normal decision remains independent")
         if self.decision_entry_generation.get() != self.risk_state_service.entry_generation:
             return await decision_error_response(
                 "decision invalidated by a stop while awaiting LLM", result

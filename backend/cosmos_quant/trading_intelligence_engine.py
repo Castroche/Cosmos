@@ -303,6 +303,8 @@ class DualLLMResult:
     analysis: MarketAnalysis
     decision: PortfolioTraderDecision
     episode: DecisionEpisode
+    trader_request: dict[str, Any] | None = None
+    trader_completion: Any = None
 
 
 _MATERIAL_REGIMES = {
@@ -992,6 +994,41 @@ class DualLLMDecisionService:
             role="MarketAnalyst",
             source_prompt=analyst_prompt,
         )
+        return await self.trade(
+            market_state=market_state,
+            delta=delta,
+            quant=quant,
+            portfolio=portfolio,
+            previous_thesis=previous_thesis,
+            previous_plan=previous_plan,
+            require_quant_edge=require_quant_edge,
+            minimum_reward_risk=minimum_reward_risk,
+            previous_wait_plan=previous_wait_plan,
+            previous_market_state=previous_market_state,
+            learning=learning,
+            analysis=analysis,
+            analyst_result=analyst_result,
+            analyst_prompt=analyst_prompt,
+        )
+
+    async def trade(
+        self,
+        *,
+        market_state,
+        delta,
+        quant,
+        portfolio,
+        previous_thesis,
+        previous_plan,
+        require_quant_edge,
+        minimum_reward_risk,
+        previous_wait_plan,
+        previous_market_state,
+        learning,
+        analysis,
+        analyst_result,
+        analyst_prompt,
+    ) -> DualLLMResult:
         trader_prompt = json.dumps(
             {
                 "market_state_hash": market_state.state_hash,
@@ -1012,7 +1049,7 @@ class DualLLMDecisionService:
             separators=(",", ":"),
             default=str,
         )
-        trader_result, _ = await self.gateway.generate_json(
+        trader_request = dict(
             system=(
                 "You are the sole COSMOS trading decision authority. Return only the decision "
                 "contract; there is no downstream strategy reviewer or critic. "
@@ -1089,6 +1126,7 @@ class DualLLMDecisionService:
             max_tokens=5000,
             thinking_enabled=False,
         )
+        trader_result, _ = await self.gateway.generate_json(**trader_request)
         decision, _ = await self._validate_with_one_repair(
             PortfolioTraderDecision,
             trader_result.data,
@@ -1203,13 +1241,23 @@ class DualLLMDecisionService:
                 "analyst_prompt": sha256(analyst_prompt.encode()).hexdigest(),
                 "trader_prompt": sha256(trader_prompt.encode()).hexdigest(),
                 "learning_version": str((learning or {}).get("version", "none")),
+                "learning_input": str((learning or {}).get("input_hash", "none")),
+                "learning_cases": json.dumps(
+                    [c["episode_id"] for c in (learning or {}).get("cases", [])]
+                ),
             },
             output_hashes={
                 "analysis": content_hash(analysis),
                 "decision": content_hash(decision),
             },
         )
-        return DualLLMResult(analysis=analysis, decision=decision, episode=episode)
+        return DualLLMResult(
+            analysis=analysis,
+            decision=decision,
+            episode=episode,
+            trader_request=trader_request,
+            trader_completion=trader_result,
+        )
 
     async def _validate_with_one_repair(
         self,

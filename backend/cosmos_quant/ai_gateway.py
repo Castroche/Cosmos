@@ -7,6 +7,7 @@ import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from hashlib import sha256
 from time import perf_counter
 from typing import Any
 
@@ -244,6 +245,7 @@ class BaseProviderAdapter:
                 AIErrorCode.NOT_CONFIGURED,
                 "该厂商尚未配置 API Key",
             )
+        attempts = min(attempts, getattr(self, "maximum_attempts", attempts))
         for attempt in range(attempts):
             caught: Exception | None = None
             try:
@@ -621,9 +623,7 @@ class OpenAIChatAdapter(BaseProviderAdapter):
                 if thinking_enabled is None
                 else thinking_enabled
             )
-            request_body["thinking"] = {
-                "type": "enabled" if effective_thinking else "disabled"
-            }
+            request_body["thinking"] = {"type": "enabled" if effective_thinking else "disabled"}
             if effective_thinking:
                 effective_effort = reasoning_effort or self.configuration.reasoning_effort
                 request_body["reasoning_effort"] = str(effective_effort)
@@ -775,9 +775,7 @@ class AIGateway:
                 "half_open_in_flight": circuit.half_open_in_flight,
                 "deterministic_fallback_available": True,
                 "agent_decision_quality": decision_quality,
-                "automatic_agent_decisions_allowed": decision_quality[
-                    "automatic_allowed"
-                ],
+                "automatic_agent_decisions_allowed": decision_quality["automatic_allowed"],
             }
         return snapshot
 
@@ -951,9 +949,7 @@ class AIGateway:
         schema_version: str = "v1",
     ) -> tuple[AICompletionResult, list[AIProvider]]:
         if max_tokens < 1 or max_tokens > MAX_STRUCTURED_OUTPUT_TOKENS:
-            raise ValueError(
-                f"max_tokens must be between 1 and {MAX_STRUCTURED_OUTPUT_TOKENS}"
-            )
+            raise ValueError(f"max_tokens must be between 1 and {MAX_STRUCTURED_OUTPUT_TOKENS}")
         route = self.routing_order(requested_provider)
         if not route:
             raise AIProviderError(
@@ -999,6 +995,10 @@ class AIGateway:
                         prompt_version=prompt_version,
                         schema_version=schema_version,
                     )
+                    if hasattr(adapter, "configuration"):
+                        result.configuration_hash = sha256(
+                            adapter.configuration.model_dump_json().encode()
+                        ).hexdigest()
                 finally:
                     await adapter.close()
                 self._record(provider, success=True)
@@ -1014,3 +1014,22 @@ class AIGateway:
         if last_error:
             raise last_error
         raise AssertionError("AI routing terminated without a result")
+
+    async def generate_shadow_json(self, *, provider, configuration_hash, expected_model, **kwargs):
+        adapter = self._adapter(provider)
+        try:
+            current_hash = sha256(adapter.configuration.model_dump_json().encode()).hexdigest()
+            if current_hash != configuration_hash:
+                raise ValueError("MODEL_CONFIGURATION_CHANGED")
+            adapter.maximum_attempts = 1
+            result = await adapter.generate_json(**kwargs)
+            result.configuration_hash = current_hash
+            await self._record_usage(result)
+            if result.model != expected_model:
+                raise ValueError("MODEL_VERSION_CHANGED")
+            return result
+        except AIProviderError as exc:
+            await self._record_failure_usage(exc)
+            raise
+        finally:
+            await adapter.close()

@@ -12,6 +12,7 @@ from .repository_audit import AuditRepository
 from .repository_configuration import ConfigurationRepository
 from .repository_execution import ExecutionRepository
 from .repository_governance import GovernanceRepository
+from .repository_learning import LearningRepository
 from .repository_market_data import MarketDataRepository
 from .repository_migrations import MigrationsRepository
 from .repository_research import ResearchRepository
@@ -33,9 +34,11 @@ class SqliteStore:
         self.governance = GovernanceRepository(self)
         self.audit = AuditRepository(self)
         self.execution = ExecutionRepository(self)
-        self._backup_before_schema_upgrade(10)
+        self._backup_before_schema_upgrade(11)
         self._enable_wal()
         self._initialize()
+        self.learning = LearningRepository(self)
+        self.learning.initialize()
 
     def _enable_wal(self) -> None:
         """Set the persistent journal mode once, not on every read connection."""

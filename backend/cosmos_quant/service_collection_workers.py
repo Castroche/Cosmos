@@ -129,3 +129,14 @@ class CollectionWorkersService:
                 self.metrics.increment("trading_intelligence_official_event_failures_total")
             await asyncio.sleep(300)
 
+    async def learning_refresh_loop(self):
+        from .trading_learning import refresh_learning
+
+        while True:
+            try:
+                await asyncio.to_thread(refresh_learning, self.trading_intelligence_store)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Learning update unavailable; retaining prior snapshot")
+            await asyncio.sleep(30)

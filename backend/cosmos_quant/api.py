@@ -14,6 +14,7 @@ from . import (
     routes_intelligence_decisions,
     routes_intelligence_execution,
     routes_intelligence_queries,
+    routes_learning,
     routes_market,
     routes_operations,
     routes_relative_value,
@@ -76,6 +77,7 @@ def create_app(settings: Settings | None = None, *, services=None) -> FastAPI:
     routes_intelligence_queries.register(app)
     routes_intelligence_decisions.register(app)
     routes_intelligence_execution.register(app)
+    routes_learning.register(app)
     routes_intelligence_automation.register(app)
     distribution = Path(__file__).resolve().parents[2] / "apps" / "web" / "dist"
     if distribution.exists():

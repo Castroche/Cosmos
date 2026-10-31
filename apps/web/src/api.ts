@@ -681,3 +681,20 @@ export function revokeHumanLiveGrantV2(grantId: string): Promise<HumanLiveGrantV
     method: 'DELETE',
   })
 }
+
+export function getLearningData(signal?: AbortSignal) {
+  const root = '/api/trading-intelligence/learning'
+  return Promise.all([
+    api<import('./types').LearningEvidence>(`${root}/snapshot`, { signal }),
+    api<import('./types').LearningSettings>(`${root}/settings`, { signal }),
+    api<import('./types').LearningPage<import('./types').LearningVersion>>(`${root}/versions`, { signal }),
+    api<import('./types').LearningSummary>(`${root}/summary`, { signal }),
+    api<import('./types').LearningPage<import('./types').LearningComparison>>(`${root}/comparisons`, { signal }),
+  ])
+}
+
+export function updateLearningSettings(settings: import('./types').LearningSettings) {
+  return api<import('./types').LearningSettings>('/api/trading-intelligence/learning/settings', {
+    method: 'PUT', headers: jsonHeaders, body: JSON.stringify(settings),
+  })
+}

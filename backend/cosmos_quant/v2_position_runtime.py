@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -786,14 +785,6 @@ class V2PositionReconciler:
             ).model_dump(mode="json")
             linked.order_ids = list(dict.fromkeys([*linked.order_ids, *closed.exit_order_ids]))
             self.store.save_episode(linked)
-        from .trading_learning import refresh_learning
-
-        try:
-            refresh_learning(self.store)
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "Learning refresh failed; completed outcome retained for replay"
-            )
         for plan_id in plan_ids:
             current_plan = self.store.get_plan(plan_id)
             if current_plan and current_plan.state == PlanState.TRIGGERED:

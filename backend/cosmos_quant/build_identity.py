@@ -67,7 +67,9 @@ def capture_runtime_build_identity(workspace: Path | None = None) -> RuntimeBuil
         tracked = _git(root, "ls-files", "-z").split("\0")
         dirty = bool(_git(root, "status", "--porcelain", "--untracked-files=all").strip())
     except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
-        raise RuntimeError("COSMOS build identity: Git repository inspection failed (UTF-8, executable or timeout)") from exc
+        raise RuntimeError(
+            "COSMOS build identity: Git repository inspection failed (UTF-8, executable or timeout)"
+        ) from exc
     commit_sha = injected or repository_sha
     if len(commit_sha) != 40 or any(
         character not in "0123456789abcdef" for character in commit_sha

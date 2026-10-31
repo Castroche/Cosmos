@@ -17,6 +17,7 @@ from .carry_campaign import run_carry_research_campaign
 from .config_service import ConfigurationService
 from .domain import AuditEvent, StrategyPlan
 from .exchanges.ccxt_adapter import CcxtExchangeAdapter
+from .learning_shadow import ShadowComparisonWorker
 from .liquidation_stream import BinanceLiquidationCollector
 from .local_access import LocalAccess
 from .ml_challenger import detect_return_drift
@@ -193,3 +194,8 @@ class ApplicationServices(
         self.critical_workers: dict[str, asyncio.Task] = {}
         self.runtime.reconciliation_plan_ids_provider = self.reconciliation_protected_plan_ids
 
+        self.active_decisions = 0
+        self.learning_shadow = ShadowComparisonWorker(
+            self.store.learning, self.ai_gateway, foreground_busy=lambda: self.active_decisions
+        )
+        self.learning_worker_task = None
