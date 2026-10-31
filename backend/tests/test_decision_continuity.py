@@ -8,7 +8,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
+from cosmos_quant.api_contracts import TradingIntelligenceDecisionRequest
 from cosmos_quant.domain import PortfolioState, Position
 from cosmos_quant.position_decisions import resolve_position_decision
 from cosmos_quant.trading_intelligence import (
@@ -139,7 +140,7 @@ def test_management_api_revalidates_after_llm_latency(tmp_path, monkeypatch, mat
     monkeypatch.setattr(api.runtime, "reconciliation_report", None)
     monkeypatch.setattr(api.dual_llm_decision_service, "decide", decide)
     monkeypatch.setattr(api, "v2_entry_allocation_lock", asyncio.Lock())
-    response = asyncio.run(api.invoke_trading_intelligence(api.TradingIntelligenceDecisionRequest(
+    response = asyncio.run(api.invoke_trading_intelligence(TradingIntelligenceDecisionRequest(
         symbol=market.symbol, trigger="BOUNDED_RETRY", trigger_event_id=event_id,
     )))
     assert len(captured) == 1

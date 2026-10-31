@@ -2,7 +2,8 @@ import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
 
-from cosmos_quant import api
+from app_fixture import services as api
+from cosmos_quant.api_contracts import GenerateRequest
 from cosmos_quant.backtest import run_walk_forward_backtest
 from cosmos_quant.configuration import StrategyKind, UserConfiguration
 from cosmos_quant.demo import demo_candles, snapshot_from_candles
@@ -93,7 +94,7 @@ def test_generate_strategy_accepts_only_server_validated_ai_champion(monkeypatch
 
     plan = asyncio.run(
         api.generate_strategy(
-            api.GenerateRequest(
+            GenerateRequest(
                 symbol="BTC/USDT",
                 timeframe="1h",
                 strategy_kind=StrategyKind.TREND,

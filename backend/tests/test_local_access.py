@@ -2,7 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
 from cosmos_quant.demo import demo_candles, snapshot_from_candles
 from cosmos_quant.local_access import LocalAccess
 from cosmos_quant.runtime import NetworkFreeRuntime

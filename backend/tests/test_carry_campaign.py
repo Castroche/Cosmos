@@ -3,7 +3,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
+from cosmos_quant.api_contracts import CarryCampaignRequest
 from cosmos_quant.carry import CARRY_STRATEGY_LIBRARY
 from cosmos_quant.carry_campaign import (
     CARRY_CAMPAIGN_ENGINE_VERSION,
@@ -16,6 +17,7 @@ from cosmos_quant.domain import Candle, FundingRatePoint
 from cosmos_quant.multi_leg_execution import validate_multi_leg_execution_certificate
 from cosmos_quant.research import build_research_dataset
 from cosmos_quant.storage import SqliteStore
+from fastapi import HTTPException
 
 
 def _markets():
@@ -236,7 +238,7 @@ def test_carry_campaign_api_builds_exact_spot_swap_markets_and_replays(
             market.funding_rates,
         )
         dataset_ids.extend([market.spot_dataset.id, market.perpetual_dataset.id])
-    request = api.CarryCampaignRequest(
+    request = CarryCampaignRequest(
         dataset_ids=dataset_ids,
         strategy_specs=[CARRY_STRATEGY_LIBRARY[0].model_dump(mode="json")],
     )
@@ -253,7 +255,7 @@ def test_carry_campaign_api_builds_exact_spot_swap_markets_and_replays(
     assert asyncio.run(api.get_carry_campaign(first.id)).id == first.id
 
     weakened = CARRY_STRATEGY_LIBRARY[0].model_copy(update={"entry_basis_rate": Decimal("0.0005")})
-    with pytest.raises(api.HTTPException, match="child not frozen"):
+    with pytest.raises(HTTPException, match="child not frozen"):
         asyncio.run(
             api.run_carry_campaign(
                 request.model_copy(
@@ -287,7 +289,7 @@ def test_carry_campaign_api_builds_exact_spot_swap_markets_and_replays(
     assert successor.cumulative_hypothesis_count > first.cumulative_hypothesis_count
     assert successor.effective_trial_count >= successor.cumulative_hypothesis_count
     assert successor.recommended_revisions == []
-    with pytest.raises(api.HTTPException, match="only one successor"):
+    with pytest.raises(HTTPException, match="only one successor"):
         asyncio.run(
             api.run_carry_campaign(
                 request.model_copy(
@@ -344,7 +346,7 @@ def test_carry_campaign_opens_one_sealed_blind_set_once_without_metric_leakage(
         return result
 
     monkeypatch.setattr(api, "run_carry_research_campaign", controlled_runner)
-    request = api.CarryCampaignRequest(
+    request = CarryCampaignRequest(
         dataset_ids=[dataset.id for dataset, _, _ in development],
         blind_dataset_ids=[dataset.id for dataset, _, _ in blind],
         strategy_specs=[CARRY_STRATEGY_LIBRARY[0].model_dump(mode="json")],
@@ -375,7 +377,7 @@ def test_carry_campaign_opens_one_sealed_blind_set_once_without_metric_leakage(
         item["cell"]["dataset_id"] not in request.blind_dataset_ids
         for item in public_payload["cells"]
     )
-    with pytest.raises(api.HTTPException, match="sealed after blind-set opening"):
+    with pytest.raises(HTTPException, match="sealed after blind-set opening"):
         asyncio.run(
             api.run_carry_campaign(
                 request.model_copy(

@@ -7,7 +7,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
+from cosmos_quant.entry_runtime import EntryOrderService
 from cosmos_quant.trading_intelligence import AutomationRuntimeV2, PositionStateV2
 from cosmos_quant.v2_position_runtime import PositionReconciliationIntegrityError
 from test_pooled_positions import campaign, close_fills
@@ -161,7 +162,7 @@ def test_uncertain_entry_keeps_recovery_fail_closed(recovery_account, monkeypatc
     async def uncertain(*_args, **_kwargs):
         return {"uncertain": 1}
 
-    monkeypatch.setattr(api.EntryOrderService, "reconcile", uncertain)
+    monkeypatch.setattr(EntryOrderService, "reconcile", uncertain)
     with pytest.raises(PositionReconciliationIntegrityError, match="entry order remains uncertain"):
         asyncio.run(api.reconcile_v2_demo_state(exchange))
     assert store.get_position(position.position_id).version == position.version

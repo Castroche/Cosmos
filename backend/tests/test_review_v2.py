@@ -3,9 +3,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
 from cosmos_quant.ai_configuration import AIProvider
 from cosmos_quant.ai_usage import AICompletionResult, AIUsage
+from cosmos_quant.api_contracts import AIProposalRequest
 from cosmos_quant.backtest import BacktestResult, run_walk_forward_backtest
 from cosmos_quant.configuration import StrategyKind
 from cosmos_quant.demo import demo_candles
@@ -277,7 +278,7 @@ def test_ai_generation_uses_reasoning_once_then_non_reasoning_schema_repair(
 
     response = asyncio.run(
         api.propose_ai_strategy_candidates(
-            api.AIProposalRequest(
+            AIProposalRequest(
                 hypothesis="验证成本感知的低换手趋势假设",
                 provider=AIProvider.DEEPSEEK,
                 symbol="BTC/USDT",

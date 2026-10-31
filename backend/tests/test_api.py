@@ -3,15 +3,18 @@ import threading
 from decimal import Decimal
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
+from cosmos_quant.backtest import BacktestResult
 from cosmos_quant.configuration import (
     ConfigurationUpdate,
     CredentialInput,
     UserConfiguration,
 )
 from cosmos_quant.demo import demo_candles, snapshot_from_candles
+from cosmos_quant.domain import Order, PortfolioState
 from cosmos_quant.runtime import NetworkFreeRuntime
 from cosmos_quant.strategy import ExplainableTrendStrategy
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 
 
@@ -43,7 +46,7 @@ def request(method: str, path: str, json=None):
 
 def mark_latest_backtest_robust(plan_id: str) -> None:
     payload = api.store.load_latest_backtest(plan_id)
-    artifact = api.BacktestResult.model_validate(payload)
+    artifact = BacktestResult.model_validate(payload)
     artifact.robustness_passed = True
     artifact.validation_reasons = ["test fixture passed independent research review"]
     api.store.save_backtest(plan_id, artifact)
@@ -141,7 +144,7 @@ def test_dashboard_contract(monkeypatch):
 
 def test_non_paper_strategy_sizing_uses_exchange_equity():
     configuration = UserConfiguration(trading_mode="sandbox")
-    portfolio = api.PortfolioState(
+    portfolio = PortfolioState(
         equity="12500",
         cash="10000",
         available_margin="10000",
@@ -154,7 +157,7 @@ def test_non_paper_strategy_sizing_uses_exchange_equity():
 
 
 def test_v2_llm_portfolio_context_withholds_affordability_and_sizing_fields():
-    portfolio = api.PortfolioState(
+    portfolio = PortfolioState(
         equity="12500",
         cash="10000",
         available_margin="9000",
@@ -230,7 +233,7 @@ def test_contract_plan_is_shrunk_to_available_margin_before_review():
     plan.market_type = "swap"
     plan.margin_mode = "cross"
     plan.leverage = Decimal("3")
-    portfolio = api.PortfolioState(
+    portfolio = PortfolioState(
         equity="1000",
         cash="100",
         available_margin="100",
@@ -327,7 +330,7 @@ def test_cancel_order_rejects_unknown_and_terminal_orders():
     assert unknown.status_code == 404
 
     plan = request("POST", "/api/strategies/generate", json={}).json()
-    order = api.Order(
+    order = Order(
         id="terminal-order",
         client_order_id="terminal-client",
         plan_id=plan["id"],
@@ -349,7 +352,7 @@ def test_cancel_order_rejects_unknown_and_terminal_orders():
 
 def test_cancel_order_confirms_exchange_state_and_updates_ledger():
     plan = request("POST", "/api/strategies/generate", json={}).json()
-    order = api.Order(
+    order = Order(
         id="working-order",
         client_order_id="working-client",
         plan_id=plan["id"],
@@ -398,7 +401,7 @@ def test_environment_switch_is_rejected_while_old_gateway_has_open_orders(monkey
     monkeypatch.setattr(api.runtime, "execution", GatewayWithOpenOrder())
     monkeypatch.setattr(api.runtime, "portfolio", portfolio)
 
-    with pytest.raises(api.HTTPException) as raised:
+    with pytest.raises(HTTPException) as raised:
         asyncio.run(api.update_settings(ConfigurationUpdate(configuration=UserConfiguration())))
 
     assert raised.value.status_code == 409
@@ -427,7 +430,7 @@ def test_failed_runtime_switch_rolls_back_configuration_and_credentials(monkeypa
 
     monkeypatch.setattr(api.runtime, "initialize", initialize)
 
-    with pytest.raises(api.HTTPException, match="candidate account mode is invalid"):
+    with pytest.raises(HTTPException, match="candidate account mode is invalid"):
         asyncio.run(
             api.update_settings(
                 ConfigurationUpdate(

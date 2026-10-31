@@ -4,7 +4,14 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
+from cosmos_quant.api_contracts import (
+    CampaignRevisionRequest,
+    CausalPolicyBacktestRequest,
+    CausalPolicyCampaignSpec,
+    CausalPolicyRevisionRequest,
+    ResearchCampaignRequest,
+)
 from cosmos_quant.demo import demo_candles
 from cosmos_quant.research import build_research_dataset
 from cosmos_quant.research_campaign import (
@@ -82,7 +89,7 @@ def _cell(
 
 
 def test_campaign_request_budget_covers_full_eighty_template_library_and_revisions():
-    request = api.ResearchCampaignRequest(
+    request = ResearchCampaignRequest(
         dataset_ids=[f"development_{index}" for index in range(6)],
         blind_dataset_ids=[f"blind_{index}" for index in range(6)],
         library_entry_ids=[f"library_{index}" for index in range(80)],
@@ -93,12 +100,12 @@ def test_campaign_request_budget_covers_full_eighty_template_library_and_revisio
     assert len(request.library_entry_ids) == 80
     assert request.max_backtests == 522
     with pytest.raises(ValueError):
-        api.ResearchCampaignRequest(
+        ResearchCampaignRequest(
             dataset_ids=["development"],
             max_backtests=6001,
         )
     with pytest.raises(ValueError):
-        api.CampaignRevisionRequest(max_revisions=4)
+        CampaignRevisionRequest(max_revisions=4)
 
 
 def test_causal_policy_endpoint_binds_public_library_to_immutable_dataset(
@@ -124,7 +131,7 @@ def test_causal_policy_endpoint_binds_public_library_to_immutable_dataset(
 
     result = asyncio.run(
         api.backtest_causal_strategy_policy(
-            api.CausalPolicyBacktestRequest(
+            CausalPolicyBacktestRequest(
                 dataset_id=dataset.id,
                 library_entry_ids=entry_ids,
                 maximum_candidates_per_bar=3,
@@ -143,7 +150,7 @@ def test_causal_policy_endpoint_binds_public_library_to_immutable_dataset(
     assert result.integrity_checks["immutable_dataset_binding"] is True
     assert result.integrity_checks["causal_library_policy_return_inputs_forbidden"] is True
     with pytest.raises(ValueError, match="must be unique"):
-        api.CausalPolicyBacktestRequest(
+        CausalPolicyBacktestRequest(
             dataset_id=dataset.id,
             library_entry_ids=[entry_ids[0], entry_ids[0]],
         )
@@ -166,15 +173,15 @@ def test_causal_policy_campaign_runs_frozen_meta_hypotheses(monkeypatch, tmp_pat
         "builtin_sma_20_100_trend_v2",
         "builtin_zscore_20_rsi_v2",
     ]
-    request = api.ResearchCampaignRequest(
+    request = ResearchCampaignRequest(
         dataset_ids=[dataset.id],
         causal_policy_specs=[
-            api.CausalPolicyCampaignSpec(
+            CausalPolicyCampaignSpec(
                 id="selective",
                 library_entry_ids=entry_ids,
                 maximum_candidates_per_bar=1,
             ),
-            api.CausalPolicyCampaignSpec(
+            CausalPolicyCampaignSpec(
                 id="balanced",
                 library_entry_ids=entry_ids,
                 maximum_candidates_per_bar=2,
@@ -205,7 +212,7 @@ def test_causal_policy_campaign_runs_frozen_meta_hypotheses(monkeypatch, tmp_pat
     revision = asyncio.run(
         api.revise_campaign_causal_policy(
             report.id,
-            api.CausalPolicyRevisionRequest(max_revisions=3),
+            CausalPolicyRevisionRequest(max_revisions=3),
         )
     )
     assert 1 <= len(revision.revisions) <= 3
@@ -242,7 +249,7 @@ def test_causal_policy_campaign_runs_frozen_meta_hypotheses(monkeypatch, tmp_pat
 
 
 def test_causal_policy_campaign_request_rejects_fake_hypothesis_sets():
-    policy = api.CausalPolicyCampaignSpec(
+    policy = CausalPolicyCampaignSpec(
         id="selective",
         library_entry_ids=[
             "builtin_ema_12_26_trend_v2",
@@ -250,12 +257,12 @@ def test_causal_policy_campaign_request_rejects_fake_hypothesis_sets():
         ],
     )
     with pytest.raises(ValueError, match="at least two hypotheses"):
-        api.ResearchCampaignRequest(
+        ResearchCampaignRequest(
             dataset_ids=["dataset"],
             causal_policy_specs=[policy],
         )
     with pytest.raises(ValueError, match="cannot be mixed"):
-        api.ResearchCampaignRequest(
+        ResearchCampaignRequest(
             dataset_ids=["dataset"],
             library_entry_ids=["builtin_ema_12_26_trend_v2"],
             causal_policy_specs=[
@@ -264,7 +271,7 @@ def test_causal_policy_campaign_request_rejects_fake_hypothesis_sets():
             ],
         )
     with pytest.raises(ValueError, match="structurally unique"):
-        api.ResearchCampaignRequest(
+        ResearchCampaignRequest(
             dataset_ids=["dataset"],
             causal_policy_specs=[
                 policy,
@@ -276,7 +283,7 @@ def test_causal_policy_campaign_request_rejects_fake_hypothesis_sets():
 
 def test_causal_policy_campaign_requires_every_frozen_prior_feature():
     entry = api.build_causal_policy_campaign_entry(
-        api.CausalPolicyCampaignSpec(
+        CausalPolicyCampaignSpec(
             id="derivative_aware",
             library_entry_ids=[
                 "builtin_ema_12_26_trend_v2",
@@ -328,7 +335,7 @@ def test_main_campaign_freezes_one_bounded_successor(monkeypatch, tmp_path):
     revision = asyncio.run(
         api.revise_campaign_strategy(
             parent.id,
-            api.CampaignRevisionRequest(
+            CampaignRevisionRequest(
                 library_entry_id=entry.id,
                 max_revisions=3,
             ),
@@ -341,7 +348,7 @@ def test_main_campaign_freezes_one_bounded_successor(monkeypatch, tmp_path):
     assert 1 <= len(child_ids) <= 3
     assert frozen_parent.authorized_revision_candidate_ids == child_ids
 
-    request = api.ResearchCampaignRequest(
+    request = ResearchCampaignRequest(
         dataset_ids=[dataset.id],
         library_entry_ids=[entry.id],
         candidate_ids=child_ids,
@@ -990,14 +997,14 @@ def test_execution_certificate_binds_full_causal_policy_definition():
         "builtin_zscore_20_rsi_v2",
     ]
     stable = api.build_causal_policy_campaign_entry(
-        api.CausalPolicyCampaignSpec(
+        CausalPolicyCampaignSpec(
             id="selective",
             library_entry_ids=entry_ids,
             maximum_candidates_per_bar=1,
         )
     )
     fragile = api.build_causal_policy_campaign_entry(
-        api.CausalPolicyCampaignSpec(
+        CausalPolicyCampaignSpec(
             id="balanced",
             library_entry_ids=entry_ids,
             maximum_candidates_per_bar=2,
@@ -1164,7 +1171,7 @@ def test_campaign_rejects_unsealed_or_mismatched_blind_datasets(monkeypatch, tmp
     with pytest.raises(HTTPException, match="role-bound"):
         asyncio.run(
             api.execute_research_campaign(
-                api.ResearchCampaignRequest(
+                ResearchCampaignRequest(
                     dataset_ids=[development.id],
                     blind_dataset_ids=[generic.id],
                     library_entry_ids=["builtin_rsi_14_30_70_v2"],
@@ -1175,7 +1182,7 @@ def test_campaign_rejects_unsealed_or_mismatched_blind_datasets(monkeypatch, tmp
     with pytest.raises(HTTPException, match="development splits"):
         asyncio.run(
             api.execute_research_campaign(
-                api.ResearchCampaignRequest(
+                ResearchCampaignRequest(
                     dataset_ids=[generic.id],
                     blind_dataset_ids=[blind.id],
                     library_entry_ids=["builtin_rsi_14_30_70_v2"],
@@ -1526,7 +1533,7 @@ def test_campaign_reuses_complete_cell_cache(monkeypatch, tmp_path):
         timeframe="1h",
     )
     store.save_research_dataset(dataset, candles)
-    request = api.ResearchCampaignRequest(
+    request = ResearchCampaignRequest(
         dataset_ids=[dataset.id],
         library_entry_ids=["builtin_rsi_14_30_70_v2"],
         max_backtests=1,

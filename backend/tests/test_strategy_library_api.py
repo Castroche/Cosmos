@@ -1,4 +1,4 @@
-from cosmos_quant import api
+from app_fixture import services as api
 from cosmos_quant.storage import SqliteStore
 from cosmos_quant.strategy_library import list_strategy_library
 from fastapi.testclient import TestClient

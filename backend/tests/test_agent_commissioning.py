@@ -2,7 +2,8 @@ import asyncio
 from decimal import Decimal
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
+from cosmos_quant.api_contracts import CommissioningRequest
 from cosmos_quant.configuration import CommissioningResult, UserConfiguration
 from cosmos_quant.demo import demo_candles, snapshot_from_candles
 from cosmos_quant.domain import (
@@ -231,7 +232,7 @@ def test_agent_position_management_commissioning_persists_full_success(monkeypat
 
     result = asyncio.run(
         api.commission_agent_position_management(
-            api.CommissioningRequest(confirmation="TEST AGENT REDUCTION BTC/USDT")
+            CommissioningRequest(confirmation="TEST AGENT REDUCTION BTC/USDT")
         )
     )
 
@@ -249,7 +250,7 @@ def test_failed_commissioning_emergency_flattens_only_test_position(monkeypatch)
     with pytest.raises(HTTPException) as error:
         asyncio.run(
             api.commission_agent_position_management(
-                api.CommissioningRequest(confirmation="TEST AGENT REDUCTION BTC/USDT")
+                CommissioningRequest(confirmation="TEST AGENT REDUCTION BTC/USDT")
             )
         )
 
@@ -272,7 +273,7 @@ def test_halted_platform_rejects_position_commissioning_before_any_order(
     with pytest.raises(HTTPException) as error:
         asyncio.run(
             api.commission_agent_position_management(
-                api.CommissioningRequest(confirmation="TEST AGENT REDUCTION BTC/USDT")
+                CommissioningRequest(confirmation="TEST AGENT REDUCTION BTC/USDT")
             )
         )
 

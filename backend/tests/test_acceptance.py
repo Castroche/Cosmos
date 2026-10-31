@@ -1,6 +1,6 @@
 import asyncio
 
-from cosmos_quant import api
+from app_fixture import services as api
 from cosmos_quant.acceptance import build_product_acceptance_report
 
 

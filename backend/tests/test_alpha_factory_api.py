@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from cosmos_quant import api
+from app_fixture import services as api
 from cosmos_quant.alpha_factory import (
     ALPHA_MARKETS,
     AlphaModelArtifactV1,
@@ -12,6 +12,8 @@ from cosmos_quant.alpha_factory import (
     FullStrategyCertificateV2,
     SandboxAdmissionCertificateV1,
     SandboxMaturityEvidenceV1,
+    alpha_transaction_cost_fingerprint,
+    dependency_versions,
 )
 from cosmos_quant.domain import TradingMode
 from cosmos_quant.research_campaign import (
@@ -166,10 +168,10 @@ def artifact(family: str, task: str, model_id: str) -> AlphaModelArtifactV1:
         ),
         validation_windows=((datetime(2025, 1, 2, tzinfo=UTC), datetime(2025, 2, 1, tzinfo=UTC)),),
         random_seed=17,
-        dependency_versions=api.dependency_versions(),
+        dependency_versions=dependency_versions(),
         serialization_format=serialization,
         model_payload="model-native-text",
-        cost_model_fingerprint=api.alpha_transaction_cost_fingerprint(
+        cost_model_fingerprint=alpha_transaction_cost_fingerprint(
             fee_bps=api.configuration_service.current_configuration().fee_bps,
             slippage_bps=api.configuration_service.current_configuration().slippage_bps,
         ),

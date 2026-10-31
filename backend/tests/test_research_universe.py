@@ -3,10 +3,18 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
+from cosmos_quant.api_contracts import (
+    HistoricalUniverseArchiveImportRequest,
+    ResearchCampaignRequest,
+    ResearchUniverseCell,
+    ResearchUniverseJob,
+    ResearchUniverseReport,
+    ResearchUniverseRequest,
+)
 from cosmos_quant.domain import Candle
 from cosmos_quant.exchanges.ccxt_adapter import CcxtExchangeAdapter
-from cosmos_quant.research import build_research_dataset
+from cosmos_quant.research import ResearchJobStatus, build_research_dataset
 from cosmos_quant.research_universe import (
     HistoricalCatalogArchiveEvidence,
     MarketCatalogEntry,
@@ -17,6 +25,7 @@ from cosmos_quant.research_universe import (
     validate_universe_snapshot,
 )
 from cosmos_quant.storage import SqliteStore
+from fastapi import HTTPException
 
 
 def _candles(count: int, timeframe_minutes: int = 15) -> list[Candle]:
@@ -75,7 +84,7 @@ def test_research_universe_materializes_each_requested_exchange(monkeypatch):
 
     report = asyncio.run(
         api.prepare_research_universe(
-            api.ResearchUniverseRequest(
+            ResearchUniverseRequest(
                 symbols=["BTC/USDT"],
                 timeframes=["15m"],
                 exchange_ids=["okx", "binance"],
@@ -96,7 +105,7 @@ def test_research_universe_rejects_unapproved_exchange_before_network():
     with pytest.raises(ValueError, match="unsupported research exchanges"):
         asyncio.run(
             api.prepare_research_universe(
-                api.ResearchUniverseRequest(
+                ResearchUniverseRequest(
                     symbols=["BTC/USDT"],
                     timeframes=["1h"],
                     exchange_ids=["unknown-exchange"],
@@ -135,7 +144,7 @@ def test_public_research_can_override_configured_market_type(tmp_path, monkeypat
     monkeypatch.setattr(api, "store", local_store)
     report = asyncio.run(
         api.prepare_research_universe(
-            api.ResearchUniverseRequest(
+            ResearchUniverseRequest(
                 symbols=["BTC/USDT"],
                 timeframes=["15m"],
                 exchange_ids=["binance"],
@@ -200,7 +209,7 @@ def test_market_type_override_never_reuses_a_fresh_opposite_market_dataset(
     monkeypatch.setattr(api, "materialize_research_dataset", materialize)
     report = asyncio.run(
         api.prepare_research_universe(
-            api.ResearchUniverseRequest(
+            ResearchUniverseRequest(
                 symbols=["BTC/USDT"],
                 timeframes=["15m"],
                 exchange_ids=["binance"],
@@ -217,14 +226,14 @@ def test_market_type_override_never_reuses_a_fresh_opposite_market_dataset(
 
 def test_durable_universe_job_persists_progress_and_report(tmp_path, monkeypatch):
     local_store = SqliteStore(tmp_path / "universe-job.db")
-    request = api.ResearchUniverseRequest(
+    request = ResearchUniverseRequest(
         symbols=["BTC/USDT"],
         timeframes=["1h"],
         exchange_ids=["binance"],
         bars=500,
         max_markets=1,
     )
-    cell = api.ResearchUniverseCell(
+    cell = ResearchUniverseCell(
         exchange="binance",
         symbol="BTC/USDT",
         timeframe="1h",
@@ -239,7 +248,7 @@ def test_durable_universe_job_persists_progress_and_report(tmp_path, monkeypatch
     async def prepare(_request, *, progress_callback=None):
         assert progress_callback is not None
         await progress_callback(1, 1, cell)
-        return api.ResearchUniverseReport(
+        return ResearchUniverseReport(
             requested_markets=1,
             completed_markets=1,
             healthy_markets=1,
@@ -250,7 +259,7 @@ def test_durable_universe_job_persists_progress_and_report(tmp_path, monkeypatch
     monkeypatch.setattr(api, "store", local_store)
     monkeypatch.setattr(api, "prepare_research_universe", prepare)
     normalized = request.model_dump(mode="json")
-    job = api.ResearchUniverseJob(
+    job = ResearchUniverseJob(
         request=normalized,
         request_fingerprint=api.research_universe_request_fingerprint(normalized),
         total_markets=1,
@@ -258,10 +267,10 @@ def test_durable_universe_job_persists_progress_and_report(tmp_path, monkeypatch
 
     asyncio.run(api.run_research_universe_job(job))
 
-    restored = api.ResearchUniverseJob.model_validate(
+    restored = ResearchUniverseJob.model_validate(
         local_store.load_research_universe_job(job.id)
     )
-    assert restored.status == api.ResearchJobStatus.COMPLETED
+    assert restored.status == ResearchJobStatus.COMPLETED
     assert restored.completed_markets == 1
     assert restored.healthy_markets == 1
     assert restored.report is not None
@@ -302,7 +311,7 @@ def test_research_universe_reuses_fresh_complete_dataset_after_restart(
     monkeypatch.setattr(api, "CcxtExchangeAdapter", Adapter)
     report = asyncio.run(
         api.prepare_research_universe(
-            api.ResearchUniverseRequest(
+            ResearchUniverseRequest(
                 symbols=["BTC/USDT"],
                 timeframes=["1h"],
                 exchange_ids=["binance"],
@@ -472,7 +481,7 @@ def test_historical_archive_import_persists_only_hash_matching_catalogs(
         payload_sha256=catalog_archive_sha256(catalogs["binance"]),
         record_count=2,
     )
-    request = api.HistoricalUniverseArchiveImportRequest(
+    request = HistoricalUniverseArchiveImportRequest(
         as_of=as_of,
         policy=PointInTimeUniversePolicy(
             timeframes=["15m"],
@@ -490,7 +499,7 @@ def test_historical_archive_import_persists_only_hash_matching_catalogs(
     tampered = request.model_copy(
         update={"archive_evidence": [evidence.model_copy(update={"payload_sha256": "c" * 64})]}
     )
-    with pytest.raises(api.HTTPException, match="payload hash"):
+    with pytest.raises(HTTPException, match="payload hash"):
         asyncio.run(api.import_historical_universe_archive(tampered))
 
 
@@ -545,7 +554,7 @@ def test_snapshot_listing_quarantines_invalid_legacy_artifact(monkeypatch):
 
     listed = asyncio.run(api.list_research_universe_snapshots())
     assert [snapshot.id for snapshot in listed] == [valid.id]
-    with pytest.raises(api.HTTPException) as exc_info:
+    with pytest.raises(HTTPException) as exc_info:
         asyncio.run(api.get_research_universe_snapshot("universe_invalid_legacy"))
     assert exc_info.value.status_code == 409
 
@@ -597,7 +606,7 @@ def test_frozen_snapshot_materializes_exact_archived_scope(tmp_path, monkeypatch
     monkeypatch.setattr(api, "CcxtExchangeAdapter", Adapter)
     report = asyncio.run(
         api.prepare_research_universe(
-            api.ResearchUniverseRequest(
+            ResearchUniverseRequest(
                 selection_mode="frozen_snapshot",
                 universe_snapshot_id=snapshot.id,
                 symbols=["BTC/USDT"],
@@ -620,7 +629,7 @@ def test_frozen_snapshot_materializes_exact_archived_scope(tmp_path, monkeypatch
     with pytest.raises(ValueError, match="symbols must exactly match"):
         asyncio.run(
             api.prepare_research_universe(
-                api.ResearchUniverseRequest(
+                ResearchUniverseRequest(
                     selection_mode="frozen_snapshot",
                     universe_snapshot_id=snapshot.id,
                     symbols=["ETH/USDT"],
@@ -689,7 +698,7 @@ def test_point_in_time_universe_discovers_and_persists_exact_market_scope(
 
     report = asyncio.run(
         api.prepare_research_universe(
-            api.ResearchUniverseRequest(
+            ResearchUniverseRequest(
                 selection_mode="point_in_time",
                 timeframes=["15m"],
                 exchange_ids=["binance", "okx"],
@@ -750,10 +759,10 @@ def test_campaign_rejects_cherry_picked_subset_of_frozen_universe(
     local_store.save_research_dataset(dataset, candles, [], [], [], [])
     monkeypatch.setattr(api, "store", local_store)
 
-    with pytest.raises(api.HTTPException, match="exact frozen point-in-time universe"):
+    with pytest.raises(HTTPException, match="exact frozen point-in-time universe"):
         asyncio.run(
             api.execute_research_campaign(
-                api.ResearchCampaignRequest(
+                ResearchCampaignRequest(
                     dataset_ids=[dataset.id],
                     universe_snapshot_id=snapshot.id,
                     library_entry_ids=["builtin_ema_12_26_trend_v2"],
@@ -791,10 +800,10 @@ def test_campaign_rejects_exact_scope_with_incomplete_frozen_history(
     local_store.save_research_dataset(dataset, candles, [], [], [], [])
     monkeypatch.setattr(api, "store", local_store)
 
-    with pytest.raises(api.HTTPException, match="history coverage contract"):
+    with pytest.raises(HTTPException, match="history coverage contract"):
         asyncio.run(
             api.execute_research_campaign(
-                api.ResearchCampaignRequest(
+                ResearchCampaignRequest(
                     dataset_ids=[dataset.id],
                     universe_snapshot_id=snapshot.id,
                     library_entry_ids=["builtin_ema_12_26_trend_v2"],
@@ -831,10 +840,10 @@ def test_campaign_rejects_data_that_predates_the_frozen_universe(
     local_store.save_research_dataset(dataset, candles, [], [], [], [])
     monkeypatch.setattr(api, "store", local_store)
 
-    with pytest.raises(api.HTTPException, match="start at or after"):
+    with pytest.raises(HTTPException, match="start at or after"):
         asyncio.run(
             api.execute_research_campaign(
-                api.ResearchCampaignRequest(
+                ResearchCampaignRequest(
                     dataset_ids=[dataset.id],
                     universe_snapshot_id=snapshot.id,
                     library_entry_ids=["builtin_ema_12_26_trend_v2"],
@@ -879,7 +888,7 @@ def test_point_in_time_report_marks_partial_history_as_unmaterialized(
     monkeypatch.setattr(api, "CcxtExchangeAdapter", Adapter)
     report = asyncio.run(
         api.prepare_research_universe(
-            api.ResearchUniverseRequest(
+            ResearchUniverseRequest(
                 selection_mode="point_in_time",
                 timeframes=["15m"],
                 exchange_ids=["binance"],

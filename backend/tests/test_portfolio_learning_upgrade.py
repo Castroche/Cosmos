@@ -4,11 +4,12 @@ import asyncio
 from contextlib import suppress
 from decimal import Decimal
 
-from cosmos_quant import api
+from app_fixture import services as api
 from cosmos_quant.domain import PortfolioState, Position
 from cosmos_quant.portfolio_risk_v2 import portfolio_risk_snapshot
 from cosmos_quant.storage import SqliteStore
 from cosmos_quant.trading_intelligence import (
+    V2_SYMBOLS,
     DecisionEpisode,
     DeltaContext,
     PositionRuntimeV2,
@@ -115,7 +116,7 @@ def save_outcome(store, episode_id, pnl, *, complete=True, mode="OKX_DEMO", stat
         episode_id=episode_id, symbol="BTC/USDT:USDT", status=status,
         market_state_hash="entry-hash", delta=DeltaContext(current_state_hash="entry-hash"),
         outcome={"action": "LONG", "evidence_complete": complete, "trading_mode": mode,
-                 "realized_pnl": pnl, "return_on_risk": str(Decimal(pnl) / 50),
+                 "realized_pnl": pnl, "fees": "0", "return_on_risk": str(Decimal(pnl) / 50),
                  "regime": "TREND_UP", "mfe": "2", "mae": "-1"},
     ))
 
@@ -193,4 +194,4 @@ def test_slow_btc_refresh_does_not_block_eth_or_sol(monkeypatch):
                 await task
 
     asyncio.run(run())
-    assert reached == set(api.V2_SYMBOLS)
+    assert reached == set(V2_SYMBOLS)

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from cosmos_quant.api_contracts import ResearchUniverseRequest
 
 import argparse
 import asyncio
@@ -12,7 +13,8 @@ BACKEND = ROOT / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from cosmos_quant import api  # noqa: E402
+from cosmos_quant.application_services import ApplicationServices  # noqa: E402
+api = ApplicationServices()
 from cosmos_quant.alpha_factory import ALPHA_MARKETS, assess_crypto_5m_contract  # noqa: E402
 
 
@@ -29,7 +31,7 @@ def _selected_scope(market: str | None) -> tuple[list[str], list[str]]:
 async def run(*, execute: bool, feature_mode: str, market: str | None) -> int:
     before = assess_crypto_5m_contract(api.store.list_research_datasets(2_000))
     symbols, exchange_ids = _selected_scope(market)
-    request = api.ResearchUniverseRequest(
+    request = ResearchUniverseRequest(
         symbols=symbols,
         timeframes=["5m"],
         exchange_ids=exchange_ids,

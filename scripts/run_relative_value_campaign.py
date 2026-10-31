@@ -1,10 +1,12 @@
 from __future__ import annotations
+from cosmos_quant.api_contracts import RelativeValueCampaignRequest
 
 import argparse
 import asyncio
 import json
 
-from cosmos_quant import api
+from cosmos_quant.application_services import ApplicationServices
+api = ApplicationServices()
 from cosmos_quant.relative_value import PAIR_STRATEGY_LIBRARY
 
 
@@ -77,7 +79,7 @@ def main() -> None:
     args = parse_args()
     report = asyncio.run(
         api.run_relative_value_campaign(
-            api.RelativeValueCampaignRequest(
+            RelativeValueCampaignRequest(
                 dataset_ids=args.dataset_ids,
                 fold_count=args.fold_count,
             )
@@ -94,7 +96,7 @@ def main() -> None:
         ]
         successor = asyncio.run(
             api.run_relative_value_campaign(
-                api.RelativeValueCampaignRequest(
+                RelativeValueCampaignRequest(
                     dataset_ids=args.dataset_ids,
                     strategy_specs=successor_specs,
                     fold_count=args.fold_count,

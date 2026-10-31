@@ -109,7 +109,7 @@ def test_sec_rss_filters_and_normalizes_digital_asset_releases() -> None:
 
 
 def test_persisted_event_wakes_once_when_its_risk_window_later_opens(monkeypatch) -> None:
-    from cosmos_quant import api
+    from app_fixture import services as api
 
     event = normalize_official_event(
         event_type=OfficialEventType.CPI,

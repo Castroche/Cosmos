@@ -2,12 +2,13 @@ import asyncio
 from decimal import Decimal
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
 from cosmos_quant.carry import CARRY_STRATEGY_LIBRARY
 from cosmos_quant.configuration import StrategyKind
 from cosmos_quant.demo import demo_candles
 from cosmos_quant.relative_value import PAIR_STRATEGY_LIBRARY
 from cosmos_quant.research import build_research_dataset
+from cosmos_quant.research_campaign import historical_feature_eligibility
 from cosmos_quant.research_lifecycle import CandidateStatus, StrategyCandidate, create_candidate
 from cosmos_quant.signals import score_market_state
 from cosmos_quant.storage import SqliteStore
@@ -19,6 +20,7 @@ from cosmos_quant.strategy_library import (
     strategy_library_summary,
 )
 from cosmos_quant.strategy_spec import validate_strategy_spec
+from fastapi import HTTPException
 
 
 def test_builtin_strategy_library_is_non_empty_and_covers_every_family():
@@ -132,7 +134,7 @@ def test_offline_campaign_preflight_uses_only_development_data_availability():
             funding, open_interest, positioning, basis, order_flow, liquidation_flow = (
                 features[dataset.id]
             )
-            reasons = api.historical_feature_eligibility(
+            reasons = historical_feature_eligibility(
                 dataset=dataset,
                 required_data=entry.required_data,
                 funding=funding,
@@ -180,7 +182,7 @@ def test_unified_research_library_exposes_offline_single_pair_and_carry_priors()
     assert carry["counts"]["single_leg"] == 0
     assert all(entry["execution_eligible"] is False for entry in carry["entries"])
 
-    with pytest.raises(api.HTTPException, match="strategy family must be"):
+    with pytest.raises(HTTPException, match="strategy family must be"):
         asyncio.run(api.builtin_strategy_library("unknown"))
 
 

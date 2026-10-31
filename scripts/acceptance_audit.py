@@ -1,4 +1,9 @@
 from __future__ import annotations
+from cosmos_quant.agent.performance import build_forward_performance
+from cosmos_quant.agent.schemas import AgentAutonomyMode
+from cosmos_quant.api_contracts import CausalPolicyCampaignSpec
+from cosmos_quant.api_contracts import ResearchCampaignRequest
+from cosmos_quant.domain import StrategyPlan
 
 import argparse
 import json
@@ -19,7 +24,8 @@ BACKEND = ROOT / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from cosmos_quant import api  # noqa: E402
+from cosmos_quant.application_services import ApplicationServices  # noqa: E402
+api = ApplicationServices()
 from cosmos_quant.acceptance import build_product_acceptance_report  # noqa: E402
 from cosmos_quant.archived_exchange_catalog import (  # noqa: E402
     verify_archived_catalog_evidence,
@@ -354,10 +360,10 @@ def _campaign_profitability_evidence(
 
 def _causal_policy_specs_from_report(
     campaign: ResearchCampaignReport,
-) -> list[api.CausalPolicyCampaignSpec]:
+) -> list[CausalPolicyCampaignSpec]:
     """Reconstruct the exact frozen causal hypotheses for an audit replay."""
 
-    specs: list[api.CausalPolicyCampaignSpec] = []
+    specs: list[CausalPolicyCampaignSpec] = []
     for definition in campaign.causal_policy_definitions:
         priors = definition.get("priors") or []
         library_entry_ids = [
@@ -370,7 +376,7 @@ def _causal_policy_specs_from_report(
                 "causal Campaign audit replay requires every frozen prior identifier"
             )
         specs.append(
-            api.CausalPolicyCampaignSpec(
+            CausalPolicyCampaignSpec(
                 id=str(definition["policy_id"]),
                 library_entry_ids=library_entry_ids,
                 maximum_candidates_per_bar=int(
@@ -434,7 +440,7 @@ async def _replay_latest_campaign(campaign: ResearchCampaignReport | None = None
             for entry_id in campaign.library_entry_ids
             if not entry_id.startswith("candidate:")
         ]
-        replay_request = api.ResearchCampaignRequest(
+        replay_request = ResearchCampaignRequest(
             dataset_ids=campaign.research_dataset_ids,
             blind_dataset_ids=campaign.blind_dataset_ids,
             universe_snapshot_id=campaign.universe_snapshot_id,
@@ -448,7 +454,7 @@ async def _replay_latest_campaign(campaign: ResearchCampaignReport | None = None
             parent_campaign_id=campaign.parent_campaign_id,
         )
     else:
-        replay_request = api.ResearchCampaignRequest.model_validate(source.request)
+        replay_request = ResearchCampaignRequest.model_validate(source.request)
     report = await api.execute_research_campaign(
         replay_request,
         progress_callback=update,
@@ -1238,7 +1244,7 @@ async def gather_evidence(*, run_tests: bool) -> dict:
     plan_by_id = {
         plan.id: plan
         for payload in api.store.load_strategies()
-        for plan in [api.StrategyPlan.model_validate(payload)]
+        for plan in [StrategyPlan.model_validate(payload)]
     }
     certified_episodes = []
     if champion and campaign and campaign.execution_certificate:
@@ -1255,10 +1261,10 @@ async def gather_evidence(*, run_tests: bool) -> dict:
     certified_symbols = list(
         dict.fromkeys(episode.symbol for episode in certified_episodes)
     )
-    certified_forward = api.build_forward_performance(
+    certified_forward = build_forward_performance(
         certified_episodes,
         api.configuration_service.current_configuration().agent_forward_validation,
-        scope_mode=api.AgentAutonomyMode.SANDBOX,
+        scope_mode=AgentAutonomyMode.SANDBOX,
         required_symbols=certified_symbols,
     )
     pbo_passed = bool(campaign and campaign.pbo.passed)

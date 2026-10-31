@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
 from cosmos_quant.ai_config_service import AIConfigurationService
 from cosmos_quant.ai_configuration import (
     AIConfiguration,

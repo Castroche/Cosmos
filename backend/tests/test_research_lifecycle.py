@@ -4,7 +4,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
+from cosmos_quant.api_contracts import CandidatePromotionRequest
 from cosmos_quant.backtest import run_walk_forward_backtest
 from cosmos_quant.configuration import StrategyKind, UserConfiguration
 from cosmos_quant.demo import demo_candles
@@ -338,7 +339,7 @@ def test_promotion_retests_incumbent_on_challenger_dataset(monkeypatch):
     decision = asyncio.run(
         api.promote_strategy_candidate(
             challenger.id,
-            api.CandidatePromotionRequest(confirmation=f"PROMOTE {challenger.spec_fingerprint}"),
+            CandidatePromotionRequest(confirmation=f"PROMOTE {challenger.spec_fingerprint}"),
         )
     )
 

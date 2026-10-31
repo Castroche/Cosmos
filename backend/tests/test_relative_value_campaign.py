@@ -3,7 +3,8 @@ import math
 from decimal import Decimal
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
+from cosmos_quant.api_contracts import RelativeValueCampaignRequest
 from cosmos_quant.demo import demo_candles
 from cosmos_quant.multi_leg_execution import validate_multi_leg_execution_certificate
 from cosmos_quant.relative_value import PAIR_STRATEGY_LIBRARY
@@ -261,7 +262,7 @@ def test_relative_value_campaign_api_builds_pairs_and_persists_report(
 
     report = asyncio.run(
         api.run_relative_value_campaign(
-            api.RelativeValueCampaignRequest(
+            RelativeValueCampaignRequest(
                 dataset_ids=list(unique),
                 strategy_specs=[PAIR_STRATEGY_LIBRARY[0].model_dump(mode="json")],
             )
@@ -287,7 +288,7 @@ def test_relative_value_campaign_api_builds_pairs_and_persists_report(
     ]
     successor = asyncio.run(
         api.run_relative_value_campaign(
-            api.RelativeValueCampaignRequest(
+            RelativeValueCampaignRequest(
                 dataset_ids=list(unique),
                 strategy_specs=successor_specs,
                 parent_campaign_id=report.id,
@@ -304,7 +305,7 @@ def test_relative_value_campaign_api_builds_pairs_and_persists_report(
     with pytest.raises(HTTPException, match="only one successor"):
         asyncio.run(
             api.run_relative_value_campaign(
-                api.RelativeValueCampaignRequest(
+                RelativeValueCampaignRequest(
                     dataset_ids=list(unique),
                     strategy_specs=successor_specs,
                     parent_campaign_id=successor.id,
@@ -314,7 +315,7 @@ def test_relative_value_campaign_api_builds_pairs_and_persists_report(
 
     extension = asyncio.run(
         api.run_relative_value_campaign(
-            api.RelativeValueCampaignRequest(
+            RelativeValueCampaignRequest(
                 dataset_ids=list(unique),
                 strategy_specs=[PAIR_STRATEGY_LIBRARY[-1].model_dump(mode="json")],
             )
@@ -330,7 +331,7 @@ def test_relative_value_campaign_api_builds_pairs_and_persists_report(
 
     replay = asyncio.run(
         api.run_relative_value_campaign(
-            api.RelativeValueCampaignRequest(
+            RelativeValueCampaignRequest(
                 dataset_ids=list(unique),
                 strategy_specs=[PAIR_STRATEGY_LIBRARY[-1].model_dump(mode="json")],
             )
@@ -385,7 +386,7 @@ def test_pair_campaign_opens_one_sealed_blind_set_once_without_disclosing_metric
         return result
 
     monkeypatch.setattr(api, "run_pair_research_campaign", controlled_runner)
-    request = api.RelativeValueCampaignRequest(
+    request = RelativeValueCampaignRequest(
         dataset_ids=[dataset.id for dataset, _ in development],
         blind_dataset_ids=[dataset.id for dataset, _ in blind],
         strategy_specs=[PAIR_STRATEGY_LIBRARY[0].model_dump(mode="json")],
@@ -466,6 +467,6 @@ def test_relative_value_campaign_api_never_uses_sealed_blind_data_for_selection(
     with pytest.raises(HTTPException, match="sealed blind datasets"):
         asyncio.run(
             api.run_relative_value_campaign(
-                api.RelativeValueCampaignRequest(dataset_ids=list(unique))
+                RelativeValueCampaignRequest(dataset_ids=list(unique))
             )
         )

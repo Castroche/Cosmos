@@ -1,7 +1,7 @@
 import asyncio
 import inspect
 
-from cosmos_quant import api
+from app_fixture import services as api
 from httpx import ASGITransport, AsyncClient
 
 

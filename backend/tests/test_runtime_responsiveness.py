@@ -1,18 +1,18 @@
 """UI metadata requests must stay independent of native Quant model loading."""
-
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace
 
-from cosmos_quant import api
+from app_fixture import services as api
 from cosmos_quant.configuration import UserConfiguration
 from cosmos_quant.demo import demo_candles
 from cosmos_quant.domain import MarketSnapshot
 from cosmos_quant.market_data import MarketDataService
 from cosmos_quant.storage import SqliteStore
 from cosmos_quant.trading_intelligence import (
+    V2_SYMBOLS,
     AutomationRuntimeV2,
     WaitPlan,
     WaitRuntimeStatus,
@@ -52,7 +52,7 @@ def test_concurrent_quant_loads_share_one_predictor(monkeypatch):
 
     monkeypatch.setattr(api, "LightGBMQuantIntelligenceV1", build)
     with ThreadPoolExecutor(max_workers=6) as workers:
-        models = list(workers.map(api.load_quant_v1_model, [api.V2_SYMBOLS[0]] * 6))
+        models = list(workers.map(api.load_quant_v1_model, [V2_SYMBOLS[0]] * 6))
     assert len(created) == 1
     assert all(model is created[0] for model in models)
 
@@ -133,7 +133,7 @@ def test_account_resume_finishes_while_a_symbol_decision_is_busy(tmp_path):
     )
 
     async def run():
-        async with service._locks[api.V2_SYMBOLS[0]]:
+        async with service._locks[V2_SYMBOLS[0]]:
             await asyncio.wait_for(service.resume(evaluate_market_states=False), 1)
 
     asyncio.run(run())
@@ -166,7 +166,7 @@ def test_active_price_wakes_are_not_evicted_by_newer_terminal_history(tmp_path):
     store = TradingIntelligenceStore(SqliteStore(tmp_path / "waits.db"))
     now = datetime.now(UTC)
     active = WaitRuntimeV2(
-        episode_id="active", symbol=api.V2_SYMBOLS[0],
+        episode_id="active", symbol=V2_SYMBOLS[0],
         wait_plan=WaitPlan(
             reason="future price", expires_at=now + timedelta(hours=1),
             wake_conditions=[{"kind": "PRICE_CROSSES_ABOVE", "action": "RECALL_LLM",
@@ -184,5 +184,5 @@ def test_active_price_wakes_are_not_evicted_by_newer_terminal_history(tmp_path):
                 (item.wait_runtime_id, "WaitRuntimeV2", str(i), item.model_dump_json(),
                  (now + timedelta(seconds=1)).isoformat()),
             )
-    found = store.list_wait_runtimes(symbol=api.V2_SYMBOLS[0], active_only=True)
+    found = store.list_wait_runtimes(symbol=V2_SYMBOLS[0], active_only=True)
     assert [item.wait_runtime_id for item in found] == [active.wait_runtime_id]

@@ -2,7 +2,7 @@ import asyncio
 from decimal import Decimal
 
 import pytest
-from cosmos_quant import api
+from app_fixture import services as api
 from cosmos_quant.demo import demo_candles, snapshot_from_candles
 from cosmos_quant.domain import PortfolioState
 from cosmos_quant.exchanges.paper import PaperExchange
@@ -236,7 +236,7 @@ def test_backup_maintenance_requires_three_consecutive_failures(monkeypatch):
 
     monkeypatch.setattr(api, "backup_service", backup)
     monkeypatch.setattr(api, "risk_state_service", risk_state)
-    monkeypatch.setattr(api.asyncio, "sleep", stop_after_third_attempt)
+    monkeypatch.setattr(asyncio, "sleep", stop_after_third_attempt)
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(api.maintenance_loop())

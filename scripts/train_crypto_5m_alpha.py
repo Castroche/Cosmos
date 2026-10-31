@@ -12,7 +12,8 @@ BACKEND = ROOT / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from cosmos_quant import api  # noqa: E402
+from cosmos_quant.application_services import ApplicationServices  # noqa: E402
+api = ApplicationServices()
 from cosmos_quant.alpha_factory import (  # noqa: E402
     alpha_transaction_cost_fingerprint,
     assess_crypto_5m_contract,
