@@ -13,7 +13,8 @@ COSMOS 是面向 OKX BTC/ETH/SOL USDT 永续的事件驱动交易智能系统。
 
 ## 当前能力
 
-本次工作台、多品种与交易学习升级见 [升级说明](docs/TERMINAL_LEARNING_UPGRADE.md)。
+最新应用分层、可验证学习与影子对照见 [升级说明](docs/LEARNING_ARCHITECTURE_UPGRADE.md)。
+工作台与多品种能力见 [此前升级说明](docs/TERMINAL_LEARNING_UPGRADE.md)。
 
 - OKX BTC/ETH/SOL 永续 1m、5m、15m、1h、4h、1d 统一 MarketStateV2。
 - 公共 WebSocket 实时报价、多品种持久连接、K 线 REST 补洞、断线重连与数据质量标记。
@@ -62,7 +63,7 @@ npm run service:stop
 
 生产行情只允许服务端采集器写入；原始 `POST /api/trading-intelligence/market-state`
 接口现返回 403。需要更新行情时使用 `/market-state/{symbol}/refresh`。
-本轮静态修复和未运行验证的范围见 [修复说明](docs/STATIC_REMEDIATION.md)。
+历史静态修复记录见 [修复说明](docs/STATIC_REMEDIATION.md)，当前认证方式及验证边界以上述升级说明为准。
 
 ## 模拟盘启用顺序
 

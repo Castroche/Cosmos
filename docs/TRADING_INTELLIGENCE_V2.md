@@ -14,7 +14,7 @@ The hot path is:
 
 ```text
 official/market event → MarketState v2 → MarketAnalyst → PortfolioTrader
-                      → exact-price TradePlan → durable entry-zone trigger
+                      → MARKET/LIMIT TradePlan → immediate deterministic risk validation
                       → deterministic RiskAllocation → protected OKX execution
                       → deterministic Position Manager → DecisionEpisode outcome
 ```
@@ -151,3 +151,17 @@ The generated manifest uses `KEEP`, `DELETE`, `REBUILD`, and `REVIEW`, includes
 absolute paths, sizes, row counts, reasons, and reference sources, and must show no
 `DELETE` or `REVIEW` entries after cleanup. Never use `git clean -fdx` on this
 workspace. Raw Binance/OKX archives and their checksums are immutable evidence.
+
+
+## Learning evidence and observational comparisons
+
+Learning remains advisory. Complete outcomes acquire a first-observed timestamp; decision-time
+retrieval cannot consume evidence first observed after that decision. A pinned snapshot is
+supported, as are disabling learning and reverting to automatic snapshot updates.
+
+The optional shadow Trader reuses the Analyst output and all non-learning inputs. Stable 10%
+sampling and a durable daily limit of ten groups (Asia/Shanghai) bound additional calls. Each
+group allows one Trader request and at most one format repair, with no HTTP retry or provider
+fallback. It never enters the order/plan/wake/position pipeline. Its price outcomes are explicitly
+labelled proxies, not executable fills or profit. The default setting is enabled; requests only
+run while automation is active and valid learning cases exist.

@@ -1,5 +1,7 @@
 # 2026-09-17 运行问题修复与 OKX Demo 启用
 
+> 历史报告：密钥配对／会话认证描述已被本机免登录、Host／Origin 校验取代。当前行为与应用分层、学习对照机制以 [ARCHITECTURE](ARCHITECTURE.md) 和 [升级说明](LEARNING_ARCHITECTURE_UPGRADE.md) 为准。
+
 最终检查时间：2026-09-17 14:09:41（北京时间）。原账户服务健康，自动化 `enabled=true / RUNNING / OKX_DEMO`，覆盖 BTC、ETH、SOL；连续失败 0，风险未暂停，当前无持仓。更新后的 BTC 决策已正常完成并选择 NO_TRADE。服务继续运行在 `http://127.0.0.1:8000`。
 
 ## 修改

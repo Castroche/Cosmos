@@ -1,5 +1,7 @@
 # 2026-09-17 服务试运行与安全复查
 
+> 历史报告：密钥配对／会话认证描述已被本机免登录、Host／Origin 校验取代。当前行为与应用分层、学习对照机制以 [ARCHITECTURE](ARCHITECTURE.md) 和 [升级说明](LEARNING_ARCHITECTURE_UPGRADE.md) 为准。
+
 > 以下保留首次试运行的发现与证据。随后已按用户授权修复并切回原 OKX Demo 账户，最新状态见 [运行修复记录](RUNTIME_REMEDIATION.md)。
 
 ## 结论与范围

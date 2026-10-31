@@ -1,0 +1,43 @@
+{
+  "verified_at": "2026-10-31",
+  "browser": {
+    "desktop": "1600x1100",
+    "mobile": "390x844",
+    "horizontal_overflow": false,
+    "page_errors": 0,
+    "intentional_http_503": 1,
+    "settings_persisted": true,
+    "version_pin_and_auto_restore": true,
+    "empty_state": true,
+    "failure_and_recovery": true,
+    "fixtures_only": true
+  },
+  "frontend": {
+    "typecheck": "passed",
+    "lint": "passed",
+    "tests_passed": 3,
+    "build": "passed"
+  },
+  "boundaries": [
+    "No operator service restart",
+    "No production account migration",
+    "No exchange orders",
+    "No paid model comparison during verification",
+    "Learning evidence does not certify profitability"
+  ],
+  "architecture": {
+    "api_lines": 88,
+    "storage_lines": 850,
+    "domain_service_modules": 30,
+    "repository_modules": 9
+  },
+  "backend": {
+    "tests_passed": 759,
+    "failures": 0,
+    "errors": 0,
+    "duration_seconds": 209.223,
+    "ruff": "passed",
+    "tested_code_commit": "2d8b805",
+    "schema_version": 11
+  }
+}

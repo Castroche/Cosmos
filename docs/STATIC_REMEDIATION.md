@@ -1,5 +1,7 @@
 # 2026-09-17 静态审查修复
 
+> 历史报告：密钥配对／会话认证描述已被本机免登录、Host／Origin 校验取代。当前行为与应用分层、学习对照机制以 [ARCHITECTURE](ARCHITECTURE.md) 和 [升级说明](LEARNING_ARCHITECTURE_UPGRADE.md) 为准。
+
 本轮针对 `security_best_practices_report.md` 的具体问题修改源码，未运行测试、构建、浏览器、应用服务或交易所请求。没有迁移当前运行数据库，没有重启或部署服务。
 
 ## 已修改的路径
