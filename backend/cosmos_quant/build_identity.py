@@ -31,9 +31,11 @@ def _git(workspace: Path, *arguments: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="strict",
         timeout=10,
     )
-    return completed.stdout.strip()
+    return completed.stdout
 
 
 def _source_tree_hash(workspace: Path, tracked_files: list[str]) -> str:
@@ -61,11 +63,11 @@ def capture_runtime_build_identity(workspace: Path | None = None) -> RuntimeBuil
     root = (workspace or Path(__file__).resolve().parents[2]).resolve()
     injected = os.getenv("COSMOS_GIT_COMMIT_SHA", "").strip().lower()
     try:
-        repository_sha = _git(root, "rev-parse", "HEAD").lower()
+        repository_sha = _git(root, "rev-parse", "HEAD").strip().lower()
         tracked = _git(root, "ls-files", "-z").split("\0")
-        dirty = bool(_git(root, "status", "--porcelain", "--untracked-files=all"))
-    except (FileNotFoundError, subprocess.SubprocessError) as exc:
-        raise RuntimeError("COSMOS formal build identity requires a Git repository") from exc
+        dirty = bool(_git(root, "status", "--porcelain", "--untracked-files=all").strip())
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        raise RuntimeError("COSMOS build identity: Git repository inspection failed (UTF-8, executable or timeout)") from exc
     commit_sha = injected or repository_sha
     if len(commit_sha) != 40 or any(
         character not in "0123456789abcdef" for character in commit_sha
