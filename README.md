@@ -1,5 +1,7 @@
 # COSMOS Quant
 
+本项目采用 [MIT 许可证](LICENSE)。
+
 COSMOS 是面向 OKX BTC/ETH/SOL USDT 永续的事件驱动交易智能系统。生产热路径只有 Trading Intelligence v2：
 
 ```text
